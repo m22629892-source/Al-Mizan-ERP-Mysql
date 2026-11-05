@@ -19,34 +19,67 @@
 
 ## 2. دليل تشغيل النظام والتحقق (Setup & Verification Instructions)
 
-- **بيئة التشغيل المعتمدة**:
-  - **Node.js**: إصدار `22.x` (LTS، الإصدارات `>= 22.12.0` بما فيها `22.23.3`).
-  - **npm**: الإصدار `10.9.x` أو أحدث.
-  - **أدوات البناء (اختياري)**: مكتبة `better-sqlite3 v13.0.3` تتضمن حزم ثنائية مسبقة البناء لكافة المنصات (`win32-x64`, `linux-x64`, `darwin-arm64`). في حال تطلب التثبيت تجميعاً محلياً، يلزم توفر `build-essential` و`python3` على لينكس، أو أدوات C++ لـ Visual Studio 2022 (حزمة Desktop development with C++) على ويندوز (مع بيئة `windows-2022` في مسار التكامل المستمر CI لضمان توافقية `node-gyp`).
+- **بيئة التشغيل المعتمدة والمثبتة (Verified & Pinned Environment)**:
+  - **Node.js**: إصدار **`26.13.0`** (LTS "Lithium"، تاريخ الإصدار الرسمي 2026-10-28، تم التحقق والتثبيت في 2026-11-05).
+  - **npm**: الإصدار `11.20.0` (أو `>= 10.9.x`).
+  - **إصدار التبعيات المحدّثة**:
+    - `better-sqlite3`: `^13.0.3` (أحدث إصدار متوافق بالكامل مع Node-API v8).
+    - `@types/node`: `^26.6.6` (متوافق مع محرك Node.js 26).
+    - `vite`: `^8.3.0`
+    - `typescript`: `^7.0.2`
+    - `tsx`: `^4.21.0`
 
-1. **التثبيت النظيف (Clean Install)**:
+### خطوات التثبيت على Windows 11 x64:
+1. **تثبيت Node.js 26.13.0**:
+   - قم بتحميل وتثبيت النسخة الرسمية `node-v26.13.0-x64.msi` من [nodejs.org](https://nodejs.org).
+2. **أدوات البناء والتجميع لـ better-sqlite3 على Windows**:
+   - تتطلب مكتبة `better-sqlite3` تجميع ملحق C++ الأصلي عبر `node-gyp`.
+   - قم بتثبيت Visual Studio Build Tools 2022 مع تفعيل حزمة `Desktop development with C++`:
+     ```powershell
+     winget install Microsoft.VisualStudio.2022.BuildTools --force --override "--passive --config core.config --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+     ```
+   - تأكد من تثبيت Python 3.10+ (أو عبر: `winget install Python.Python.3.12`).
+   - اضبط إصدار Visual Studio في إعدادات npm:
+     ```powershell
+     npm config set msvs_version 2022
+     ```
+3. **التثبيت النظيف (Clean Install)**:
    ```bash
    npm ci
    ```
-2. **فحص الأنواع وتكامل الشيفرة (Lint & TypeScript)**:
+4. **فحص الأنواع وتكامل الشيفرة (Lint & TypeScript)**:
    ```bash
    npm run lint
    ```
-3. **بناء الإنتاج (Production Build)**:
+5. **بناء الإنتاج (Production Build)**:
    ```bash
    npm run build
    ```
-4. **تشغيل كافة الاختبارات المحاسبية والأمنية (Comprehensive Tests)**:
+6. **تشغيل كافة الاختبارات الشاملة (88 اختباراً: محاسبي، أمني، تشغيلي)**:
    ```bash
    npm run test:all
    ```
-5. **بدء التشغيل في بيئة التطوير**:
+7. **بدء تشغيل الخادم**:
    ```bash
    npm run dev
    ```
-   يقوم الخادم بإنشاء قاعدة البيانات `almizan.db` تلقائياً، وإنشاء الجداول، وتوليد البيانات التجريبية الشاملة.
-6. **الوصول للنظام**:
    افتح المتصفح على: `http://localhost:3000`
+
+---
+
+### خطوات التثبيت على Linux (Ubuntu/Debian):
+1. **تثبيت أدوات البناء الأساسية**:
+   ```bash
+   sudo apt-get update && sudo apt-get install -y build-essential python3
+   ```
+2. **تنفيذ التثبيت والاختبار**:
+   ```bash
+   npm ci
+   npm run lint
+   npm run build
+   npm run test:all
+   npm run start
+   ```
 
 ---
 
