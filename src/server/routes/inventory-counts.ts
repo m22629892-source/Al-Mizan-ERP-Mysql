@@ -1,4 +1,5 @@
-import { Router, Response } from 'express';
+import { Router } from '../mysql-router.js';
+import { Response } from 'express';
 import Decimal from 'decimal.js';
 import { db } from '../db.js';
 import { AuthenticatedRequest, requireAuth, requirePermission, isBranchAllowed, isWarehouseAllowed } from '../api.js';
@@ -10,9 +11,9 @@ export const inventoryCountsRouter = Router();
 /**
  * GET /: List all physical inventory count sessions
  */
-inventoryCountsRouter.get('/', requireAuth, requirePermission('inventory_count.view', 'inventory.count', 'inventory.view'), (req: AuthenticatedRequest, res: Response) => {
+inventoryCountsRouter.get('/', requireAuth, requirePermission('inventory_count.view', 'inventory.count', 'inventory.view'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const counts = db.prepare(`
+    const counts = (await db.prepare(`
       SELECT ic.*, b.name_ar as branch_name, w.name_ar as warehouse_name, u.display_name as creator_name,
              je.entry_number as journal_number
       FROM inventory_counts ic
@@ -21,7 +22,7 @@ inventoryCountsRouter.get('/', requireAuth, requirePermission('inventory_count.v
       JOIN users u ON ic.created_by = u.id
       LEFT JOIN journal_entries je ON ic.journal_entry_id = je.id
       ORDER BY ic.count_date DESC, ic.created_at DESC
-    `).all() as any[];
+    `).all()) as any[];
 
     const scopedCounts = counts.filter(c => isBranchAllowed(req.user, c.branch_id) && isWarehouseAllowed(req.user, c.warehouse_id));
 
@@ -34,9 +35,9 @@ inventoryCountsRouter.get('/', requireAuth, requirePermission('inventory_count.v
 /**
  * GET /:id: Get full details of a physical inventory count with items
  */
-inventoryCountsRouter.get('/:id', requireAuth, requirePermission('inventory_count.view', 'inventory.count', 'inventory.view'), (req: AuthenticatedRequest, res: Response) => {
+inventoryCountsRouter.get('/:id', requireAuth, requirePermission('inventory_count.view', 'inventory.count', 'inventory.view'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const count = db.prepare(`
+    const count = (await db.prepare(`
       SELECT ic.*, b.name_ar as branch_name, w.name_ar as warehouse_name, u.display_name as creator_name,
              je.entry_number as journal_number
       FROM inventory_counts ic
@@ -45,7 +46,7 @@ inventoryCountsRouter.get('/:id', requireAuth, requirePermission('inventory_coun
       JOIN users u ON ic.created_by = u.id
       LEFT JOIN journal_entries je ON ic.journal_entry_id = je.id
       WHERE ic.id = ?
-    `).get(req.params.id) as any;
+    `).get(req.params.id)) as any;
 
     if (!count) {
       return res.status(404).json({ error: 'محضر الجرد الفعلي غير موجود.' });
@@ -55,13 +56,13 @@ inventoryCountsRouter.get('/:id', requireAuth, requirePermission('inventory_coun
       return res.status(403).json({ error: 'محضر الجرد خارج نطاق صلاحياتك.' });
     }
 
-    const items = db.prepare(`
+    const items = (await db.prepare(`
       SELECT ici.*, i.code as item_code, i.name_ar as item_name, i.category, i.base_unit
       FROM inventory_count_items ici
       JOIN items i ON ici.item_id = i.id
       WHERE ici.count_id = ?
       ORDER BY i.name_ar ASC
-    `).all(req.params.id) as any[];
+    `).all(req.params.id)) as any[];
 
     res.json({ success: true, count, items });
   } catch (err: any) {
@@ -72,7 +73,7 @@ inventoryCountsRouter.get('/:id', requireAuth, requirePermission('inventory_coun
 /**
  * POST /: Create a new physical inventory count session (in Draft)
  */
-inventoryCountsRouter.post('/', requireAuth, requirePermission('inventory.count'), (req: AuthenticatedRequest, res: Response) => {
+inventoryCountsRouter.post('/', requireAuth, requirePermission('inventory.count'), async (req: AuthenticatedRequest, res: Response) => {
   const { branchId, warehouseId, countDate, notes, items: customItems } = req.body;
 
   if (!branchId || !warehouseId) {
@@ -88,7 +89,7 @@ inventoryCountsRouter.post('/', requireAuth, requirePermission('inventory.count'
   }
 
   const effectiveDate = countDate || new Date().toISOString().split('T')[0];
-  const period = getFiscalPeriodForDate(effectiveDate);
+  const period = (await getFiscalPeriodForDate(effectiveDate));
 
   if (period.is_closed === 1) {
     return res.status(400).json({ error: 'الفترة المالية لتاريخ الجرد مقفلة، ولا يمكن إنشاء محضر جرد بها.' });
@@ -96,25 +97,25 @@ inventoryCountsRouter.post('/', requireAuth, requirePermission('inventory.count'
 
   try {
     const countId = `invcnt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const countNumber = getNextDocumentNumber('STK-CNT', branchId, period.fiscal_year_id);
+    const countNumber = (await getNextDocumentNumber('STK-CNT', branchId, period.fiscal_year_id));
 
-    db.transaction(() => {
+    (await db.transaction(async () => {
       // 1. Snapshot all stockable items and their current book quantity and unit cost
-      const stockItems = db.prepare(`
+      const stockItems = (await db.prepare(`
         SELECT i.id, i.name_ar, i.code, i.moving_avg_cost,
                COALESCE(ws.quantity, 0) as system_quantity
         FROM items i
         LEFT JOIN warehouse_stock ws ON i.id = ws.item_id AND ws.warehouse_id = ?
         WHERE i.item_type = 'stock' AND i.is_active = 1
         ORDER BY i.name_ar ASC
-      `).all(warehouseId) as any[];
+      `).all(warehouseId)) as any[];
 
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO inventory_counts (
           id, count_number, branch_id, warehouse_id, count_date, status, notes,
           total_shortage_cost, total_surplus_cost, net_variance_cost, created_by
         ) VALUES (?, ?, ?, ?, ?, 'draft', ?, 0, 0, 0, ?)
-      `).run(countId, countNumber, branchId, warehouseId, effectiveDate, notes || null, req.user!.id);
+      `).run(countId, countNumber, branchId, warehouseId, effectiveDate, notes || null, req.user!.id));
 
       const insLine = db.prepare(`
         INSERT INTO inventory_count_items (
@@ -131,11 +132,11 @@ inventoryCountsRouter.post('/', requireAuth, requirePermission('inventory.count'
         const unitCost = item.moving_avg_cost || 0;
         const totalDiffCost = diffQty * unitCost;
 
-        insLine.run(lineId, countId, item.id, item.system_quantity, countedQty, diffQty, unitCost, totalDiffCost, custom?.notes || null);
+        (await insLine.run(lineId, countId, item.id, item.system_quantity, countedQty, diffQty, unitCost, totalDiffCost, custom?.notes || null));
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'CREATE_INVENTORY_COUNT', 'inventory_counts', countId, `إنشاء مسودة محضر جرد فعلي رقم ${countNumber}`);
+    (await logAudit(req.user!.id, 'CREATE_INVENTORY_COUNT', 'inventory_counts', countId, `إنشاء مسودة محضر جرد فعلي رقم ${countNumber}`));
 
     res.json({
       success: true,
@@ -151,14 +152,14 @@ inventoryCountsRouter.post('/', requireAuth, requirePermission('inventory.count'
 /**
  * PUT /:id: Update counted quantities on draft
  */
-inventoryCountsRouter.put('/:id', requireAuth, requirePermission('inventory.count'), (req: AuthenticatedRequest, res: Response) => {
+inventoryCountsRouter.put('/:id', requireAuth, requirePermission('inventory.count'), async (req: AuthenticatedRequest, res: Response) => {
   const { items, notes } = req.body;
 
   if (!items || !Array.isArray(items)) {
     return res.status(400).json({ error: 'بيانات بنود الجرد غير صحيحة.' });
   }
 
-  const count = db.prepare('SELECT * FROM inventory_counts WHERE id = ?').get(req.params.id) as any;
+  const count = (await db.prepare('SELECT * FROM inventory_counts WHERE id = ?').get(req.params.id)) as any;
   if (!count) return res.status(404).json({ error: 'محضر الجرد غير موجود.' });
   if (count.status === 'posted') return res.status(400).json({ error: 'لا يمكن تعديل محضر جرد تم اعتماده وترحيله.' });
   if (!isBranchAllowed(req.user, count.branch_id) || !isWarehouseAllowed(req.user, count.warehouse_id)) {
@@ -166,7 +167,7 @@ inventoryCountsRouter.put('/:id', requireAuth, requirePermission('inventory.coun
   }
 
   try {
-    db.transaction(() => {
+    (await db.transaction(async () => {
       let totalShortage = new Decimal(0);
       let totalSurplus = new Decimal(0);
 
@@ -178,7 +179,7 @@ inventoryCountsRouter.put('/:id', requireAuth, requirePermission('inventory.coun
 
       for (const it of items) {
         const counted = Number(it.countedQuantity || 0);
-        const currentLine = db.prepare('SELECT system_quantity, unit_cost FROM inventory_count_items WHERE count_id = ? AND item_id = ?').get(req.params.id, it.itemId) as any;
+        const currentLine = (await db.prepare('SELECT system_quantity, unit_cost FROM inventory_count_items WHERE count_id = ? AND item_id = ?').get(req.params.id, it.itemId)) as any;
         if (currentLine) {
           const diff = counted - currentLine.system_quantity;
           const totalDiff = diff * currentLine.unit_cost;
@@ -189,17 +190,17 @@ inventoryCountsRouter.put('/:id', requireAuth, requirePermission('inventory.coun
             totalSurplus = totalSurplus.plus(totalDiff);
           }
 
-          updateLine.run(counted, diff, totalDiff, it.notes || null, req.params.id, it.itemId);
+          (await updateLine.run(counted, diff, totalDiff, it.notes || null, req.params.id, it.itemId));
         }
       }
 
       const netVariance = totalSurplus.minus(totalShortage);
-      db.prepare(`
+      (await db.prepare(`
         UPDATE inventory_counts
         SET notes = COALESCE(?, notes), total_shortage_cost = ?, total_surplus_cost = ?, net_variance_cost = ?
         WHERE id = ?
-      `).run(notes || null, totalShortage.toNumber(), totalSurplus.toNumber(), netVariance.toNumber(), req.params.id);
-    })();
+      `).run(notes || null, totalShortage.toNumber(), totalSurplus.toNumber(), netVariance.toNumber(), req.params.id));
+    })());
 
     res.json({ success: true, message: 'تم حفظ تعديلات محضر الجرد بنجاح.' });
   } catch (err: any) {
@@ -210,8 +211,8 @@ inventoryCountsRouter.put('/:id', requireAuth, requirePermission('inventory.coun
 /**
  * DELETE /:id: Delete draft count
  */
-inventoryCountsRouter.delete('/:id', requireAuth, requirePermission('inventory.count'), (req: AuthenticatedRequest, res: Response) => {
-  const count = db.prepare('SELECT * FROM inventory_counts WHERE id = ?').get(req.params.id) as any;
+inventoryCountsRouter.delete('/:id', requireAuth, requirePermission('inventory.count'), async (req: AuthenticatedRequest, res: Response) => {
+  const count = (await db.prepare('SELECT * FROM inventory_counts WHERE id = ?').get(req.params.id)) as any;
   if (!count) return res.status(404).json({ error: 'محضر الجرد غير موجود.' });
   if (count.status === 'posted') return res.status(400).json({ error: 'ممنوع حذف محضر جرد معتمد ومرحل.' });
   if (!isBranchAllowed(req.user, count.branch_id) || !isWarehouseAllowed(req.user, count.warehouse_id)) {
@@ -219,12 +220,12 @@ inventoryCountsRouter.delete('/:id', requireAuth, requirePermission('inventory.c
   }
 
   try {
-    db.transaction(() => {
-      db.prepare('DELETE FROM inventory_count_items WHERE count_id = ?').run(req.params.id);
-      db.prepare('DELETE FROM inventory_counts WHERE id = ?').run(req.params.id);
-    })();
+    (await db.transaction(async () => {
+      (await db.prepare('DELETE FROM inventory_count_items WHERE count_id = ?').run(req.params.id));
+      (await db.prepare('DELETE FROM inventory_counts WHERE id = ?').run(req.params.id));
+    })());
 
-    logAudit(req.user!.id, 'DELETE_INVENTORY_COUNT', 'inventory_counts', req.params.id, `حذف مسودة محضر الجرد رقم ${count.count_number}`);
+    (await logAudit(req.user!.id, 'DELETE_INVENTORY_COUNT', 'inventory_counts', req.params.id, `حذف مسودة محضر الجرد رقم ${count.count_number}`));
     res.json({ success: true, message: 'تم حذف مسودة محضر الجرد بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -234,15 +235,15 @@ inventoryCountsRouter.delete('/:id', requireAuth, requirePermission('inventory.c
 /**
  * POST /:id/post: Approve & Post Inventory Count (Creates Atomic Adjustment Transaction + Balanced Journal Entry)
  */
-inventoryCountsRouter.post('/:id/post', requireAuth, requirePermission('inventory.count'), (req: AuthenticatedRequest, res: Response) => {
-  const count = db.prepare('SELECT * FROM inventory_counts WHERE id = ?').get(req.params.id) as any;
+inventoryCountsRouter.post('/:id/post', requireAuth, requirePermission('inventory.count'), async (req: AuthenticatedRequest, res: Response) => {
+  const count = (await db.prepare('SELECT * FROM inventory_counts WHERE id = ?').get(req.params.id)) as any;
   if (!count) return res.status(404).json({ error: 'محضر الجرد غير موجود.' });
   if (count.status === 'posted') return res.status(400).json({ error: 'تم ترحيل واعتماد هذا الجرد مسبقاً لمنع التكرار.' });
   if (!isBranchAllowed(req.user, count.branch_id) || !isWarehouseAllowed(req.user, count.warehouse_id)) {
     return res.status(403).json({ error: 'محضر الجرد خارج نطاق صلاحياتك.' });
   }
 
-  const period = getFiscalPeriodForDate(count.count_date);
+  const period = (await getFiscalPeriodForDate(count.count_date));
   if (period.is_closed === 1) {
     return res.status(400).json({ error: 'الفترة المالية للجرد مقفلة، ولا يمكن الترحيل بها.' });
   }
@@ -250,13 +251,13 @@ inventoryCountsRouter.post('/:id/post', requireAuth, requirePermission('inventor
   try {
     let jeResult: any = null;
 
-    db.transaction(() => {
-      const items = db.prepare(`
+    (await db.transaction(async () => {
+      const items = (await db.prepare(`
         SELECT ici.*, i.name_ar as item_name
         FROM inventory_count_items ici
         JOIN items i ON ici.item_id = i.id
         WHERE ici.count_id = ?
-      `).all(req.params.id) as any[];
+      `).all(req.params.id)) as any[];
 
       let totalShortage = new Decimal(0);
       let totalSurplus = new Decimal(0);
@@ -313,7 +314,7 @@ inventoryCountsRouter.post('/:id/post', requireAuth, requirePermission('inventor
 
       // If there are financial variances, post balanced Journal Entry
       if (lines.length > 0) {
-        jeResult = postJournalEntry({
+        jeResult = (await postJournalEntry({
           docType: 'STK_ADJ',
           docId: count.id,
           docNumber: count.count_number,
@@ -324,13 +325,13 @@ inventoryCountsRouter.post('/:id/post', requireAuth, requirePermission('inventor
           description: `قيد تسوية فروق الجرد الفعلي محضر رقم ${count.count_number}`,
           createdBy: req.user!.id,
           lines
-        });
+        }));
       }
 
       // Create Stock Adjustment Transaction Record
       const transId = `stk_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-      const transNumber = getNextDocumentNumber('STK-ADJ', count.branch_id, period.fiscal_year_id);
-      db.prepare(`
+      const transNumber = (await getNextDocumentNumber('STK-ADJ', count.branch_id, period.fiscal_year_id));
+      (await db.prepare(`
         INSERT INTO stock_transactions (
           id, trans_number, trans_type, branch_id, from_warehouse_id, to_warehouse_id,
           trans_date, notes, journal_entry_id, status, created_by
@@ -345,17 +346,17 @@ inventoryCountsRouter.post('/:id/post', requireAuth, requirePermission('inventor
         `تسوية جرد فعلي محضر ${count.count_number}`,
         jeResult ? jeResult.entryId : null,
         req.user!.id
-      );
+      ));
 
       // Update physical inventory in warehouse_stock
       for (const it of itemsWithDiff) {
-        db.prepare(`
+        (await db.prepare(`
           UPDATE warehouse_stock
           SET quantity = ?
           WHERE warehouse_id = ? AND item_id = ?
-        `).run(it.counted_quantity, count.warehouse_id, it.item_id);
+        `).run(it.counted_quantity, count.warehouse_id, it.item_id));
 
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO stock_transaction_items (
             id, transaction_id, item_id, quantity, unit_cost, total_cost
           ) VALUES (?, ?, ?, ?, ?, ?)
@@ -366,25 +367,25 @@ inventoryCountsRouter.post('/:id/post', requireAuth, requirePermission('inventor
           it.diff_quantity,
           it.unit_cost,
           it.total_diff_cost
-        );
+        ));
       }
 
       // Mark count as posted
-      db.prepare(`
+      (await db.prepare(`
         UPDATE inventory_counts
         SET status = 'posted', journal_entry_id = ?, stock_transaction_id = ?,
             posted_by = ?, posted_at = CURRENT_TIMESTAMP
         WHERE id = ?
-      `).run(jeResult ? jeResult.entryId : null, transId, req.user!.id, count.id);
+      `).run(jeResult ? jeResult.entryId : null, transId, req.user!.id, count.id));
 
-      logAudit(
+      (await logAudit(
         req.user!.id,
         'POST_INVENTORY_COUNT',
         'inventory_counts',
         count.id,
         `ترحيل واعتماد محضر الجرد الفعلي رقم ${count.count_number}. عجز: ${totalShortage.toFixed(2)} ج.م، زيادة: ${totalSurplus.toFixed(2)} ج.م`
-      );
-    })();
+      ));
+    })());
 
     res.json({
       success: true,

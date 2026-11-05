@@ -1,7 +1,7 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { initDb } from './src/server/db.js';
+import { initDb, db } from './src/server/db.js';
 import { seedInitialData } from './src/server/seed.js';
 import { apiRouter } from './src/server/api.js';
 
@@ -18,10 +18,10 @@ async function startServer() {
   app.use(express.json({ limit: '100mb' }));
   app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
-  // Initialize SQLite Database schema & Seed
+  // Initialize MySQL schema; demo data is opt-in.
   try {
-    initDb();
-    seedInitialData();
+    (await initDb());
+    if (process.env.SEED_DEMO_DATA === 'true') await seedInitialData();
   } catch (err) {
     console.error('CRITICAL: Failed to initialize database or run migrations:', err);
     process.exit(1);
@@ -31,8 +31,9 @@ async function startServer() {
   app.use('/api', apiRouter);
 
   // Health check endpoint
-  app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  app.get('/api/health', async (_req, res) => {
+    try { await db.query('SELECT 1'); res.json({ status: 'ok', database: 'mysql', timestamp: new Date().toISOString() }); }
+    catch { res.status(503).json({ status: 'error', database: 'mysql' }); }
   });
 
   // Global Error Handler (handles PayloadTooLargeError cleanly)

@@ -11,3 +11,6 @@ coverage/
 *.db-shm
 almizan*.db*
 
+
+backups/
+*.zip

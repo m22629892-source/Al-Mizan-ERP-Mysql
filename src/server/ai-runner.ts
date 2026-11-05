@@ -11,10 +11,10 @@ export interface AIRunnerConfig {
 /**
  * Retrieve current AI runner configuration from database system_settings
  */
-export function getAIRunnerConfig(): AIRunnerConfig {
-  const getSetting = (key: string, defaultValue: string) => {
+export async function getAIRunnerConfig(): Promise<AIRunnerConfig> {
+  const getSetting = async (key: string, defaultValue: string) => {
     try {
-      const row = db.prepare('SELECT setting_value FROM system_settings WHERE setting_key = ?').get(key) as { setting_value: string } | undefined;
+      const row = (await db.prepare('SELECT setting_value FROM system_settings WHERE setting_key = ?').get(key)) as { setting_value: string } | undefined;
       return row ? row.setting_value : defaultValue;
     } catch {
       return defaultValue;
@@ -22,27 +22,27 @@ export function getAIRunnerConfig(): AIRunnerConfig {
   };
 
   return {
-    runnerUrl: getSetting('ai_runner_url', 'http://localhost:11434'),
-    primaryModel: getSetting('ai_primary_model', 'qwen2.5:7b'),
-    fallbackModel: getSetting('ai_fallback_model', 'deepseek-r1:7b'),
-    timeoutSeconds: parseInt(getSetting('ai_timeout_seconds', '30'), 10) || 30
+    runnerUrl: (await getSetting('ai_runner_url', 'http://localhost:11434')),
+    primaryModel: (await getSetting('ai_primary_model', 'qwen2.5:7b')),
+    fallbackModel: (await getSetting('ai_fallback_model', 'deepseek-r1:7b')),
+    timeoutSeconds: parseInt((await getSetting('ai_timeout_seconds', '30')), 10) || 30
   };
 }
 
 /**
  * Save updated AI runner configuration
  */
-export function saveAIRunnerConfig(config: Partial<AIRunnerConfig>): void {
+export async function saveAIRunnerConfig(config: Partial<AIRunnerConfig>): Promise<void> {
   const upsert = db.prepare(`
     INSERT INTO system_settings (setting_key, setting_value, updated_at)
     VALUES (?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value, updated_at = CURRENT_TIMESTAMP
+    ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value), updated_at = CURRENT_TIMESTAMP
   `);
 
-  if (config.runnerUrl !== undefined) upsert.run('ai_runner_url', config.runnerUrl.trim());
-  if (config.primaryModel !== undefined) upsert.run('ai_primary_model', config.primaryModel.trim());
-  if (config.fallbackModel !== undefined) upsert.run('ai_fallback_model', config.fallbackModel.trim());
-  if (config.timeoutSeconds !== undefined) upsert.run('ai_timeout_seconds', String(config.timeoutSeconds));
+  if (config.runnerUrl !== undefined) (await upsert.run('ai_runner_url', config.runnerUrl.trim()));
+  if (config.primaryModel !== undefined) (await upsert.run('ai_primary_model', config.primaryModel.trim()));
+  if (config.fallbackModel !== undefined) (await upsert.run('ai_fallback_model', config.fallbackModel.trim()));
+  if (config.timeoutSeconds !== undefined) (await upsert.run('ai_timeout_seconds', String(config.timeoutSeconds)));
 }
 
 /**
@@ -354,7 +354,7 @@ export async function askAlMizanAssistant(
   modelUsed?: string;
   isFailoverUsed: boolean;
 }> {
-  const config = getAIRunnerConfig();
+  const config = (await getAIRunnerConfig());
   const timeoutMs = (config.timeoutSeconds || 30) * 1000;
 
   // Security & Prompt Injection Defense:

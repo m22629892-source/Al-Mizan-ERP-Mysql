@@ -1,4 +1,5 @@
-import { Router, Response } from 'express';
+import { Router } from '../mysql-router.js';
+import { Response } from 'express';
 import * as XLSX from 'xlsx';
 import Decimal from 'decimal.js';
 import crypto from 'crypto';
@@ -93,8 +94,8 @@ if (cleanupTimer.unref) cleanupTimer.unref();
 /**
  * Helper: Retrieve and validate session ownership
  */
-function getValidSession(sessionId: string, req: AuthenticatedRequest, res: Response): AnalyticsSession | null {
-  const session = sessionsMap.get(sessionId);
+ async function getValidSession(sessionId: string, req: AuthenticatedRequest, res: Response): Promise<AnalyticsSession | null> {
+  const session = (await sessionsMap.get(sessionId));
   if (!session) {
     res.status(404).json({ error: 'جلسة التحليل غير موجودة أو انتهت صلاحيتها. يرجى رفع الملف مجدداً.' });
     return null;
@@ -265,8 +266,8 @@ excelAnalyticsRouter.get(
   '/sessions/:sessionId',
   requireAuth,
   requirePermission('excel_analytics.view', 'import.excel', 'excel_import.view'),
-  (req: AuthenticatedRequest, res: Response) => {
-    const session = getValidSession(req.params.sessionId, req, res);
+  async (req: AuthenticatedRequest, res: Response) => {
+    const session = (await getValidSession(req.params.sessionId, req, res));
     if (!session) return;
 
     const activeParsed = session.sheetsData[session.activeSheetName];
@@ -291,8 +292,8 @@ excelAnalyticsRouter.post(
   '/sessions/:sessionId/sheet',
   requireAuth,
   requirePermission('excel_analytics.view', 'import.excel', 'excel_import.view'),
-  (req: AuthenticatedRequest, res: Response) => {
-    const session = getValidSession(req.params.sessionId, req, res);
+  async (req: AuthenticatedRequest, res: Response) => {
+    const session = (await getValidSession(req.params.sessionId, req, res));
     if (!session) return;
 
     const { sheetName, headerRowIndex, columnTypeOverrides } = req.body;
@@ -344,8 +345,8 @@ excelAnalyticsRouter.post(
   '/sessions/:sessionId/mapping',
   requireAuth,
   requirePermission('excel_analytics.view', 'import.excel', 'excel_import.view'),
-  (req: AuthenticatedRequest, res: Response) => {
-    const session = getValidSession(req.params.sessionId, req, res);
+  async (req: AuthenticatedRequest, res: Response) => {
+    const session = (await getValidSession(req.params.sessionId, req, res));
     if (!session) return;
 
     const { sheetName, mapping } = req.body;
@@ -378,8 +379,8 @@ excelAnalyticsRouter.post(
   '/sessions/:sessionId/filter',
   requireAuth,
   requirePermission('excel_analytics.view', 'import.excel', 'excel_import.view'),
-  (req: AuthenticatedRequest, res: Response) => {
-    const session = getValidSession(req.params.sessionId, req, res);
+  async (req: AuthenticatedRequest, res: Response) => {
+    const session = (await getValidSession(req.params.sessionId, req, res));
     if (!session) return;
 
     const { filters, groupByCol, amountCol, periodFilter, targetCurrency, dataLevel } = req.body;
@@ -451,7 +452,7 @@ excelAnalyticsRouter.post(
     const effectiveGroupCol = groupByCol || activeParsed.sheetAnalysis.columns.find(c => /عميل|مورد|صنف|فرع|customer|supplier|item|branch/i.test(c.name))?.name;
 
     if (effectiveAmountCol && effectiveGroupCol) {
-      groupResult = groupRows(matchingRows, effectiveGroupCol, effectiveAmountCol, 'custom', effectiveCurrCol);
+      groupResult = (await groupRows(matchingRows, effectiveGroupCol, effectiveAmountCol, 'custom', effectiveCurrCol));
       groupResult.items = groupResult.items.slice(0, 15);
     }
 
@@ -502,8 +503,8 @@ excelAnalyticsRouter.post(
   '/sessions/:sessionId/statistical-test',
   requireAuth,
   requirePermission('excel_analytics.view', 'import.excel', 'excel_import.view'),
-  (req: AuthenticatedRequest, res: Response) => {
-    const session = getValidSession(req.params.sessionId, req, res);
+  async (req: AuthenticatedRequest, res: Response) => {
+    const session = (await getValidSession(req.params.sessionId, req, res));
     if (!session) return;
 
     const {
@@ -561,7 +562,7 @@ excelAnalyticsRouter.post(
         testResult = runCorrelationTest(matchingRows, col1, col2, currency, numAlpha, session.activeSheetName);
         break;
       case 'two_independent_groups':
-        testResult = runTwoIndependentGroupsTest(
+        testResult = (await runTwoIndependentGroupsTest(
           matchingRows,
           col1,
           col2,
@@ -570,10 +571,10 @@ excelAnalyticsRouter.post(
           currency,
           numAlpha,
           session.activeSheetName
-        );
+        ));
         break;
       case 'paired_samples':
-        testResult = runPairedSamplesTest(
+        testResult = (await runPairedSamplesTest(
           matchingRows,
           col1,
           col2,
@@ -581,10 +582,10 @@ excelAnalyticsRouter.post(
           currency,
           numAlpha,
           session.activeSheetName
-        );
+        ));
         break;
       case 'anova_kruskal':
-        testResult = runAnovaAndKruskalTest(matchingRows, col1, col2, currency, numAlpha, session.activeSheetName);
+        testResult = (await runAnovaAndKruskalTest(matchingRows, col1, col2, currency, numAlpha, session.activeSheetName));
         break;
       case 'contingency_table':
         testResult = runContingencyTest(matchingRows, col1, col2, numAlpha, session.activeSheetName);
@@ -611,8 +612,8 @@ excelAnalyticsRouter.post(
   '/sessions/:sessionId/export-statistical-test',
   requireAuth,
   requirePermission('excel_analytics.export', 'excel_analytics.view', 'import.excel'),
-  (req: AuthenticatedRequest, res: Response) => {
-    const session = getValidSession(req.params.sessionId, req, res);
+  async (req: AuthenticatedRequest, res: Response) => {
+    const session = (await getValidSession(req.params.sessionId, req, res));
     if (!session) return;
 
     const { testResult } = req.body;
@@ -683,7 +684,7 @@ excelAnalyticsRouter.post(
   requireAuth,
   requirePermission('excel_analytics.chat', 'excel_analytics.view', 'import.excel'),
   async (req: AuthenticatedRequest, res: Response) => {
-    const session = getValidSession(req.params.sessionId, req, res);
+    const session = (await getValidSession(req.params.sessionId, req, res));
     if (!session) return;
 
     const { question, activeFilters } = req.body;
@@ -698,15 +699,15 @@ excelAnalyticsRouter.post(
         question,
         activeParsed.sheetAnalysis,
         session.chatHistory,
-        (plan: AnalysisPlan) => {
+        async (plan: AnalysisPlan) => {
           // If active UI filters are present, merge them with the plan
           if (activeFilters && Array.isArray(activeFilters) && activeFilters.length > 0) {
             plan.filters = [...(plan.filters || []), ...activeFilters];
           }
-          return executeAnalysisPlan(plan, {
+          return (await executeAnalysisPlan(plan, {
             sheetAnalysis: activeParsed.sheetAnalysis,
             rows: activeParsed.rows
-          });
+          }));
         }
       );
 
@@ -753,8 +754,8 @@ excelAnalyticsRouter.post(
   '/sessions/:sessionId/matching-rows',
   requireAuth,
   requirePermission('excel_analytics.view', 'import.excel', 'excel_import.view'),
-  (req: AuthenticatedRequest, res: Response) => {
-    const session = getValidSession(req.params.sessionId, req, res);
+  async (req: AuthenticatedRequest, res: Response) => {
+    const session = (await getValidSession(req.params.sessionId, req, res));
     if (!session) return;
 
     const { indices } = req.body;
@@ -783,8 +784,8 @@ excelAnalyticsRouter.post(
   '/sessions/:sessionId/export',
   requireAuth,
   requirePermission('excel_analytics.export', 'excel_analytics.view', 'import.excel'),
-  (req: AuthenticatedRequest, res: Response) => {
-    const session = getValidSession(req.params.sessionId, req, res);
+  async (req: AuthenticatedRequest, res: Response) => {
+    const session = (await getValidSession(req.params.sessionId, req, res));
     if (!session) return;
 
     const { indices, summaryTitle } = req.body;
@@ -832,8 +833,8 @@ excelAnalyticsRouter.post(
 /**
  * DELETE /sessions/:sessionId: Close & purge analysis session
  */
-excelAnalyticsRouter.delete('/sessions/:sessionId', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-  const session = sessionsMap.get(req.params.sessionId);
+excelAnalyticsRouter.delete('/sessions/:sessionId', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const session = (await sessionsMap.get(req.params.sessionId));
   if (session && (req.user?.role === 'owner' || session.userId === req.user?.id)) {
     sessionsMap.delete(req.params.sessionId);
   }
@@ -846,8 +847,8 @@ excelAnalyticsRouter.delete('/sessions/:sessionId', requireAuth, (req: Authentic
 excelAnalyticsRouter.get(
   '/ai-settings',
   requireAuth,
-  (req: AuthenticatedRequest, res: Response) => {
-    const config = getAIRunnerConfig();
+  async (req: AuthenticatedRequest, res: Response) => {
+    const config = (await getAIRunnerConfig());
     res.json({
       success: true,
       config,
@@ -867,19 +868,19 @@ excelAnalyticsRouter.post(
   '/ai-settings',
   requireAuth,
   requirePermission('manage_settings', 'users.manage'),
-  (req: AuthenticatedRequest, res: Response) => {
+  async (req: AuthenticatedRequest, res: Response) => {
     const { runnerUrl, primaryModel, fallbackModel, timeoutSeconds } = req.body;
-    saveAIRunnerConfig({
+    (await saveAIRunnerConfig({
       runnerUrl,
       primaryModel,
       fallbackModel,
       timeoutSeconds
-    });
+    }));
 
     res.json({
       success: true,
       message: 'تم حفظ إعدادات مشغل الذكاء الاصطناعي المحلي بنجاح.',
-      config: getAIRunnerConfig()
+      config: (await getAIRunnerConfig())
     });
   }
 );
@@ -892,7 +893,7 @@ excelAnalyticsRouter.post(
   requireAuth,
   requirePermission('manage_settings', 'users.manage'),
   async (req: AuthenticatedRequest, res: Response) => {
-    const config = getAIRunnerConfig();
+    const config = (await getAIRunnerConfig());
     const result = await testAIRunnerConnection(config);
     res.json(result);
   }

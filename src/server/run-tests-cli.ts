@@ -5,7 +5,7 @@ console.log('🚀 Running Al-Mizan ERP Financial Acceptance Test Suite');
 console.log('====================================================');
 
 const startTime = Date.now();
-const { summary, results } = runAllFinancialTests();
+const { summary, results } = (await runAllFinancialTests());
 const totalDuration = Date.now() - startTime;
 
 results.forEach(res => {

@@ -1,4 +1,5 @@
-import { Router, Response } from 'express';
+import { Router } from '../mysql-router.js';
+import { Response } from 'express';
 import Decimal from 'decimal.js';
 import { db } from '../db.js';
 import { AuthenticatedRequest, requireAuth, requirePermission, isBranchAllowed } from '../api.js';
@@ -16,7 +17,7 @@ function diffDays(laterDateStr: string, earlierDateStr: string): number {
 /**
  * GET /receivables: Customer Aging Report as of Date
  */
-agingRouter.get('/receivables', requireAuth, requirePermission('aging.receivables', 'reports.aging.customers', 'reports.view'), (req: AuthenticatedRequest, res: Response) => {
+agingRouter.get('/receivables', requireAuth, requirePermission('aging.receivables', 'reports.aging.customers', 'reports.view'), async (req: AuthenticatedRequest, res: Response) => {
   const asOfDate = (req.query.asOfDate as string) || new Date().toISOString().split('T')[0];
   const branchId = req.query.branchId as string;
   const partyId = req.query.partyId as string;
@@ -38,12 +39,12 @@ agingRouter.get('/receivables', requireAuth, requirePermission('aging.receivable
       partyParams.push(currency);
     }
 
-    const parties = db.prepare(`
+    const parties = (await db.prepare(`
       SELECT p.id, p.code, p.name_ar, p.phone, p.credit_limit, p.payment_terms_days, p.currency_code
       FROM parties p
       ${partyFilter}
       ORDER BY p.name_ar ASC
-    `).all(...partyParams) as any[];
+    `).all(...partyParams)) as any[];
 
     const resultRows: AgingBucketRow[] = [];
     let grandTotal = new Decimal(0);
@@ -68,7 +69,7 @@ agingRouter.get('/receivables', requireAuth, requirePermission('aging.receivable
         invParams.push(branchId);
       }
 
-      const invoices = db.prepare(invQuery).all(...invParams) as any[];
+      const invoices = (await db.prepare(invQuery).all(...invParams)) as any[];
 
       let partyNotDue = new Decimal(0);
       let party1to30 = new Decimal(0);
@@ -84,19 +85,19 @@ agingRouter.get('/receivables', requireAuth, requirePermission('aging.receivable
         const totalAmt = new Decimal(inv.total_amount || 0);
 
         // Historical payments allocated to this invoice on or before asOfDate
-        const allocRow = db.prepare(`
+        const allocRow = (await db.prepare(`
           SELECT COALESCE(SUM(va.allocated_amount), 0) as paid_as_of
           FROM voucher_allocations va
           JOIN payment_vouchers pv ON va.voucher_id = pv.id
           WHERE va.invoice_id = ? AND pv.status = 'posted' AND pv.voucher_date <= ?
-        `).get(inv.id, asOfDate) as { paid_as_of: number };
+        `).get(inv.id, asOfDate)) as { paid_as_of: number };
 
         // Historical sales returns on or before asOfDate
-        const retRow = db.prepare(`
+        const retRow = (await db.prepare(`
           SELECT COALESCE(SUM(sr.total_amount), 0) as ret_as_of
           FROM sales_returns sr
           WHERE sr.original_invoice_id = ? AND sr.status = 'posted' AND sr.return_date <= ?
-        `).get(inv.id, asOfDate) as { ret_as_of: number };
+        `).get(inv.id, asOfDate)) as { ret_as_of: number };
 
         const paidAsOf = new Decimal(allocRow?.paid_as_of || 0);
         const retAsOf = new Decimal(retRow?.ret_as_of || 0);
@@ -138,11 +139,11 @@ agingRouter.get('/receivables', requireAuth, requirePermission('aging.receivable
       }
 
       // Check unallocated receipt vouchers as of date
-      const unallocRow = db.prepare(`
+      const unallocRow = (await db.prepare(`
         SELECT COALESCE(SUM(unallocated_amount), 0) as unalloc_total
         FROM payment_vouchers
         WHERE party_id = ? AND voucher_type = 'receipt' AND status = 'posted' AND voucher_date <= ?
-      `).get(party.id, asOfDate) as { unalloc_total: number };
+      `).get(party.id, asOfDate)) as { unalloc_total: number };
 
       const unalloc = new Decimal(unallocRow?.unalloc_total || 0);
 
@@ -198,7 +199,7 @@ agingRouter.get('/receivables', requireAuth, requirePermission('aging.receivable
 /**
  * GET /payables: Supplier Aging Report as of Date
  */
-agingRouter.get('/payables', requireAuth, requirePermission('aging.payables', 'reports.aging.suppliers', 'reports.view'), (req: AuthenticatedRequest, res: Response) => {
+agingRouter.get('/payables', requireAuth, requirePermission('aging.payables', 'reports.aging.suppliers', 'reports.view'), async (req: AuthenticatedRequest, res: Response) => {
   const asOfDate = (req.query.asOfDate as string) || new Date().toISOString().split('T')[0];
   const branchId = req.query.branchId as string;
   const partyId = req.query.partyId as string;
@@ -220,12 +221,12 @@ agingRouter.get('/payables', requireAuth, requirePermission('aging.payables', 'r
       partyParams.push(currency);
     }
 
-    const parties = db.prepare(`
+    const parties = (await db.prepare(`
       SELECT p.id, p.code, p.name_ar, p.phone, p.credit_limit, p.payment_terms_days, p.currency_code
       FROM parties p
       ${partyFilter}
       ORDER BY p.name_ar ASC
-    `).all(...partyParams) as any[];
+    `).all(...partyParams)) as any[];
 
     const resultRows: AgingBucketRow[] = [];
     let grandTotal = new Decimal(0);
@@ -250,7 +251,7 @@ agingRouter.get('/payables', requireAuth, requirePermission('aging.payables', 'r
         invParams.push(branchId);
       }
 
-      const invoices = db.prepare(invQuery).all(...invParams) as any[];
+      const invoices = (await db.prepare(invQuery).all(...invParams)) as any[];
 
       let partyNotDue = new Decimal(0);
       let party1to30 = new Decimal(0);
@@ -266,19 +267,19 @@ agingRouter.get('/payables', requireAuth, requirePermission('aging.payables', 'r
         const totalAmt = new Decimal(inv.total_amount || 0);
 
         // Historical payments allocated to this invoice on or before asOfDate
-        const allocRow = db.prepare(`
+        const allocRow = (await db.prepare(`
           SELECT COALESCE(SUM(va.allocated_amount), 0) as paid_as_of
           FROM voucher_allocations va
           JOIN payment_vouchers pv ON va.voucher_id = pv.id
           WHERE va.invoice_id = ? AND pv.status = 'posted' AND pv.voucher_date <= ?
-        `).get(inv.id, asOfDate) as { paid_as_of: number };
+        `).get(inv.id, asOfDate)) as { paid_as_of: number };
 
         // Historical purchase returns on or before asOfDate
-        const retRow = db.prepare(`
+        const retRow = (await db.prepare(`
           SELECT COALESCE(SUM(pr.total_amount), 0) as ret_as_of
           FROM purchase_returns pr
           WHERE pr.original_invoice_id = ? AND pr.status = 'posted' AND pr.return_date <= ?
-        `).get(inv.id, asOfDate) as { ret_as_of: number };
+        `).get(inv.id, asOfDate)) as { ret_as_of: number };
 
         const paidAsOf = new Decimal(allocRow?.paid_as_of || 0);
         const retAsOf = new Decimal(retRow?.ret_as_of || 0);
@@ -320,11 +321,11 @@ agingRouter.get('/payables', requireAuth, requirePermission('aging.payables', 'r
       }
 
       // Check unallocated payment vouchers as of date
-      const unallocRow = db.prepare(`
+      const unallocRow = (await db.prepare(`
         SELECT COALESCE(SUM(unallocated_amount), 0) as unalloc_total
         FROM payment_vouchers
         WHERE party_id = ? AND voucher_type = 'payment' AND status = 'posted' AND voucher_date <= ?
-      `).get(party.id, asOfDate) as { unalloc_total: number };
+      `).get(party.id, asOfDate)) as { unalloc_total: number };
 
       const unalloc = new Decimal(unallocRow?.unalloc_total || 0);
 

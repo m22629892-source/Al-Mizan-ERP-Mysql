@@ -1,4 +1,5 @@
-import { Router, Request, Response, NextFunction } from 'express';
+import { Router } from './mysql-router.js';
+import { Request, Response, NextFunction } from 'express';
 import Decimal from 'decimal.js';
 import crypto from 'crypto';
 import { db, effectivePermissions } from './db.js';
@@ -40,7 +41,7 @@ export interface AuthenticatedRequest extends Request {
 // ----------------------------------------------------
 // Authentication Middleware
 // ----------------------------------------------------
-export function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+export async function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   const authHeader = req.headers.authorization;
   let token = '';
 
@@ -54,20 +55,20 @@ export function requireAuth(req: AuthenticatedRequest, res: Response, next: Next
     return res.status(401).json({ error: 'غير مصرح: يجب تسجيل الدخول للوصول إلى هذا المورد' });
   }
 
-  const session = db.prepare(`
+  const session = (await db.prepare(`
     SELECT s.token, s.expires_at, u.id, u.username, u.display_name, u.role, u.is_active,
            u.allowed_branch_ids, u.allowed_warehouse_ids, u.allowed_cashbox_ids
     FROM user_sessions s
     JOIN users u ON s.user_id = u.id
     WHERE s.token = ?
-  `).get(token) as any;
+  `).get(token)) as any;
 
   if (!session) {
     return res.status(401).json({ error: 'جلسة الدخول غير صالحة أو منتهية. يرجى تسجيل الدخول مجدداً.' });
   }
 
   if (new Date(session.expires_at) < new Date()) {
-    db.prepare('DELETE FROM user_sessions WHERE token = ?').run(token);
+    (await db.prepare('DELETE FROM user_sessions WHERE token = ?').run(token));
     return res.status(401).json({ error: 'انتهت مدة الجلسة. يرجى تسجيل الدخول مجدداً.' });
   }
 
@@ -76,7 +77,7 @@ export function requireAuth(req: AuthenticatedRequest, res: Response, next: Next
   }
 
   // Load user permissions dynamically (individual permissions take precedence, else role defaults)
-  const permissions = effectivePermissions(session.id, session.role);
+  const permissions = (await effectivePermissions(session.id, session.role));
   
   req.user = {
     id: session.id,
@@ -156,21 +157,21 @@ export function isCashboxAllowed(user: AuthenticatedRequest['user'], cashboxId: 
 }
 
 // Helper: Handle Idempotency Key bound to User, Endpoint, and Request Hash
-export function checkIdempotency(req: AuthenticatedRequest, res: Response): any | null {
+export async function checkIdempotency(req: AuthenticatedRequest, res: Response): Promise<any | null> {
   const key = (req.headers['idempotency-key'] || req.body?.idempotencyKey) as string | undefined;
   if (!key) return null;
 
   const requestHash = crypto.createHash('sha256').update(JSON.stringify(req.body || {})).digest('hex');
   const userId = req.user?.id || 'anonymous';
 
-  const existing = db.prepare(`
+  const existing = (await db.prepare(`
     SELECT user_id, endpoint, request_hash, response_code, response_body 
     FROM idempotency_keys 
-    WHERE key = ?
-  `).get(key) as { user_id: string; endpoint: string; request_hash: string; response_code: number; response_body: string } | undefined;
+    WHERE \`key\` = ?
+  `).get(key)) as { user_id: string; endpoint: string; request_hash: string; response_code: number; response_body: string } | undefined;
 
   if (existing) {
-    if (existing.user_id !== userId || existing.request_hash !== requestHash) {
+    if (existing.user_id !== userId || existing.endpoint !== req.path || existing.request_hash !== requestHash) {
       res.status(409).json({
         error: 'تعارض في مفتاح عدم التكرار (Idempotency Key Conflict): هذا المفتاح مسجل مسبقاً بمحتوى طلب أو مستخدم مختلف.'
       });
@@ -187,24 +188,25 @@ export function checkIdempotency(req: AuthenticatedRequest, res: Response): any 
   return null;
 }
 
-export function saveIdempotency(key: string | undefined, userId: string, endpoint: string, code: number, body: any, reqBody?: any) {
+export async function saveIdempotency(key: string | undefined, userId: string, endpoint: string, code: number, body: any, reqBody?: any) {
   if (!key) return;
   try {
     const requestHash = crypto.createHash('sha256').update(JSON.stringify(reqBody || {})).digest('hex');
-    db.prepare(`
-      INSERT INTO idempotency_keys (key, user_id, endpoint, request_hash, response_code, response_body)
+    (await db.prepare(`
+      INSERT INTO idempotency_keys (\`key\`, user_id, endpoint, request_hash, response_code, response_body)
       VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(key) DO UPDATE SET response_code = ?, response_body = ?
-    `).run(key, userId, endpoint, requestHash, code, JSON.stringify(body), code, JSON.stringify(body));
+      ON DUPLICATE KEY UPDATE response_code = ?, response_body = ?
+    `).run(key, userId, endpoint, requestHash, code, JSON.stringify(body), code, JSON.stringify(body)));
   } catch (err) {
     console.error('Failed to save idempotency key:', err);
+    throw err;
   }
 }
 
 // ----------------------------------------------------
 // 1. Auth Endpoints
 // ----------------------------------------------------
-apiRouter.post('/auth/login', (req, res) => {
+apiRouter.post('/auth/login', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
     return res.status(400).json({ error: 'اسم المستخدم وكلمة المرور مطلوبان' });
@@ -214,21 +216,21 @@ apiRouter.post('/auth/login', (req, res) => {
   const attemptKey = `${clientIp}_${username}`;
 
   // Check login rate limiting
-  const attempt = db.prepare('SELECT attempts, locked_until FROM login_attempts WHERE ip_or_user = ?').get(attemptKey) as { attempts: number; locked_until: string | null } | undefined;
+  const attempt = (await db.prepare('SELECT attempts, locked_until FROM login_attempts WHERE ip_or_user = ?').get(attemptKey)) as { attempts: number; locked_until: string | null } | undefined;
   if (attempt && attempt.locked_until && new Date(attempt.locked_until) > new Date()) {
     const remainingMins = Math.ceil((new Date(attempt.locked_until).getTime() - Date.now()) / 60000);
     return res.status(429).json({ error: `تم تجاوز الحد الأقصى لمحاولات الدخول. الحساب مؤمّن ومغلق لمدة ${remainingMins} دقيقة.` });
   }
 
-  const user = db.prepare('SELECT id, username, password_hash, display_name, role, is_active, allowed_branch_ids, allowed_warehouse_ids, allowed_cashbox_ids FROM users WHERE username = ?').get(username) as any;
+  const user = (await db.prepare('SELECT id, username, password_hash, display_name, role, is_active, allowed_branch_ids, allowed_warehouse_ids, allowed_cashbox_ids FROM users WHERE username = ?').get(username)) as any;
 
   if (!user) {
     // Increment failed attempt
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO login_attempts (ip_or_user, attempts, last_attempt)
       VALUES (?, 1, CURRENT_TIMESTAMP)
-      ON CONFLICT(ip_or_user) DO UPDATE SET attempts = attempts + 1, last_attempt = CURRENT_TIMESTAMP
-    `).run(attemptKey);
+      ON DUPLICATE KEY UPDATE attempts = attempts + 1, last_attempt = CURRENT_TIMESTAMP
+    `).run(attemptKey));
     return res.status(401).json({ error: 'اسم المستخدم أو كلمة المرور غير صحيحة' });
   }
 
@@ -245,47 +247,47 @@ apiRouter.post('/auth/login', (req, res) => {
       lockUntil = new Date(Date.now() + 15 * 60 * 1000).toISOString();
     }
 
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO login_attempts (ip_or_user, attempts, last_attempt, locked_until)
       VALUES (?, ?, CURRENT_TIMESTAMP, ?)
-      ON CONFLICT(ip_or_user) DO UPDATE SET attempts = ?, last_attempt = CURRENT_TIMESTAMP, locked_until = ?
-    `).run(attemptKey, currentAttempts, lockUntil, currentAttempts, lockUntil);
+      ON DUPLICATE KEY UPDATE attempts = ?, last_attempt = CURRENT_TIMESTAMP, locked_until = ?
+    `).run(attemptKey, currentAttempts, lockUntil, currentAttempts, lockUntil));
 
     return res.status(401).json({ error: 'اسم المستخدم أو كلمة المرور غير صحيحة' });
   }
 
   // Clear failed login attempts on success
-  db.prepare('DELETE FROM login_attempts WHERE ip_or_user = ?').run(attemptKey);
+  (await db.prepare('DELETE FROM login_attempts WHERE ip_or_user = ?').run(attemptKey));
 
   // Upgrade legacy SHA-256 hash to bcrypt transparently
   if (verification.needsRehash) {
     const newBcryptHash = hashPassword(password);
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newBcryptHash, user.id);
+    (await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newBcryptHash, user.id));
   }
 
   // Generate secure 64-char hex session token
   const token = crypto.randomBytes(32).toString('hex');
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // 24 hours
 
-  db.prepare(`
+  (await db.prepare(`
     INSERT INTO user_sessions (token, user_id, expires_at)
     VALUES (?, ?, ?)
-  `).run(token, user.id, expiresAt);
+  `).run(token, user.id, expiresAt));
 
   // Fetch true effective permissions (individual if custom, else role)
-  user.permissions = effectivePermissions(user.id, user.role);
+  user.permissions = (await effectivePermissions(user.id, user.role));
   delete user.password_hash;
 
-  logAudit(user.id, 'LOGIN', 'users', user.id, `تسجيل دخول ناجح للمستخدم ${user.display_name}`, null, null);
+  (await logAudit(user.id, 'LOGIN', 'users', user.id, `تسجيل دخول ناجح للمستخدم ${user.display_name}`, null, null));
 
   res.json({ token, user });
 });
 
-apiRouter.post('/auth/logout', requireAuth, (req: AuthenticatedRequest, res) => {
+apiRouter.post('/auth/logout', requireAuth, async (req: AuthenticatedRequest, res) => {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.substring(7);
-    db.prepare('DELETE FROM user_sessions WHERE token = ?').run(token);
+    (await db.prepare('DELETE FROM user_sessions WHERE token = ?').run(token));
   }
   res.json({ success: true, message: 'تم تسجيل الخروج وإبطال الجلسة بنجاح.' });
 });
@@ -297,19 +299,19 @@ apiRouter.get('/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
 // ----------------------------------------------------
 // 2. User & Permission Management (Full Admin Management)
 // ----------------------------------------------------
-apiRouter.get('/users', requireAuth, requirePermission('users.view', 'users.manage', 'manage_settings'), (req: AuthenticatedRequest, res) => {
-  const rawUsers = db.prepare(`
+apiRouter.get('/users', requireAuth, requirePermission('users.view', 'users.manage', 'manage_settings'), async (req: AuthenticatedRequest, res) => {
+  const rawUsers = (await db.prepare(`
     SELECT u.id, u.username, u.display_name, u.role, u.is_active, u.created_at,
            u.allowed_branch_ids, u.allowed_warehouse_ids, u.allowed_cashbox_ids,
            ip.permission_keys as custom_perm_json
     FROM users u
     LEFT JOIN individual_permissions ip ON u.id = ip.user_id
     ORDER BY u.created_at ASC
-  `).all() as any[];
+  `).all()) as any[];
 
-  const users = rawUsers.map(u => {
+  const users = (await Promise.all(rawUsers.map(async u => {
     const isCustom = u.custom_perm_json !== null && u.custom_perm_json !== undefined;
-    const perms = effectivePermissions(u.id, u.role);
+    const perms = (await effectivePermissions(u.id, u.role));
     delete u.custom_perm_json;
     return {
       ...u,
@@ -317,12 +319,12 @@ apiRouter.get('/users', requireAuth, requirePermission('users.view', 'users.mana
       permissions: perms,
       permissions_csv: perms.join(',')
     };
-  });
+  })));
 
   res.json({ users });
 });
 
-apiRouter.post('/users', requireAuth, requirePermission('manage_settings'), (req: AuthenticatedRequest, res) => {
+apiRouter.post('/users', requireAuth, requirePermission('manage_settings'), async (req: AuthenticatedRequest, res) => {
   const { username, password, display_name, role, allowed_branch_ids, allowed_warehouse_ids, allowed_cashbox_ids } = req.body;
   if (!username || !password || !display_name || !role) {
     return res.status(400).json({ error: 'بيانات المستخدم الأساسية ناقصة.' });
@@ -350,7 +352,7 @@ apiRouter.post('/users', requireAuth, requirePermission('manage_settings'), (req
     const cleanWarehouseScope = validateScope(allowed_warehouse_ids, 'المستودعات');
     const cleanCashboxScope = validateScope(allowed_cashbox_ids, 'الخزائن والبنوك');
 
-    const existingUser = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+    const existingUser = (await db.prepare('SELECT id FROM users WHERE username = ?').get(username));
     if (existingUser) {
       return res.status(400).json({ error: `اسم المستخدم "${username}" مسجل مسبقاً في النظام.` });
     }
@@ -358,7 +360,7 @@ apiRouter.post('/users', requireAuth, requirePermission('manage_settings'), (req
     const userId = `usr_${username.toLowerCase().replace(/[^a-z0-9_]/g, '')}_${Date.now().toString().slice(-4)}`;
     const passHash = hashPassword(password);
 
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO users (id, username, password_hash, display_name, role, is_active, allowed_branch_ids, allowed_warehouse_ids, allowed_cashbox_ids)
       VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
     `).run(
@@ -370,17 +372,17 @@ apiRouter.post('/users', requireAuth, requirePermission('manage_settings'), (req
       cleanBranchScope,
       cleanWarehouseScope,
       cleanCashboxScope
-    );
+    ));
 
-    logAudit(req.user!.id, 'CREATE_USER', 'users', userId, `إنشاء مستخدم جديد: ${username} بالدور: ${role}`);
+    (await logAudit(req.user!.id, 'CREATE_USER', 'users', userId, `إنشاء مستخدم جديد: ${username} بالدور: ${role}`));
     res.json({ success: true, userId, message: `تم إنشاء المستخدم "${display_name}" بنجاح.` });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-apiRouter.put('/users/:id', requireAuth, requirePermission('manage_settings'), (req: AuthenticatedRequest, res) => {
-  const targetUser = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id) as any;
+apiRouter.put('/users/:id', requireAuth, requirePermission('manage_settings'), async (req: AuthenticatedRequest, res) => {
+  const targetUser = (await db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id)) as any;
   if (!targetUser) return res.status(404).json({ error: 'المستخدم غير موجود' });
 
   const { is_active, role, password, display_name, allowed_branch_ids, allowed_warehouse_ids, allowed_cashbox_ids } = req.body;
@@ -402,7 +404,7 @@ apiRouter.put('/users/:id', requireAuth, requirePermission('manage_settings'), (
 
   // 4. Protect the last active owner from being deactivated or changed
   if (targetUser.role === 'owner' && (is_active === 0 || (role && role !== 'owner'))) {
-    const ownerCount = db.prepare("SELECT COUNT(*) as cnt FROM users WHERE role = 'owner' AND is_active = 1").get() as { cnt: number };
+    const ownerCount = (await db.prepare("SELECT COUNT(*) as cnt FROM users WHERE role = 'owner' AND is_active = 1").get()) as { cnt: number };
     if (ownerCount.cnt <= 1) {
       return res.status(400).json({ error: 'لا يمكن تعطيل أو تغيير دور مالك النظام الوحيد النشط.' });
     }
@@ -428,12 +430,12 @@ apiRouter.put('/users/:id', requireAuth, requirePermission('manage_settings'), (
 
     if (password) {
       const newHash = hashPassword(password);
-      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, targetUser.id);
+      (await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, targetUser.id));
       // Invalidate all existing sessions on password reset
-      db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(targetUser.id);
+      (await db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(targetUser.id));
     }
 
-    db.prepare(`
+    (await db.prepare(`
       UPDATE users 
       SET is_active = COALESCE(?, is_active),
           role = COALESCE(?, role),
@@ -450,17 +452,17 @@ apiRouter.put('/users/:id', requireAuth, requirePermission('manage_settings'), (
       cleanWarehouseScope,
       cleanCashboxScope,
       targetUser.id
-    );
+    ));
 
-    logAudit(req.user!.id, 'UPDATE_USER', 'users', targetUser.id, `تعديل بيانات وصلاحيات المستخدم: ${targetUser.username}`);
+    (await logAudit(req.user!.id, 'UPDATE_USER', 'users', targetUser.id, `تعديل بيانات وصلاحيات المستخدم: ${targetUser.username}`));
     res.json({ success: true, message: 'تم تحديث بيانات المستخدم وصلاحياته بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-apiRouter.delete('/users/:id', requireAuth, requirePermission('manage_settings'), (req: AuthenticatedRequest, res) => {
-  const targetUser = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id) as any;
+apiRouter.delete('/users/:id', requireAuth, requirePermission('manage_settings'), async (req: AuthenticatedRequest, res) => {
+  const targetUser = (await db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id)) as any;
   if (!targetUser) return res.status(404).json({ error: 'المستخدم غير موجود' });
 
   if (targetUser.id === req.user?.id) {
@@ -472,9 +474,9 @@ apiRouter.delete('/users/:id', requireAuth, requirePermission('manage_settings')
   }
 
   // Check if user is referenced in journal entries or invoices
-  const jeCount = db.prepare('SELECT COUNT(*) as cnt FROM journal_entries WHERE created_by = ?').get(targetUser.id) as { cnt: number };
-  const siCount = db.prepare('SELECT COUNT(*) as cnt FROM sales_invoices WHERE created_by = ?').get(targetUser.id) as { cnt: number };
-  const piCount = db.prepare('SELECT COUNT(*) as cnt FROM purchase_invoices WHERE created_by = ?').get(targetUser.id) as { cnt: number };
+  const jeCount = (await db.prepare('SELECT COUNT(*) as cnt FROM journal_entries WHERE created_by = ?').get(targetUser.id)) as { cnt: number };
+  const siCount = (await db.prepare('SELECT COUNT(*) as cnt FROM sales_invoices WHERE created_by = ?').get(targetUser.id)) as { cnt: number };
+  const piCount = (await db.prepare('SELECT COUNT(*) as cnt FROM purchase_invoices WHERE created_by = ?').get(targetUser.id)) as { cnt: number };
 
   if (jeCount.cnt > 0 || siCount.cnt > 0 || piCount.cnt > 0) {
     return res.status(400).json({
@@ -483,9 +485,9 @@ apiRouter.delete('/users/:id', requireAuth, requirePermission('manage_settings')
   }
 
   try {
-    db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(targetUser.id);
-    db.prepare('DELETE FROM users WHERE id = ?').run(targetUser.id);
-    logAudit(req.user!.id, 'DELETE_USER', 'users', targetUser.id, `حذف المستخدم: ${targetUser.username}`);
+    (await db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(targetUser.id));
+    (await db.prepare('DELETE FROM users WHERE id = ?').run(targetUser.id));
+    (await logAudit(req.user!.id, 'DELETE_USER', 'users', targetUser.id, `حذف المستخدم: ${targetUser.username}`));
     res.json({ success: true, message: 'تم حذف المستخدم بنجاح.' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -611,7 +613,7 @@ export const SYSTEM_AVAILABLE_PERMISSIONS = [
   { key: 'treasury.post', label_ar: 'ترحيل خزينة عام', category: 'توافق عام', unit: 'treasury', action: 'post' }
 ];
 
-apiRouter.get('/permissions-matrix', requireAuth, (req, res) => {
+apiRouter.get('/permissions-matrix', requireAuth, async (req, res) => {
   const roles = [
     { id: 'owner', name: 'المالك / Super Admin' },
     { id: 'admin', name: 'مدير النظام' },
@@ -624,7 +626,7 @@ apiRouter.get('/permissions-matrix', requireAuth, (req, res) => {
     { id: 'auditor_readonly', name: 'مراجع حسابات (قراءة فقط)' },
   ];
 
-  const allPerms = db.prepare('SELECT role, permission_key FROM user_permissions').all() as { role: string; permission_key: string }[];
+  const allPerms = (await db.prepare('SELECT role, permission_key FROM user_permissions').all()) as { role: string; permission_key: string }[];
   const rolePermissions: Record<string, string[]> = {};
   roles.forEach(r => { rolePermissions[r.id] = []; });
   allPerms.forEach(p => {
@@ -639,7 +641,7 @@ apiRouter.get('/permissions-matrix', requireAuth, (req, res) => {
   });
 });
 
-apiRouter.put('/roles/:role/permissions', requireAuth, requirePermission('manage_settings', 'users.manage'), (req: AuthenticatedRequest, res) => {
+apiRouter.put('/roles/:role/permissions', requireAuth, requirePermission('manage_settings', 'users.manage'), async (req: AuthenticatedRequest, res) => {
   const targetRole = req.params.role;
   const { permissions } = req.body;
 
@@ -658,15 +660,15 @@ apiRouter.put('/roles/:role/permissions', requireAuth, requirePermission('manage
   }
 
   try {
-    db.transaction(() => {
-      db.prepare('DELETE FROM user_permissions WHERE role = ?').run(targetRole);
+    (await db.transaction(async () => {
+      (await db.prepare('DELETE FROM user_permissions WHERE role = ?').run(targetRole));
       const insertStmt = db.prepare('INSERT INTO user_permissions (id, role, permission_key) VALUES (?, ?, ?)');
       for (const p of permissions) {
-        insertStmt.run(`perm_${targetRole}_${p}`, targetRole, p);
+        (await insertStmt.run(`perm_${targetRole}_${p}`, targetRole, p));
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'UPDATE_ROLE_PERMISSIONS', 'roles', targetRole, `تحديث مصفوفة صلاحيات الدور: ${targetRole}`);
+    (await logAudit(req.user!.id, 'UPDATE_ROLE_PERMISSIONS', 'roles', targetRole, `تحديث مصفوفة صلاحيات الدور: ${targetRole}`));
     res.json({ success: true, message: `تم تحديث صلاحيات الدور "${targetRole}" بنجاح.` });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -674,18 +676,18 @@ apiRouter.put('/roles/:role/permissions', requireAuth, requirePermission('manage
 });
 
 // Individual User Permissions Endpoints (Owner & users.manage)
-apiRouter.get('/users/:id/permissions', requireAuth, (req: AuthenticatedRequest, res) => {
+apiRouter.get('/users/:id/permissions', requireAuth, async (req: AuthenticatedRequest, res) => {
   if (req.user!.role !== 'owner' && !req.user!.permissions.includes('users.manage') && !req.user!.permissions.includes('manage_settings')) {
     return res.status(403).json({ error: 'غير مصرح: استعراض صلاحيات المستخدم مقتصر على المالك وإدارة المستخدمين.' });
   }
 
-  const targetUser = db.prepare('SELECT id, username, display_name, role, is_active FROM users WHERE id = ?').get(req.params.id) as { id: string; username: string; display_name: string; role: string; is_active: number } | undefined;
+  const targetUser = (await db.prepare('SELECT id, username, display_name, role, is_active FROM users WHERE id = ?').get(req.params.id)) as { id: string; username: string; display_name: string; role: string; is_active: number } | undefined;
   if (!targetUser) {
     return res.status(404).json({ error: 'المستخدم غير موجود.' });
   }
 
   // Check if an explicit custom record exists in individual_permissions
-  const customRow = db.prepare('SELECT permission_keys FROM individual_permissions WHERE user_id = ?').get(targetUser.id) as { permission_keys: string } | undefined;
+  const customRow = (await db.prepare('SELECT permission_keys FROM individual_permissions WHERE user_id = ?').get(targetUser.id)) as { permission_keys: string } | undefined;
   const isCustom = customRow !== undefined && customRow.permission_keys !== null;
 
   let userPermissions: string[] = [];
@@ -697,11 +699,11 @@ apiRouter.get('/users/:id/permissions', requireAuth, (req: AuthenticatedRequest,
     }
   } else {
     // Inherit from role
-    const roleRows = db.prepare('SELECT permission_key FROM user_permissions WHERE role = ?').all(targetUser.role) as { permission_key: string }[];
+    const roleRows = (await db.prepare('SELECT permission_key FROM user_permissions WHERE role = ?').all(targetUser.role)) as { permission_key: string }[];
     userPermissions = roleRows.map(r => r.permission_key);
   }
 
-  const roleRows = db.prepare('SELECT permission_key FROM user_permissions WHERE role = ?').all(targetUser.role) as { permission_key: string }[];
+  const roleRows = (await db.prepare('SELECT permission_key FROM user_permissions WHERE role = ?').all(targetUser.role)) as { permission_key: string }[];
   const rolePermissions = roleRows.map(r => r.permission_key);
 
   res.json({
@@ -713,12 +715,12 @@ apiRouter.get('/users/:id/permissions', requireAuth, (req: AuthenticatedRequest,
   });
 });
 
-apiRouter.put('/users/:id/permissions', requireAuth, (req: AuthenticatedRequest, res) => {
+apiRouter.put('/users/:id/permissions', requireAuth, async (req: AuthenticatedRequest, res) => {
   if (req.user!.role !== 'owner' && !req.user!.permissions.includes('users.manage')) {
     return res.status(403).json({ error: 'غير مصرح: تعديل الصلاحيات الفردية مقتصر على مالك النظام ومدير الصلاحيات.' });
   }
 
-  const targetUser = db.prepare('SELECT id, username, display_name, role FROM users WHERE id = ?').get(req.params.id) as { id: string; username: string; display_name: string; role: string } | undefined;
+  const targetUser = (await db.prepare('SELECT id, username, display_name, role FROM users WHERE id = ?').get(req.params.id)) as { id: string; username: string; display_name: string; role: string } | undefined;
   if (!targetUser) {
     return res.status(404).json({ error: 'المستخدم غير موجود.' });
   }
@@ -736,28 +738,28 @@ apiRouter.put('/users/:id/permissions', requireAuth, (req: AuthenticatedRequest,
   const { custom, permissions } = req.body;
 
   try {
-    db.transaction(() => {
+    (await db.transaction(async () => {
       if (!custom || permissions === null) {
         // Mode 1: Inherit from role (Delete individual permissions record)
-        db.prepare('DELETE FROM individual_permissions WHERE user_id = ?').run(targetUser.id);
-        logAudit(req.user!.id, 'RESET_USER_PERMISSIONS', 'users', targetUser.id, `إلغاء التخصيص والعودة لصلاحيات الدور (${targetUser.role}) للمستخدم ${targetUser.display_name}`);
+        (await db.prepare('DELETE FROM individual_permissions WHERE user_id = ?').run(targetUser.id));
+        (await logAudit(req.user!.id, 'RESET_USER_PERMISSIONS', 'users', targetUser.id, `إلغاء التخصيص والعودة لصلاحيات الدور (${targetUser.role}) للمستخدم ${targetUser.display_name}`));
       } else {
         // Mode 2: Explicit custom permissions list (even if empty array [])
         if (!Array.isArray(permissions)) {
           throw new Error('مصفوفة الصلاحيات المخصصة غير صحيحة.');
         }
         const cleaned = permissions.filter(k => typeof k === 'string');
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO individual_permissions (user_id, permission_keys, updated_at)
           VALUES (?, ?, CURRENT_TIMESTAMP)
-          ON CONFLICT(user_id) DO UPDATE SET permission_keys = excluded.permission_keys, updated_at = CURRENT_TIMESTAMP
-        `).run(targetUser.id, JSON.stringify(cleaned));
+          ON DUPLICATE KEY UPDATE permission_keys = VALUES(permission_keys), updated_at = CURRENT_TIMESTAMP
+        `).run(targetUser.id, JSON.stringify(cleaned)));
 
-        logAudit(req.user!.id, 'UPDATE_USER_PERMISSIONS', 'users', targetUser.id, `تخصيص (${cleaned.length}) صلاحية للمستخدم ${targetUser.display_name}`);
+        (await logAudit(req.user!.id, 'UPDATE_USER_PERMISSIONS', 'users', targetUser.id, `تخصيص (${cleaned.length}) صلاحية للمستخدم ${targetUser.display_name}`));
       }
-    })();
+    })());
 
-    const effective = effectivePermissions(targetUser.id, targetUser.role);
+    const effective = (await effectivePermissions(targetUser.id, targetUser.role));
 
     res.json({
       success: true,
@@ -775,16 +777,16 @@ apiRouter.put('/users/:id/permissions', requireAuth, (req: AuthenticatedRequest,
 // ----------------------------------------------------
 // 3. Company & Org Structure
 // ----------------------------------------------------
-apiRouter.get('/company', requireAuth, (req, res) => {
-  const company = db.prepare('SELECT * FROM companies LIMIT 1').get();
-  const branches = db.prepare('SELECT * FROM branches ORDER BY code').all();
-  const warehouses = db.prepare('SELECT w.*, b.name_ar as branch_name FROM warehouses w JOIN branches b ON w.branch_id = b.id ORDER BY w.code').all();
-  const cashBoxes = db.prepare('SELECT c.*, b.name_ar as branch_name, a.name_ar as account_name FROM cash_boxes c JOIN branches b ON c.branch_id = b.id JOIN accounts a ON c.account_id = a.id').all();
-  const bankAccounts = db.prepare('SELECT b.*, a.name_ar as account_name FROM bank_accounts b JOIN accounts a ON b.account_id = a.id').all();
-  const fiscalYears = db.prepare('SELECT * FROM fiscal_years ORDER BY code DESC').all();
-  const fiscalPeriods = db.prepare('SELECT * FROM fiscal_periods ORDER BY start_date').all();
-  const costCenters = db.prepare('SELECT * FROM cost_centers ORDER BY code').all();
-  const currencies = db.prepare('SELECT * FROM currencies').all();
+apiRouter.get('/company', requireAuth, async (req, res) => {
+  const company = (await db.prepare('SELECT * FROM companies LIMIT 1').get());
+  const branches = (await db.prepare('SELECT * FROM branches ORDER BY code').all());
+  const warehouses = (await db.prepare('SELECT w.*, b.name_ar as branch_name FROM warehouses w JOIN branches b ON w.branch_id = b.id ORDER BY w.code').all());
+  const cashBoxes = (await db.prepare('SELECT c.*, b.name_ar as branch_name, a.name_ar as account_name FROM cash_boxes c JOIN branches b ON c.branch_id = b.id JOIN accounts a ON c.account_id = a.id').all());
+  const bankAccounts = (await db.prepare('SELECT b.*, a.name_ar as account_name FROM bank_accounts b JOIN accounts a ON b.account_id = a.id').all());
+  const fiscalYears = (await db.prepare('SELECT * FROM fiscal_years ORDER BY code DESC').all());
+  const fiscalPeriods = (await db.prepare('SELECT * FROM fiscal_periods ORDER BY start_date').all());
+  const costCenters = (await db.prepare('SELECT * FROM cost_centers ORDER BY code').all());
+  const currencies = (await db.prepare('SELECT * FROM currencies').all());
 
   res.json({
     company,
@@ -802,7 +804,7 @@ apiRouter.get('/company', requireAuth, (req, res) => {
 // ----------------------------------------------------
 // 4. Dashboard KPIs with Permission-Based Cost Redaction & Period Filtering
 // ----------------------------------------------------
-apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view'), (req: AuthenticatedRequest, res) => {
+apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view'), async (req: AuthenticatedRequest, res) => {
   const fromDate = typeof req.query.fromDate === 'string' && req.query.fromDate ? req.query.fromDate : null;
   const toDate = typeof req.query.toDate === 'string' && req.query.toDate ? req.query.toDate : null;
   const branchId = typeof req.query.branchId === 'string' && req.query.branchId !== 'all' ? req.query.branchId : null;
@@ -829,31 +831,31 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
   }
 
   // 1. Current Balances (Cash, Receivables, Payables)
-  const cashTotal = db.prepare(`
+  const cashTotal = (await db.prepare(`
     SELECT COALESCE(SUM(debit - credit), 0) as balance 
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
     WHERE jel.account_id IN ('acc_1111', 'acc_1112', 'acc_1113', 'acc_1114') AND je.status = 'posted'
     ${branchId ? 'AND je.branch_id = ?' : ''}
-  `).get(...(branchId ? [branchId] : [])) as { balance: number };
+  `).get(...(branchId ? [branchId] : []))) as { balance: number };
 
-  const receivables = db.prepare(`
+  const receivables = (await db.prepare(`
     SELECT COALESCE(SUM(debit - credit), 0) as balance 
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
     WHERE jel.account_id = 'acc_1121' AND je.status = 'posted'
     ${toDate ? 'AND je.entry_date <= ?' : ''}
     ${branchId ? 'AND je.branch_id = ?' : ''}
-  `).get(...[...(toDate ? [toDate] : []), ...(branchId ? [branchId] : [])]) as { balance: number };
+  `).get(...[...(toDate ? [toDate] : []), ...(branchId ? [branchId] : [])])) as { balance: number };
 
-  const payables = db.prepare(`
+  const payables = (await db.prepare(`
     SELECT COALESCE(SUM(credit - debit), 0) as balance 
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
     WHERE jel.account_id = 'acc_2111' AND je.status = 'posted'
     ${toDate ? 'AND je.entry_date <= ?' : ''}
     ${branchId ? 'AND je.branch_id = ?' : ''}
-  `).get(...[...(toDate ? [toDate] : []), ...(branchId ? [branchId] : [])]) as { balance: number };
+  `).get(...[...(toDate ? [toDate] : []), ...(branchId ? [branchId] : [])])) as { balance: number };
 
   // 2. Section 1: Sales (المبيعات)
   let salesFilter = "WHERE si.status != 'draft' AND si.status != 'reversed'";
@@ -863,7 +865,7 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
   if (branchId) { salesFilter += ' AND si.branch_id = ?'; salesParams.push(branchId); }
   if (warehouseId) { salesFilter += ' AND si.warehouse_id = ?'; salesParams.push(warehouseId); }
 
-  const salesStats = db.prepare(`
+  const salesStats = (await db.prepare(`
     SELECT COUNT(*) as invoice_count,
            COALESCE(SUM(si.total_amount), 0) as total_gross,
            COALESCE(SUM(si.taxable_amount), 0) as taxable_total,
@@ -871,7 +873,7 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
            COALESCE(SUM(si.remaining_amount), 0) as remaining_total
     FROM sales_invoices si
     ${salesFilter}
-  `).get(...salesParams) as any;
+  `).get(...salesParams)) as any;
 
   let retFilter = "WHERE sr.status = 'posted'";
   const retParams: any[] = [];
@@ -880,18 +882,18 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
   if (branchId) { retFilter += ' AND sr.branch_id = ?'; retParams.push(branchId); }
   if (warehouseId) { retFilter += ' AND sr.warehouse_id = ?'; retParams.push(warehouseId); }
 
-  const returnsStats = db.prepare(`
+  const returnsStats = (await db.prepare(`
     SELECT COUNT(*) as return_count,
            COALESCE(SUM(sr.total_amount), 0) as total_returns
     FROM sales_returns sr
     ${retFilter}
-  `).get(...retParams) as any;
+  `).get(...retParams)) as any;
 
   const netSalesAmount = (salesStats?.total_gross || 0) - (returnsStats?.total_returns || 0);
   const avgInvoiceValue = (salesStats?.invoice_count || 0) > 0 ? (salesStats.total_gross / salesStats.invoice_count) : 0;
 
   // Top 5 Customers
-  const topCustomers = db.prepare(`
+  const topCustomers = (await db.prepare(`
     SELECT p.id, p.name_ar, p.code,
            COUNT(si.id) as invoice_count,
            COALESCE(SUM(si.total_amount), 0) as total_sales
@@ -901,7 +903,7 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
     GROUP BY p.id
     ORDER BY total_sales DESC
     LIMIT 5
-  `).all(...salesParams);
+  `).all(...salesParams));
 
   // Top 5 Items
   let itemSalesFilter = "WHERE si.status != 'draft' AND si.status != 'reversed'";
@@ -911,7 +913,7 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
   if (branchId) { itemSalesFilter += ' AND si.branch_id = ?'; itemSalesParams.push(branchId); }
   if (warehouseId) { itemSalesFilter += ' AND si.warehouse_id = ?'; itemSalesParams.push(warehouseId); }
 
-  const topItems = db.prepare(`
+  const topItems = (await db.prepare(`
     SELECT i.id, i.name_ar, i.code,
            COALESCE(SUM(sii.quantity), 0) as total_qty,
            COALESCE(SUM(sii.total_amount), 0) as total_amount
@@ -922,7 +924,7 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
     GROUP BY i.id
     ORDER BY total_amount DESC
     LIMIT 5
-  `).all(...itemSalesParams);
+  `).all(...itemSalesParams));
 
   // 3. Section 2: Purchases (المشتريات)
   let purFilter = "WHERE pi.status != 'draft' AND pi.status != 'reversed'";
@@ -932,14 +934,14 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
   if (branchId) { purFilter += ' AND pi.branch_id = ?'; purParams.push(branchId); }
   if (warehouseId) { purFilter += ' AND pi.warehouse_id = ?'; purParams.push(warehouseId); }
 
-  const purStats = db.prepare(`
+  const purStats = (await db.prepare(`
     SELECT COUNT(*) as invoice_count,
            COALESCE(SUM(pi.total_amount), 0) as total_gross,
            COALESCE(SUM(pi.paid_amount), 0) as paid_total,
            COALESCE(SUM(pi.remaining_amount), 0) as remaining_total
     FROM purchase_invoices pi
     ${purFilter}
-  `).get(...purParams) as any;
+  `).get(...purParams)) as any;
 
   let pretFilter = "WHERE pr.status = 'posted'";
   const pretParams: any[] = [];
@@ -948,17 +950,17 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
   if (branchId) { pretFilter += ' AND pr.branch_id = ?'; pretParams.push(branchId); }
   if (warehouseId) { pretFilter += ' AND pr.warehouse_id = ?'; pretParams.push(warehouseId); }
 
-  const purReturnsStats = db.prepare(`
+  const purReturnsStats = (await db.prepare(`
     SELECT COUNT(*) as return_count,
            COALESCE(SUM(pr.total_amount), 0) as total_returns
     FROM purchase_returns pr
     ${pretFilter}
-  `).get(...pretParams) as any;
+  `).get(...pretParams)) as any;
 
   const netPurchasesAmount = (purStats?.total_gross || 0) - (purReturnsStats?.total_returns || 0);
 
   // Top 5 Suppliers
-  const topSuppliers = db.prepare(`
+  const topSuppliers = (await db.prepare(`
     SELECT p.id, p.name_ar, p.code,
            COUNT(pi.id) as invoice_count,
            COALESCE(SUM(pi.total_amount), 0) as total_purchases
@@ -968,7 +970,7 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
     GROUP BY p.id
     ORDER BY total_purchases DESC
     LIMIT 5
-  `).all(...purParams);
+  `).all(...purParams));
 
   // 4. Section 3: Treasury & Cash Flow (التحصيل والسداد)
   let tvFilter = "WHERE pv.status != 'reversed'";
@@ -977,7 +979,7 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
   if (toDate) { tvFilter += ' AND pv.voucher_date <= ?'; tvParams.push(toDate); }
   if (branchId) { tvFilter += ' AND pv.branch_id = ?'; tvParams.push(branchId); }
 
-  const treasuryStats = db.prepare(`
+  const treasuryStats = (await db.prepare(`
     SELECT 
       COALESCE(SUM(CASE WHEN pv.voucher_type = 'receipt' THEN pv.amount ELSE 0 END), 0) as total_receipts,
       COALESCE(SUM(CASE WHEN pv.voucher_type = 'payment' THEN pv.amount ELSE 0 END), 0) as total_payments,
@@ -985,49 +987,49 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
       COUNT(CASE WHEN pv.voucher_type = 'payment' THEN 1 END) as payment_count
     FROM payment_vouchers pv
     ${tvFilter}
-  `).get(...tvParams) as any;
+  `).get(...tvParams)) as any;
 
   const netCashMovement = (treasuryStats?.total_receipts || 0) - (treasuryStats?.total_payments || 0);
 
   // Overdue Receivables
-  const overdueReceivables = db.prepare(`
+  const overdueReceivables = (await db.prepare(`
     SELECT COUNT(*) as count, COALESCE(SUM(remaining_amount), 0) as total
     FROM sales_invoices
     WHERE status != 'draft' AND status != 'reversed' AND remaining_amount > 0 AND due_date < CURRENT_DATE
     ${branchId ? 'AND branch_id = ?' : ''}
-  `).get(...(branchId ? [branchId] : [])) as any;
+  `).get(...(branchId ? [branchId] : []))) as any;
 
   // Invoices Due in Next 7 Days
-  const dueSoonReceivables = db.prepare(`
+  const dueSoonReceivables = (await db.prepare(`
     SELECT COUNT(*) as count, COALESCE(SUM(remaining_amount), 0) as total
     FROM sales_invoices
     WHERE status != 'draft' AND status != 'reversed' AND remaining_amount > 0
-      AND due_date >= CURRENT_DATE AND due_date <= date('now', '+7 days')
+      AND due_date >= CURRENT_DATE AND due_date <= DATE_ADD(UTC_DATE(), INTERVAL 7 DAY)
     ${branchId ? 'AND branch_id = ?' : ''}
-  `).get(...(branchId ? [branchId] : [])) as any;
+  `).get(...(branchId ? [branchId] : []))) as any;
 
   // 5. Section 4: Aging Breakdown (أعمار الديون)
-  const agingReceivables = db.prepare(`
+  const agingReceivables = (await db.prepare(`
     SELECT
-      COALESCE(SUM(CASE WHEN (julianday('now') - julianday(invoice_date)) <= 30 THEN remaining_amount ELSE 0 END), 0) as bucket_0_30,
-      COALESCE(SUM(CASE WHEN (julianday('now') - julianday(invoice_date)) > 30 AND (julianday('now') - julianday(invoice_date)) <= 60 THEN remaining_amount ELSE 0 END), 0) as bucket_31_60,
-      COALESCE(SUM(CASE WHEN (julianday('now') - julianday(invoice_date)) > 60 AND (julianday('now') - julianday(invoice_date)) <= 90 THEN remaining_amount ELSE 0 END), 0) as bucket_61_90,
-      COALESCE(SUM(CASE WHEN (julianday('now') - julianday(invoice_date)) > 90 THEN remaining_amount ELSE 0 END), 0) as bucket_90_plus
+      COALESCE(SUM(CASE WHEN DATEDIFF(UTC_DATE(), invoice_date) <= 30 THEN remaining_amount ELSE 0 END), 0) as bucket_0_30,
+      COALESCE(SUM(CASE WHEN DATEDIFF(UTC_DATE(), invoice_date) > 30 AND DATEDIFF(UTC_DATE(), invoice_date) <= 60 THEN remaining_amount ELSE 0 END), 0) as bucket_31_60,
+      COALESCE(SUM(CASE WHEN DATEDIFF(UTC_DATE(), invoice_date) > 60 AND DATEDIFF(UTC_DATE(), invoice_date) <= 90 THEN remaining_amount ELSE 0 END), 0) as bucket_61_90,
+      COALESCE(SUM(CASE WHEN DATEDIFF(UTC_DATE(), invoice_date) > 90 THEN remaining_amount ELSE 0 END), 0) as bucket_90_plus
     FROM sales_invoices
     WHERE status != 'draft' AND status != 'reversed' AND remaining_amount > 0
     ${branchId ? 'AND branch_id = ?' : ''}
-  `).get(...(branchId ? [branchId] : [])) as any;
+  `).get(...(branchId ? [branchId] : []))) as any;
 
-  const agingPayables = db.prepare(`
+  const agingPayables = (await db.prepare(`
     SELECT
-      COALESCE(SUM(CASE WHEN (julianday('now') - julianday(invoice_date)) <= 30 THEN remaining_amount ELSE 0 END), 0) as bucket_0_30,
-      COALESCE(SUM(CASE WHEN (julianday('now') - julianday(invoice_date)) > 30 AND (julianday('now') - julianday(invoice_date)) <= 60 THEN remaining_amount ELSE 0 END), 0) as bucket_31_60,
-      COALESCE(SUM(CASE WHEN (julianday('now') - julianday(invoice_date)) > 60 AND (julianday('now') - julianday(invoice_date)) <= 90 THEN remaining_amount ELSE 0 END), 0) as bucket_61_90,
-      COALESCE(SUM(CASE WHEN (julianday('now') - julianday(invoice_date)) > 90 THEN remaining_amount ELSE 0 END), 0) as bucket_90_plus
+      COALESCE(SUM(CASE WHEN DATEDIFF(UTC_DATE(), invoice_date) <= 30 THEN remaining_amount ELSE 0 END), 0) as bucket_0_30,
+      COALESCE(SUM(CASE WHEN DATEDIFF(UTC_DATE(), invoice_date) > 30 AND DATEDIFF(UTC_DATE(), invoice_date) <= 60 THEN remaining_amount ELSE 0 END), 0) as bucket_31_60,
+      COALESCE(SUM(CASE WHEN DATEDIFF(UTC_DATE(), invoice_date) > 60 AND DATEDIFF(UTC_DATE(), invoice_date) <= 90 THEN remaining_amount ELSE 0 END), 0) as bucket_61_90,
+      COALESCE(SUM(CASE WHEN DATEDIFF(UTC_DATE(), invoice_date) > 90 THEN remaining_amount ELSE 0 END), 0) as bucket_90_plus
     FROM purchase_invoices
     WHERE status != 'draft' AND status != 'reversed' AND remaining_amount > 0
     ${branchId ? 'AND branch_id = ?' : ''}
-  `).get(...(branchId ? [branchId] : [])) as any;
+  `).get(...(branchId ? [branchId] : []))) as any;
 
   // 6. Section 5: Inventory Valuation & Stock Distribution (المخزون)
   let invValuation: number | null = null;
@@ -1043,12 +1045,12 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
     if (warehouseId) { invValSql += ' AND ws.warehouse_id = ?'; invParams.push(warehouseId); }
     if (branchId) { invValSql += ' AND w.branch_id = ?'; invParams.push(branchId); }
 
-    const invRow = db.prepare(invValSql).get(...invParams) as { total_value: number };
+    const invRow = (await db.prepare(invValSql).get(...invParams)) as { total_value: number };
     invValuation = invRow?.total_value || 0;
   }
 
   // Stock status counts
-  const stockCounts = db.prepare(`
+  const stockCounts = (await db.prepare(`
     SELECT 
       COUNT(DISTINCT CASE WHEN ws.quantity <= 0 THEN ws.item_id END) as out_of_stock,
       COUNT(DISTINCT CASE WHEN ws.quantity > 0 AND ws.quantity <= i.min_stock_level THEN ws.item_id END) as low_stock,
@@ -1059,10 +1061,10 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
     WHERE 1=1
     ${warehouseId ? 'AND ws.warehouse_id = ?' : ''}
     ${branchId ? 'AND w.branch_id = ?' : ''}
-  `).get(...[...(warehouseId ? [warehouseId] : []), ...(branchId ? [branchId] : [])]) as any;
+  `).get(...[...(warehouseId ? [warehouseId] : []), ...(branchId ? [branchId] : [])])) as any;
 
   // Warehouses stock breakdown
-  const warehouseStockDistribution = db.prepare(`
+  const warehouseStockDistribution = (await db.prepare(`
     SELECT w.id, w.name_ar, b.name_ar as branch_name,
            COUNT(DISTINCT ws.item_id) as items_count,
            COALESCE(SUM(ws.quantity), 0) as total_quantity
@@ -1074,7 +1076,7 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
     ${branchId ? 'WHERE w.branch_id = ?' : ''}
     GROUP BY w.id
     ORDER BY w.code ASC
-  `).all(...(branchId ? [branchId] : []));
+  `).all(...(branchId ? [branchId] : [])));
 
   // 7. Section 6: Profitability (الربحية والتكاليف)
   let cogsAmount: number | null = null;
@@ -1088,12 +1090,12 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
   if (toDate) { opexFilter += ' AND je.entry_date <= ?'; opexParams.push(toDate); }
   if (branchId) { opexFilter += ' AND je.branch_id = ?'; opexParams.push(branchId); }
 
-  const opexRow = db.prepare(`
+  const opexRow = (await db.prepare(`
     SELECT COALESCE(SUM(jel.debit - jel.credit), 0) as total
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
     ${opexFilter}
-  `).get(...opexParams) as { total: number };
+  `).get(...opexParams)) as { total: number };
   const operatingExpenses = opexRow?.total || 0;
 
   if (hasViewCost) {
@@ -1103,12 +1105,12 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
     if (toDate) { cogsFilter += ' AND je.entry_date <= ?'; cogsParams.push(toDate); }
     if (branchId) { cogsFilter += ' AND je.branch_id = ?'; cogsParams.push(branchId); }
 
-    const cogsRow = db.prepare(`
+    const cogsRow = (await db.prepare(`
       SELECT COALESCE(SUM(jel.debit - jel.credit), 0) as total
       FROM journal_entry_lines jel
       JOIN journal_entries je ON jel.entry_id = je.id
       ${cogsFilter}
-    `).get(...cogsParams) as { total: number };
+    `).get(...cogsParams)) as { total: number };
     cogsAmount = cogsRow?.total || 0;
 
     if (hasViewProfit) {
@@ -1120,30 +1122,30 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
 
   // 8. Section 7: Monitoring & Pending Drafts (المتابعة والمسودات)
   const pendingDrafts = {
-    salesInvoices: db.prepare(`
+    salesInvoices: (await db.prepare(`
       SELECT COUNT(*) as count, COALESCE(SUM(total_amount), 0) as total 
       FROM sales_invoices WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}
-    `).get(...(branchId ? [branchId] : [])) as { count: number; total: number },
+    `).get(...(branchId ? [branchId] : []))) as { count: number; total: number },
 
-    purchaseInvoices: db.prepare(`
+    purchaseInvoices: (await db.prepare(`
       SELECT COUNT(*) as count, COALESCE(SUM(total_amount), 0) as total 
       FROM purchase_invoices WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}
-    `).get(...(branchId ? [branchId] : [])) as { count: number; total: number },
+    `).get(...(branchId ? [branchId] : []))) as { count: number; total: number },
 
-    salesReturns: db.prepare(`
+    salesReturns: (await db.prepare(`
       SELECT COUNT(*) as count, COALESCE(SUM(total_amount), 0) as total 
       FROM sales_returns WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}
-    `).get(...(branchId ? [branchId] : [])) as { count: number; total: number },
+    `).get(...(branchId ? [branchId] : []))) as { count: number; total: number },
 
-    purchaseReturns: db.prepare(`
+    purchaseReturns: (await db.prepare(`
       SELECT COUNT(*) as count, COALESCE(SUM(total_amount), 0) as total 
       FROM purchase_returns WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}
-    `).get(...(branchId ? [branchId] : [])) as { count: number; total: number },
+    `).get(...(branchId ? [branchId] : []))) as { count: number; total: number },
 
-    journalEntries: db.prepare(`
+    journalEntries: (await db.prepare(`
       SELECT COUNT(*) as count 
       FROM journal_entries WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}
-    `).get(...(branchId ? [branchId] : [])) as { count: number }
+    `).get(...(branchId ? [branchId] : []))) as { count: number }
   };
 
   // Operational Actionable Alerts
@@ -1193,17 +1195,17 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
   // 9. Comparative Previous Period Metrics
   let comparison: any = null;
   if (prevFromDate && prevToDate) {
-    const prevSales = db.prepare(`
+    const prevSales = (await db.prepare(`
       SELECT COALESCE(SUM(total_amount), 0) as total FROM sales_invoices
       WHERE status != 'draft' AND status != 'reversed' AND invoice_date >= ? AND invoice_date <= ?
       ${branchId ? 'AND branch_id = ?' : ''}
-    `).get(...[prevFromDate, prevToDate, ...(branchId ? [branchId] : [])]) as any;
+    `).get(...[prevFromDate, prevToDate, ...(branchId ? [branchId] : [])])) as any;
 
-    const prevPur = db.prepare(`
+    const prevPur = (await db.prepare(`
       SELECT COALESCE(SUM(total_amount), 0) as total FROM purchase_invoices
       WHERE status != 'draft' AND status != 'reversed' AND invoice_date >= ? AND invoice_date <= ?
       ${branchId ? 'AND branch_id = ?' : ''}
-    `).get(...[prevFromDate, prevToDate, ...(branchId ? [branchId] : [])]) as any;
+    `).get(...[prevFromDate, prevToDate, ...(branchId ? [branchId] : [])])) as any;
 
     const prevSalesTotal = prevSales?.total || 0;
     const prevPurTotal = prevPur?.total || 0;
@@ -1222,8 +1224,8 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
   }
 
   // 10. Monthly Trend Chart
-  const monthlyTrend = db.prepare(`
-    SELECT strftime('%Y-%m', entry_date) as month,
+  const monthlyTrend = (await db.prepare(`
+    SELECT DATE_FORMAT(entry_date, '%Y-%m') as month,
            ROUND(SUM(credit - debit), 2) as revenue
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
@@ -1232,10 +1234,10 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
     GROUP BY month
     ORDER BY month ASC
     LIMIT 12
-  `).all(...(branchId ? [branchId] : []));
+  `).all(...(branchId ? [branchId] : [])));
 
   // Recent Invoices & Entries
-  const recentInvoices = db.prepare(`
+  const recentInvoices = (await db.prepare(`
     SELECT si.*, p.name_ar as customer_name, b.name_ar as branch_name
     FROM sales_invoices si
     JOIN parties p ON si.customer_id = p.id
@@ -1243,16 +1245,16 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
     ${branchId ? 'WHERE si.branch_id = ?' : ''}
     ORDER BY si.created_at DESC
     LIMIT 6
-  `).all(...(branchId ? [branchId] : []));
+  `).all(...(branchId ? [branchId] : [])));
 
-  const recentEntries = db.prepare(`
+  const recentEntries = (await db.prepare(`
     SELECT je.*, b.name_ar as branch_name
     FROM journal_entries je
     JOIN branches b ON je.branch_id = b.id
     ${branchId ? 'WHERE je.branch_id = ?' : ''}
     ORDER BY je.created_at DESC
     LIMIT 6
-  `).all(...(branchId ? [branchId] : []));
+  `).all(...(branchId ? [branchId] : [])));
 
   // Full Composite Response Payload
   res.json({
@@ -1339,44 +1341,44 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
         pendingDrafts,
         alerts
       },
-      actionRequired: (() => {
+      actionRequired: (await (async () => {
         const todayStr = new Date().toISOString().split('T')[0];
-        const overdueSales = db.prepare(`
+        const overdueSales = (await db.prepare(`
           SELECT COUNT(*) as count, COALESCE(SUM(remaining_amount), 0) as total
           FROM sales_invoices
           WHERE status != 'draft' AND status != 'cancelled' AND remaining_amount > 0.01 AND due_date < ?
           ${branchId ? 'AND branch_id = ?' : ''}
-        `).get(...[todayStr, ...(branchId ? [branchId] : [])]) as any;
+        `).get(...[todayStr, ...(branchId ? [branchId] : [])])) as any;
 
-        const overduePurchases = db.prepare(`
+        const overduePurchases = (await db.prepare(`
           SELECT COUNT(*) as count, COALESCE(SUM(remaining_amount), 0) as total
           FROM purchase_invoices
           WHERE status != 'draft' AND status != 'cancelled' AND remaining_amount > 0.01 AND due_date < ?
           ${branchId ? 'AND branch_id = ?' : ''}
-        `).get(...[todayStr, ...(branchId ? [branchId] : [])]) as any;
+        `).get(...[todayStr, ...(branchId ? [branchId] : [])])) as any;
 
-        const unallocVouchers = db.prepare(`
+        const unallocVouchers = (await db.prepare(`
           SELECT COUNT(*) as count, COALESCE(SUM(unallocated_amount), 0) as total
           FROM payment_vouchers
           WHERE status = 'posted' AND unallocated_amount > 0.01
           ${branchId ? 'AND branch_id = ?' : ''}
-        `).get(...(branchId ? [branchId] : [])) as any;
+        `).get(...(branchId ? [branchId] : []))) as any;
 
-        const dSales = db.prepare(`SELECT COUNT(*) as cnt FROM sales_invoices WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}`).get(...(branchId ? [branchId] : [])) as any;
-        const dPur = db.prepare(`SELECT COUNT(*) as cnt FROM purchase_invoices WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}`).get(...(branchId ? [branchId] : [])) as any;
-        const dSRet = db.prepare(`SELECT COUNT(*) as cnt FROM sales_returns WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}`).get(...(branchId ? [branchId] : [])) as any;
-        const dPRet = db.prepare(`SELECT COUNT(*) as cnt FROM purchase_returns WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}`).get(...(branchId ? [branchId] : [])) as any;
-        const dJe = db.prepare(`SELECT COUNT(*) as cnt FROM journal_entries WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}`).get(...(branchId ? [branchId] : [])) as any;
+        const dSales = (await db.prepare(`SELECT COUNT(*) as cnt FROM sales_invoices WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}`).get(...(branchId ? [branchId] : []))) as any;
+        const dPur = (await db.prepare(`SELECT COUNT(*) as cnt FROM purchase_invoices WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}`).get(...(branchId ? [branchId] : []))) as any;
+        const dSRet = (await db.prepare(`SELECT COUNT(*) as cnt FROM sales_returns WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}`).get(...(branchId ? [branchId] : []))) as any;
+        const dPRet = (await db.prepare(`SELECT COUNT(*) as cnt FROM purchase_returns WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}`).get(...(branchId ? [branchId] : []))) as any;
+        const dJe = (await db.prepare(`SELECT COUNT(*) as cnt FROM journal_entries WHERE status = 'draft' ${branchId ? 'AND branch_id = ?' : ''}`).get(...(branchId ? [branchId] : []))) as any;
 
-        const lowStockRows = db.prepare(`
+        const lowStockRows = (await db.prepare(`
           SELECT i.id
           FROM items i
           JOIN warehouse_stock ws ON i.id = ws.item_id
           WHERE i.item_type = 'stock' AND i.is_active = 1
             ${warehouseId ? 'AND ws.warehouse_id = ?' : ''}
           GROUP BY i.id
-          HAVING SUM(ws.quantity) <= i.min_stock_level
-        `).all(...(warehouseId ? [warehouseId] : []));
+          HAVING SUM(ws.quantity) <= MAX(i.min_stock_level)
+        `).all(...(warehouseId ? [warehouseId] : [])));
 
         const draftSalesCnt = dSales?.cnt || 0;
         const draftPurCnt = dPur?.cnt || 0;
@@ -1397,7 +1399,7 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
           draftJournalsCount: draftJeCnt,
           lowStockItemsCount: lowStockRows.length
         };
-      })()
+      })())
     },
     comparison,
     monthlyTrend,
@@ -1409,8 +1411,8 @@ apiRouter.get('/dashboard/stats', requireAuth, requirePermission('dashboard.view
 // ----------------------------------------------------
 // 5. Chart of Accounts & GL Entries
 // ----------------------------------------------------
-apiRouter.get('/accounts', requireAuth, requirePermission('accounts.view'), (req, res) => {
-  const accounts = db.prepare(`
+apiRouter.get('/accounts', requireAuth, requirePermission('accounts.view'), async (req, res) => {
+  const accounts = (await db.prepare(`
     SELECT a.*,
       COALESCE((
         SELECT ROUND(SUM(
@@ -1425,26 +1427,26 @@ apiRouter.get('/accounts', requireAuth, requirePermission('accounts.view'), (req
       ), 0) as current_balance
     FROM accounts a
     ORDER BY a.code ASC
-  `).all();
+  `).all());
 
   res.json({ accounts });
 });
 
 // Helper: Prevent cyclic hierarchy in Chart of Accounts tree
-function isAccountDescendant(childCandidateId: string, ancestorId: string): boolean {
+ async function isAccountDescendant(childCandidateId: string, ancestorId: string): Promise<boolean> {
   let currentId: string | null = childCandidateId;
   const visited = new Set<string>();
   while (currentId) {
     if (visited.has(currentId)) break;
     visited.add(currentId);
     if (currentId === ancestorId) return true;
-    const parentRow = db.prepare('SELECT parent_id FROM accounts WHERE id = ?').get(currentId) as { parent_id: string | null } | undefined;
+    const parentRow = (await db.prepare('SELECT parent_id FROM accounts WHERE id = ?').get(currentId)) as { parent_id: string | null } | undefined;
     currentId = parentRow ? parentRow.parent_id : null;
   }
   return false;
 }
 
-apiRouter.post('/accounts', requireAuth, requirePermission('accounts.create', 'manage_settings'), (req: AuthenticatedRequest, res) => {
+apiRouter.post('/accounts', requireAuth, requirePermission('accounts.create', 'manage_settings'), async (req: AuthenticatedRequest, res) => {
   let { code, name_ar, name_en, parent_id, account_type, nature, is_group, notes } = req.body;
   if (!name_ar || typeof name_ar !== 'string' || !name_ar.trim()) {
     return res.status(400).json({ error: 'اسم الحساب باللغة العربية مطلوب.' });
@@ -1458,9 +1460,9 @@ apiRouter.post('/accounts', requireAuth, requirePermission('accounts.create', 'm
     let finalCode = '';
     let id = '';
 
-    db.transaction(() => {
+    (await db.transaction(async () => {
       if (parent_id) {
-        const parent = db.prepare('SELECT id, code, level, is_group, account_type, nature FROM accounts WHERE id = ?').get(parent_id) as any;
+        const parent = (await db.prepare('SELECT id, code, level, is_group, account_type, nature FROM accounts WHERE id = ?').get(parent_id)) as any;
         if (!parent) {
           throw new Error('الحساب الرئيسي المحدد غير موجود.');
         }
@@ -1476,7 +1478,7 @@ apiRouter.post('/accounts', requireAuth, requirePermission('accounts.create', 'm
           const seqKey = `parent_${parent.id}`;
           let digitsCount = parent.level >= 3 ? 2 : 1;
 
-          const siblings = db.prepare('SELECT code FROM accounts WHERE parent_id = ?').all(parent_id) as { code: string }[];
+          const siblings = (await db.prepare('SELECT code FROM accounts WHERE parent_id = ?').all(parent_id)) as { code: string }[];
           for (const s of siblings) {
             if (s.code.startsWith(parent.code)) {
               const suf = s.code.slice(parent.code.length);
@@ -1484,7 +1486,7 @@ apiRouter.post('/accounts', requireAuth, requirePermission('accounts.create', 'm
             }
           }
 
-          let seqRow = db.prepare('SELECT last_number FROM account_sequences WHERE sequence_key = ?').get(seqKey) as { last_number: number } | undefined;
+          let seqRow = (await db.prepare('SELECT last_number FROM account_sequences WHERE sequence_key = ?').get(seqKey)) as { last_number: number } | undefined;
           let nextNum = 1;
 
           if (!seqRow) {
@@ -1496,16 +1498,16 @@ apiRouter.post('/accounts', requireAuth, requirePermission('accounts.create', 'm
               }
             }
             nextNum = maxFound + 1;
-            db.prepare('INSERT INTO account_sequences (sequence_key, last_number) VALUES (?, ?)').run(seqKey, nextNum);
+            (await db.prepare('INSERT INTO account_sequences (sequence_key, last_number) VALUES (?, ?)').run(seqKey, nextNum));
           } else {
             nextNum = seqRow.last_number + 1;
-            db.prepare('UPDATE account_sequences SET last_number = ? WHERE sequence_key = ?').run(nextNum, seqKey);
+            (await db.prepare('UPDATE account_sequences SET last_number = ? WHERE sequence_key = ?').run(nextNum, seqKey));
           }
 
           let candidate = `${parent.code}${nextNum.toString().padStart(digitsCount, '0')}`;
-          while (db.prepare('SELECT id FROM accounts WHERE code = ?').get(candidate)) {
+          while ((await db.prepare('SELECT id FROM accounts WHERE code = ?').get(candidate))) {
             nextNum++;
-            db.prepare('UPDATE account_sequences SET last_number = ? WHERE sequence_key = ?').run(nextNum, seqKey);
+            (await db.prepare('UPDATE account_sequences SET last_number = ? WHERE sequence_key = ?').run(nextNum, seqKey));
             candidate = `${parent.code}${nextNum.toString().padStart(digitsCount, '0')}`;
           }
           finalCode = candidate;
@@ -1531,27 +1533,27 @@ apiRouter.post('/accounts', requireAuth, requirePermission('accounts.create', 'm
           const rootDigit = rootMap[effectiveType] || '1';
           const seqKey = `root_${effectiveType}`;
 
-          let seqRow = db.prepare('SELECT last_number FROM account_sequences WHERE sequence_key = ?').get(seqKey) as { last_number: number } | undefined;
+          let seqRow = (await db.prepare('SELECT last_number FROM account_sequences WHERE sequence_key = ?').get(seqKey)) as { last_number: number } | undefined;
           let nextNum = 1;
 
           if (!seqRow) {
-            const roots = db.prepare("SELECT code FROM accounts WHERE parent_id IS NULL AND code LIKE ?").all(`${rootDigit}%`) as { code: string }[];
+            const roots = (await db.prepare("SELECT code FROM accounts WHERE parent_id IS NULL AND code LIKE ?").all(`${rootDigit}%`)) as { code: string }[];
             let maxRoot = parseInt(rootDigit, 10);
             for (const r of roots) {
               const n = parseInt(r.code, 10);
               if (!isNaN(n) && n > maxRoot) maxRoot = n;
             }
             nextNum = maxRoot + 1;
-            db.prepare('INSERT INTO account_sequences (sequence_key, last_number) VALUES (?, ?)').run(seqKey, nextNum);
+            (await db.prepare('INSERT INTO account_sequences (sequence_key, last_number) VALUES (?, ?)').run(seqKey, nextNum));
           } else {
             nextNum = seqRow.last_number + 1;
-            db.prepare('UPDATE account_sequences SET last_number = ? WHERE sequence_key = ?').run(nextNum, seqKey);
+            (await db.prepare('UPDATE account_sequences SET last_number = ? WHERE sequence_key = ?').run(nextNum, seqKey));
           }
 
           let candidate = nextNum.toString();
-          while (db.prepare('SELECT id FROM accounts WHERE code = ?').get(candidate)) {
+          while ((await db.prepare('SELECT id FROM accounts WHERE code = ?').get(candidate))) {
             nextNum++;
-            db.prepare('UPDATE account_sequences SET last_number = ? WHERE sequence_key = ?').run(nextNum, seqKey);
+            (await db.prepare('UPDATE account_sequences SET last_number = ? WHERE sequence_key = ?').run(nextNum, seqKey));
             candidate = nextNum.toString();
           }
           finalCode = candidate;
@@ -1561,28 +1563,28 @@ apiRouter.post('/accounts', requireAuth, requirePermission('accounts.create', 'm
       }
 
       // Check code uniqueness
-      const existing = db.prepare('SELECT id FROM accounts WHERE code = ?').get(finalCode);
+      const existing = (await db.prepare('SELECT id FROM accounts WHERE code = ?').get(finalCode));
       if (existing) {
         throw new Error(`كود الحساب "${finalCode}" مسجل مسبقاً في دليل الحسابات.`);
       }
 
       id = `acc_${finalCode.replace(/[^0-9a-zA-Z_]/g, '')}_${Date.now().toString(36).slice(-4)}`;
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO accounts (id, code, name_ar, name_en, parent_id, account_type, nature, is_group, level, is_active, notes)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-      `).run(id, finalCode, name_ar.trim(), name_en ? name_en.trim() : name_ar.trim(), parent_id || null, effectiveType, effectiveNature, is_group ? 1 : 0, calculatedLevel, notes || null);
-    })();
+      `).run(id, finalCode, name_ar.trim(), name_en ? name_en.trim() : name_ar.trim(), parent_id || null, effectiveType, effectiveNature, is_group ? 1 : 0, calculatedLevel, notes || null));
+    })());
 
-    logAudit(req.user!.id, 'CREATE_ACCOUNT', 'accounts', id, `إضافة حساب جديد: ${finalCode} - ${name_ar}`);
+    (await logAudit(req.user!.id, 'CREATE_ACCOUNT', 'accounts', id, `إضافة حساب جديد: ${finalCode} - ${name_ar}`));
     res.json({ success: true, id, code: finalCode, message: `تمت إضافة الحساب "${name_ar}" برقم (${finalCode}) بنجاح.` });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-apiRouter.put('/accounts/:id', requireAuth, requirePermission('accounts.edit', 'manage_settings'), (req: AuthenticatedRequest, res) => {
+apiRouter.put('/accounts/:id', requireAuth, requirePermission('accounts.edit', 'manage_settings'), async (req: AuthenticatedRequest, res) => {
   const targetId = req.params.id;
-  const target = db.prepare('SELECT * FROM accounts WHERE id = ?').get(targetId) as any;
+  const target = (await db.prepare('SELECT * FROM accounts WHERE id = ?').get(targetId)) as any;
   if (!target) return res.status(404).json({ error: 'الحساب غير موجود' });
 
   const { name_ar, name_en, parent_id, is_group, is_active, notes } = req.body;
@@ -1592,7 +1594,7 @@ apiRouter.put('/accounts/:id', requireAuth, requirePermission('accounts.edit', '
     if (parent_id === targetId) {
       return res.status(400).json({ error: 'لا يمكن للحساب أن يكون أصلاً لنفسه في شجرة الحسابات.' });
     }
-    if (parent_id && isAccountDescendant(parent_id, targetId)) {
+    if (parent_id && (await isAccountDescendant(parent_id, targetId))) {
       return res.status(400).json({ error: 'تنبيه دورة حلقية: لا يمكن نقل هذا الحساب ليصبح تابعاً لأحد الحسابات الفرعية المنبثقة منه.' });
     }
   }
@@ -1600,12 +1602,12 @@ apiRouter.put('/accounts/:id', requireAuth, requirePermission('accounts.edit', '
   // Validate Group status change
   if (is_group !== undefined && is_group !== target.is_group) {
     if (is_group === 0) {
-      const childCount = db.prepare('SELECT COUNT(*) as cnt FROM accounts WHERE parent_id = ?').get(targetId) as { cnt: number };
+      const childCount = (await db.prepare('SELECT COUNT(*) as cnt FROM accounts WHERE parent_id = ?').get(targetId)) as { cnt: number };
       if (childCount.cnt > 0) {
         return res.status(400).json({ error: `لا يمكن تحويل الحساب التجميعي إلى فرعي لوجود (${childCount.cnt}) حسابات فرعية منبثقة منه.` });
       }
     } else {
-      const txCount = db.prepare('SELECT COUNT(*) as cnt FROM journal_entry_lines WHERE account_id = ?').get(targetId) as { cnt: number };
+      const txCount = (await db.prepare('SELECT COUNT(*) as cnt FROM journal_entry_lines WHERE account_id = ?').get(targetId)) as { cnt: number };
       if (txCount.cnt > 0) {
         return res.status(400).json({ error: `لا يمكن تحويل حساب مسجل عليه حركات مالية (${txCount.cnt} حركة) إلى حساب تجميعي.` });
       }
@@ -1616,14 +1618,14 @@ apiRouter.put('/accounts/:id', requireAuth, requirePermission('accounts.edit', '
     let newLevel = target.level;
     if (parent_id !== undefined && parent_id !== target.parent_id) {
       if (parent_id) {
-        const p = db.prepare('SELECT level FROM accounts WHERE id = ?').get(parent_id) as any;
+        const p = (await db.prepare('SELECT level FROM accounts WHERE id = ?').get(parent_id)) as any;
         newLevel = p ? p.level + 1 : 2;
       } else {
         newLevel = 1;
       }
     }
 
-    db.prepare(`
+    (await db.prepare(`
       UPDATE accounts
       SET name_ar = COALESCE(?, name_ar),
           name_en = COALESCE(?, name_en),
@@ -1643,52 +1645,52 @@ apiRouter.put('/accounts/:id', requireAuth, requirePermission('accounts.edit', '
       is_active !== undefined ? (is_active ? 1 : 0) : null,
       notes || null,
       targetId
-    );
+    ));
 
-    logAudit(req.user!.id, 'UPDATE_ACCOUNT', 'accounts', targetId, `تعديل الحساب: ${target.code} - ${name_ar || target.name_ar}`);
+    (await logAudit(req.user!.id, 'UPDATE_ACCOUNT', 'accounts', targetId, `تعديل الحساب: ${target.code} - ${name_ar || target.name_ar}`));
     res.json({ success: true, message: 'تم تحديث بيانات الحساب بنجاح.' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.delete('/accounts/:id', requireAuth, requirePermission('accounts.delete', 'manage_settings'), (req: AuthenticatedRequest, res) => {
+apiRouter.delete('/accounts/:id', requireAuth, requirePermission('accounts.delete', 'manage_settings'), async (req: AuthenticatedRequest, res) => {
   const targetId = req.params.id;
-  const target = db.prepare('SELECT * FROM accounts WHERE id = ?').get(targetId) as any;
+  const target = (await db.prepare('SELECT * FROM accounts WHERE id = ?').get(targetId)) as any;
   if (!target) return res.status(404).json({ error: 'الحساب غير موجود' });
 
   // 1. Check child accounts
-  const childCount = db.prepare('SELECT COUNT(*) as cnt FROM accounts WHERE parent_id = ?').get(targetId) as { cnt: number };
+  const childCount = (await db.prepare('SELECT COUNT(*) as cnt FROM accounts WHERE parent_id = ?').get(targetId)) as { cnt: number };
   if (childCount.cnt > 0) {
     return res.status(400).json({ error: `لا يمكن حذف هذا الحساب لأنه حساب رئيسي تتبعه (${childCount.cnt}) حسابات فرعية. قم بحذف أو نقل الحسابات الفرعية أولاً.` });
   }
 
   // 2. Check journal entry transactions
-  const txCount = db.prepare('SELECT COUNT(*) as cnt FROM journal_entry_lines WHERE account_id = ?').get(targetId) as { cnt: number };
+  const txCount = (await db.prepare('SELECT COUNT(*) as cnt FROM journal_entry_lines WHERE account_id = ?').get(targetId)) as { cnt: number };
   if (txCount.cnt > 0) {
     return res.status(400).json({ error: `لا يمكن حذف هذا الحساب نهائياً لوجود (${txCount.cnt}) قيود وحركات مالية مرحلة عليه. يمكنك تعطيل الحساب بدلاً من حذفه للحفاظ على التوازن والأثر التاريخي.` });
   }
 
   // 3. Check system configuration references
-  const cashboxCheck = db.prepare('SELECT COUNT(*) as cnt FROM cash_boxes WHERE account_id = ?').get(targetId) as { cnt: number };
-  const bankCheck = db.prepare('SELECT COUNT(*) as cnt FROM bank_accounts WHERE account_id = ?').get(targetId) as { cnt: number };
-  const partyCheck = db.prepare('SELECT COUNT(*) as cnt FROM parties WHERE account_id = ?').get(targetId) as { cnt: number };
-  const assetCheck = db.prepare('SELECT COUNT(*) as cnt FROM fixed_assets WHERE asset_account_id = ? OR depreciation_expense_account_id = ? OR accumulated_depreciation_account_id = ?').get(targetId, targetId, targetId) as { cnt: number };
+  const cashboxCheck = (await db.prepare('SELECT COUNT(*) as cnt FROM cash_boxes WHERE account_id = ?').get(targetId)) as { cnt: number };
+  const bankCheck = (await db.prepare('SELECT COUNT(*) as cnt FROM bank_accounts WHERE account_id = ?').get(targetId)) as { cnt: number };
+  const partyCheck = (await db.prepare('SELECT COUNT(*) as cnt FROM parties WHERE account_id = ?').get(targetId)) as { cnt: number };
+  const assetCheck = (await db.prepare('SELECT COUNT(*) as cnt FROM fixed_assets WHERE asset_account_id = ? OR depreciation_expense_account_id = ? OR accumulated_depreciation_account_id = ?').get(targetId, targetId, targetId)) as { cnt: number };
 
   if (cashboxCheck.cnt > 0 || bankCheck.cnt > 0 || partyCheck.cnt > 0 || assetCheck.cnt > 0 || target.is_reconciliation === 1) {
     return res.status(400).json({ error: 'لا يمكن حذف هذا الحساب لأنه مربوط بالخزائن، البنوك، أطراف التعامل، الأصول الثابتة، أو معرف كحساب رقابة أساسي.' });
   }
 
   try {
-    db.prepare('DELETE FROM accounts WHERE id = ?').run(targetId);
-    logAudit(req.user!.id, 'DELETE_ACCOUNT', 'accounts', targetId, `حذف الحساب: ${target.code} - ${target.name_ar}`);
+    (await db.prepare('DELETE FROM accounts WHERE id = ?').run(targetId));
+    (await logAudit(req.user!.id, 'DELETE_ACCOUNT', 'accounts', targetId, `حذف الحساب: ${target.code} - ${target.name_ar}`));
     res.json({ success: true, message: `تم حذف الحساب "${target.name_ar}" بنجاح.` });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.get('/journal-entries', requireAuth, requirePermission('journal.view'), (req: AuthenticatedRequest, res) => {
+apiRouter.get('/journal-entries', requireAuth, requirePermission('journal.view'), async (req: AuthenticatedRequest, res) => {
   const { status, docType, fromDate, toDate, branchId } = req.query;
 
   let query = `
@@ -1723,24 +1725,24 @@ apiRouter.get('/journal-entries', requireAuth, requirePermission('journal.view')
 
   query += ' ORDER BY je.entry_date DESC, je.entry_number DESC LIMIT 200';
 
-  const entries = db.prepare(query).all(...params);
+  const entries = (await db.prepare(query).all(...params));
   res.json({ entries });
 });
 
-apiRouter.get('/journal-entries/:id', requireAuth, requirePermission('journal.view'), (req: AuthenticatedRequest, res) => {
-  const entry = db.prepare(`
+apiRouter.get('/journal-entries/:id', requireAuth, requirePermission('journal.view'), async (req: AuthenticatedRequest, res) => {
+  const entry = (await db.prepare(`
     SELECT je.*, b.name_ar as branch_name, fp.name_ar as period_name
     FROM journal_entries je
     JOIN branches b ON je.branch_id = b.id
     JOIN fiscal_periods fp ON je.fiscal_period_id = fp.id
     WHERE je.id = ?
-  `).get(req.params.id) as any;
+  `).get(req.params.id)) as any;
 
   if (!entry) {
     return res.status(404).json({ error: 'القيد المحاسبي غير موجود.' });
   }
 
-  const lines = db.prepare(`
+  const lines = (await db.prepare(`
     SELECT jel.*, a.code as account_code, a.name_ar as account_name,
            p.name_ar as party_name, cc.name_ar as cost_center_name
     FROM journal_entry_lines jel
@@ -1749,14 +1751,14 @@ apiRouter.get('/journal-entries/:id', requireAuth, requirePermission('journal.vi
     LEFT JOIN cost_centers cc ON jel.cost_center_id = cc.id
     WHERE jel.entry_id = ?
     ORDER BY jel.line_number ASC
-  `).all(req.params.id);
+  `).all(req.params.id));
 
   entry.lines = lines;
   res.json({ entry });
 });
 
-apiRouter.post('/journal-entries', requireAuth, (req: AuthenticatedRequest, res) => {
-  if (checkIdempotency(req, res)) return;
+apiRouter.post('/journal-entries', requireAuth, async (req: AuthenticatedRequest, res) => {
+  if ((await checkIdempotency(req, res))) return;
 
   try {
     const { docType, entryDate, postingDate, branchId, description, lines, status } = req.body;
@@ -1778,9 +1780,9 @@ apiRouter.post('/journal-entries', requireAuth, (req: AuthenticatedRequest, res)
     if (isDraft) {
       // Save as draft without ledger balance impact
       const effDate = entryDate || new Date().toISOString().split('T')[0];
-      const period = getFiscalPeriodForDate(effDate);
+      const period = (await getFiscalPeriodForDate(effDate));
       const entryId = `je_draft_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-      const entryNumber = getNextDocumentNumber('JV-DFT', branchId, period.fiscal_year_id);
+      const entryNumber = (await getNextDocumentNumber('JV-DFT', branchId, period.fiscal_year_id));
 
       let totalDebit = new Decimal(0);
       let totalCredit = new Decimal(0);
@@ -1791,8 +1793,8 @@ apiRouter.post('/journal-entries', requireAuth, (req: AuthenticatedRequest, res)
         }
       }
 
-      db.transaction(() => {
-        db.prepare(`
+      (await db.transaction(async () => {
+        (await db.prepare(`
           INSERT INTO journal_entries (
             id, entry_number, doc_type, doc_id, doc_number, entry_date, posting_date,
             fiscal_period_id, branch_id, status, description, total_debit, total_credit,
@@ -1802,7 +1804,7 @@ apiRouter.post('/journal-entries', requireAuth, (req: AuthenticatedRequest, res)
           entryId, entryNumber, docType || 'MANUAL', null, null, effDate, effDate,
           period.id, branchId, description || 'مسودة قيد يومية',
           totalDebit.toNumber(), totalCredit.toNumber(), req.user!.id
-        );
+        ));
 
         if (Array.isArray(lines)) {
           const insertLine = db.prepare(`
@@ -1815,22 +1817,22 @@ apiRouter.post('/journal-entries', requireAuth, (req: AuthenticatedRequest, res)
           for (const l of lines) {
             const d = new Decimal(l.debit || 0).toNumber();
             const c = new Decimal(l.credit || 0).toNumber();
-            insertLine.run(
+            (await insertLine.run(
               `jel_dft_${Date.now()}_${lineNo}`, entryId, lineNo++, l.accountId || null,
               l.partyId || null, l.costCenterId || null, d, c, l.description || description || '', d > 0 ? d : c
-            );
+            ));
           }
         }
-      })();
+      })());
 
-      logAudit(req.user!.id, 'CREATE_DRAFT_JOURNAL', 'journal_entries', entryId, `إنشاء مسودة قيد يومية برقم ${entryNumber}`);
+      (await logAudit(req.user!.id, 'CREATE_DRAFT_JOURNAL', 'journal_entries', entryId, `إنشاء مسودة قيد يومية برقم ${entryNumber}`));
       const responseData = { success: true, entryId, entryNumber, status: 'draft', message: 'تم حفظ مسودة القيد بنجاح دون أي أثر على الأستاذ.' };
-      saveIdempotency(req.headers['idempotency-key'] as string, req.user!.id, '/journal-entries', 200, responseData, req.body);
+      (await saveIdempotency(req.headers['idempotency-key'] as string, req.user!.id, '/journal-entries', 200, responseData, req.body));
       return res.json(responseData);
     }
 
     // Direct Post
-    const result = postJournalEntry({
+    const result = (await postJournalEntry({
       docType: docType || 'MANUAL',
       entryDate: entryDate || new Date().toISOString().split('T')[0],
       postingDate: postingDate || entryDate || new Date().toISOString().split('T')[0],
@@ -1838,18 +1840,18 @@ apiRouter.post('/journal-entries', requireAuth, (req: AuthenticatedRequest, res)
       description,
       createdBy: req.user!.id,
       lines
-    });
+    }));
 
     const responseData = { success: true, ...result, status: 'posted' };
-    saveIdempotency(req.headers['idempotency-key'] as string, req.user!.id, '/journal-entries', 200, responseData, req.body);
+    (await saveIdempotency(req.headers['idempotency-key'] as string, req.user!.id, '/journal-entries', 200, responseData, req.body));
     res.json(responseData);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-apiRouter.put('/journal-entries/:id', requireAuth, requirePermission('journal.edit_draft'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM journal_entries WHERE id = ?').get(req.params.id) as any;
+apiRouter.put('/journal-entries/:id', requireAuth, requirePermission('journal.edit_draft'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM journal_entries WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'القيد غير موجود.' });
 
   if (target.status !== 'draft') {
@@ -1877,8 +1879,8 @@ apiRouter.put('/journal-entries/:id', requireAuth, requirePermission('journal.ed
       totalCredit = totalCredit.plus(new Decimal(l.credit || 0));
     }
 
-    db.transaction(() => {
-      db.prepare(`
+    (await db.transaction(async () => {
+      (await db.prepare(`
         UPDATE journal_entries
         SET entry_date = COALESCE(?, entry_date),
             posting_date = COALESCE(?, posting_date),
@@ -1887,9 +1889,9 @@ apiRouter.put('/journal-entries/:id', requireAuth, requirePermission('journal.ed
             total_debit = ?,
             total_credit = ?
         WHERE id = ?
-      `).run(entryDate || null, entryDate || null, description || null, branchId || null, totalDebit.toNumber(), totalCredit.toNumber(), target.id);
+      `).run(entryDate || null, entryDate || null, description || null, branchId || null, totalDebit.toNumber(), totalCredit.toNumber(), target.id));
 
-      db.prepare('DELETE FROM journal_entry_lines WHERE entry_id = ?').run(target.id);
+      (await db.prepare('DELETE FROM journal_entry_lines WHERE entry_id = ?').run(target.id));
       const insertLine = db.prepare(`
         INSERT INTO journal_entry_lines (
           id, entry_id, line_number, account_id, party_id, cost_center_id,
@@ -1901,22 +1903,22 @@ apiRouter.put('/journal-entries/:id', requireAuth, requirePermission('journal.ed
       for (const l of lines) {
         const d = new Decimal(l.debit || 0).toNumber();
         const c = new Decimal(l.credit || 0).toNumber();
-        insertLine.run(
+        (await insertLine.run(
           `jel_${Date.now()}_${lineNo}`, target.id, lineNo++, l.accountId || null,
           l.partyId || null, l.costCenterId || null, d, c, l.description || description || '', d > 0 ? d : c
-        );
+        ));
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'UPDATE_DRAFT_JOURNAL', 'journal_entries', target.id, `تعديل مسودة القيد ${target.entry_number}`);
+    (await logAudit(req.user!.id, 'UPDATE_DRAFT_JOURNAL', 'journal_entries', target.id, `تعديل مسودة القيد ${target.entry_number}`));
     res.json({ success: true, message: 'تم تحديث مسودة القيد بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-apiRouter.delete('/journal-entries/:id', requireAuth, requirePermission('journal.delete_draft'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM journal_entries WHERE id = ?').get(req.params.id) as any;
+apiRouter.delete('/journal-entries/:id', requireAuth, requirePermission('journal.delete_draft'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM journal_entries WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'القيد غير موجود.' });
 
   if (target.status !== 'draft') {
@@ -1928,20 +1930,20 @@ apiRouter.delete('/journal-entries/:id', requireAuth, requirePermission('journal
   }
 
   try {
-    db.transaction(() => {
-      db.prepare('DELETE FROM journal_entry_lines WHERE entry_id = ?').run(target.id);
-      db.prepare('DELETE FROM journal_entries WHERE id = ?').run(target.id);
-    })();
+    (await db.transaction(async () => {
+      (await db.prepare('DELETE FROM journal_entry_lines WHERE entry_id = ?').run(target.id));
+      (await db.prepare('DELETE FROM journal_entries WHERE id = ?').run(target.id));
+    })());
 
-    logAudit(req.user!.id, 'DELETE_DRAFT_JOURNAL', 'journal_entries', target.id, `حذف مسودة القيد ${target.entry_number}`);
+    (await logAudit(req.user!.id, 'DELETE_DRAFT_JOURNAL', 'journal_entries', target.id, `حذف مسودة القيد ${target.entry_number}`));
     res.json({ success: true, message: `تم حذف مسودة القيد "${target.entry_number}" بنجاح.` });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.post('/journal-entries/:id/post', requireAuth, requirePermission('journal.post'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM journal_entries WHERE id = ?').get(req.params.id) as any;
+apiRouter.post('/journal-entries/:id/post', requireAuth, requirePermission('journal.post'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM journal_entries WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'القيد غير موجود.' });
 
   if (target.status !== 'draft') {
@@ -1952,7 +1954,7 @@ apiRouter.post('/journal-entries/:id/post', requireAuth, requirePermission('jour
     return res.status(403).json({ error: 'الفرع التابع له القيد خارج نطاق الفروع المصرح لك بها.' });
   }
 
-  const lines = db.prepare('SELECT * FROM journal_entry_lines WHERE entry_id = ?').all(target.id) as any[];
+  const lines = (await db.prepare('SELECT * FROM journal_entry_lines WHERE entry_id = ?').all(target.id)) as any[];
   if (!lines || lines.length < 2) {
     return res.status(400).json({ error: 'يجب أن يحتوي القيد على طرفين على الأقل للترحيل.' });
   }
@@ -1967,7 +1969,7 @@ apiRouter.post('/journal-entries/:id/post', requireAuth, requirePermission('jour
       totalDebit = totalDebit.plus(d);
       totalCredit = totalCredit.plus(c);
 
-      const acc = db.prepare('SELECT id, name_ar, is_group, is_active FROM accounts WHERE id = ?').get(l.account_id) as any;
+      const acc = (await db.prepare('SELECT id, name_ar, is_group, is_active FROM accounts WHERE id = ?').get(l.account_id)) as any;
       if (!acc) throw new Error(`الحساب ${l.account_id} غير موجود بدليل الحسابات.`);
       if (acc.is_group === 1) throw new Error(`الحساب "${acc.name_ar}" حساب تجميعي ويحظر الترحيل إليه.`);
       if (acc.is_active === 0) throw new Error(`الحساب "${acc.name_ar}" معطل.`);
@@ -1978,27 +1980,27 @@ apiRouter.post('/journal-entries/:id/post', requireAuth, requirePermission('jour
       throw new Error(`القيد غير متوازن: المدين (${totalDebit}) لا يساوي الدائن (${totalCredit}).`);
     }
 
-    const period = getFiscalPeriodForDate(target.posting_date || target.entry_date);
-    const postedEntryNumber = getNextDocumentNumber('JV', target.branch_id, period.fiscal_year_id);
+    const period = (await getFiscalPeriodForDate(target.posting_date || target.entry_date));
+    const postedEntryNumber = (await getNextDocumentNumber('JV', target.branch_id, period.fiscal_year_id));
 
-    db.prepare(`
+    (await db.prepare(`
       UPDATE journal_entries
       SET status = 'posted',
           entry_number = ?,
           posted_by = ?,
           posted_at = CURRENT_TIMESTAMP
       WHERE id = ?
-    `).run(postedEntryNumber, req.user!.id, target.id);
+    `).run(postedEntryNumber, req.user!.id, target.id));
 
-    logAudit(req.user!.id, 'POST_JOURNAL', 'journal_entries', target.id, `اعتماد وترحيل مسودة القيد برقم ${postedEntryNumber}`);
+    (await logAudit(req.user!.id, 'POST_JOURNAL', 'journal_entries', target.id, `اعتماد وترحيل مسودة القيد برقم ${postedEntryNumber}`));
     res.json({ success: true, entryId: target.id, entryNumber: postedEntryNumber, message: 'تم اعتماد وترحيل القيد بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-apiRouter.post('/journal-entries/:id/reverse', requireAuth, requirePermission('journal.reverse', 'reverse'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT branch_id FROM journal_entries WHERE id = ?').get(req.params.id) as any;
+apiRouter.post('/journal-entries/:id/reverse', requireAuth, requirePermission('journal.reverse', 'reverse'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT branch_id FROM journal_entries WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'القيد غير موجود.' });
 
   if (!isBranchAllowed(req.user, target.branch_id)) {
@@ -2011,7 +2013,7 @@ apiRouter.post('/journal-entries/:id/reverse', requireAuth, requirePermission('j
       return res.status(400).json({ error: 'يجب ذكر سبب عكس القيد.' });
     }
 
-    const result = reverseJournalEntry(req.params.id, reason, req.user!.id);
+    const result = (await reverseJournalEntry(req.params.id, reason, req.user!.id));
     res.json({ success: true, ...result });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -2021,7 +2023,7 @@ apiRouter.post('/journal-entries/:id/reverse', requireAuth, requirePermission('j
 // ----------------------------------------------------
 // 6. Customers & Suppliers & Statement of Account
 // ----------------------------------------------------
-apiRouter.get('/parties', requireAuth, requirePermission('parties.view'), (req, res) => {
+apiRouter.get('/parties', requireAuth, requirePermission('parties.view'), async (req, res) => {
   const { type } = req.query;
   let q = `
     SELECT p.*,
@@ -2046,13 +2048,13 @@ apiRouter.get('/parties', requireAuth, requirePermission('parties.view'), (req, 
   }
   q += ' ORDER BY p.name_ar ASC';
 
-  const parties = db.prepare(q).all(...params);
+  const parties = (await db.prepare(q).all(...params));
   res.json({ parties });
 });
 
 // Full Server-Side Statement of Account with Date and Branch Scoping
-apiRouter.get('/parties/:id/statement', requireAuth, requirePermission('parties.statement', 'parties.view'), (req, res) => {
-  const party = db.prepare('SELECT * FROM parties WHERE id = ?').get(req.params.id) as any;
+apiRouter.get('/parties/:id/statement', requireAuth, requirePermission('parties.statement', 'parties.view'), async (req, res) => {
+  const party = (await db.prepare('SELECT * FROM parties WHERE id = ?').get(req.params.id)) as any;
   if (!party) return res.status(404).json({ error: 'الطرف التجاري غير موجود' });
 
   const fromDate = typeof req.query.fromDate === 'string' && req.query.fromDate ? req.query.fromDate : null;
@@ -2075,7 +2077,7 @@ apiRouter.get('/parties/:id/statement', requireAuth, requirePermission('parties.
       openSql += ' AND je.branch_id = ?';
       openParams.push(branchId);
     }
-    const openRow = db.prepare(openSql).get(...openParams) as any;
+    const openRow = (await db.prepare(openSql).get(...openParams)) as any;
     openingDebit = new Decimal(openRow.total_debit || 0);
     openingCredit = new Decimal(openRow.total_credit || 0);
   }
@@ -2109,7 +2111,7 @@ apiRouter.get('/parties/:id/statement', requireAuth, requirePermission('parties.
   }
   periodSql += ' ORDER BY je.entry_date ASC, je.entry_number ASC';
 
-  const transactions = db.prepare(periodSql).all(...periodParams);
+  const transactions = (await db.prepare(periodSql).all(...periodParams));
 
   let runningBalance = new Decimal(openingBalance);
   let periodDebitTotal = new Decimal(0);
@@ -2153,7 +2155,7 @@ apiRouter.get('/parties/:id/statement', requireAuth, requirePermission('parties.
   });
 });
 
-apiRouter.post('/parties', requireAuth, requirePermission('parties.create', 'add'), (req: AuthenticatedRequest, res) => {
+apiRouter.post('/parties', requireAuth, requirePermission('parties.create', 'add'), async (req: AuthenticatedRequest, res) => {
   try {
     const { name_ar, name_en, type, tax_id, commercial_registry, phone, address, city, credit_limit, payment_terms_days } = req.body;
     if (!name_ar || typeof name_ar !== 'string' || !name_ar.trim()) {
@@ -2167,13 +2169,13 @@ apiRouter.post('/parties', requireAuth, requirePermission('parties.create', 'add
     let code = '';
     const id = `party_${type}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
-    db.transaction(() => {
+    (await db.transaction(async () => {
       const prefix = type === 'supplier' ? 'SUPP' : 'CUST';
-      const seqRow = db.prepare('SELECT last_number FROM party_sequences WHERE type = ?').get(type) as { last_number: number } | undefined;
+      const seqRow = (await db.prepare('SELECT last_number FROM party_sequences WHERE type = ?').get(type)) as { last_number: number } | undefined;
       let nextNum = 1;
 
       if (!seqRow) {
-        const existing = db.prepare("SELECT code FROM parties WHERE code LIKE ?").all(`${prefix}-%`) as { code: string }[];
+        const existing = (await db.prepare("SELECT code FROM parties WHERE code LIKE ?").all(`${prefix}-%`)) as { code: string }[];
         let maxNum = 0;
         for (const p of existing) {
           const parts = p.code.split('-');
@@ -2181,20 +2183,20 @@ apiRouter.post('/parties', requireAuth, requirePermission('parties.create', 'add
           if (!isNaN(n) && n > maxNum) maxNum = n;
         }
         nextNum = maxNum + 1;
-        db.prepare('INSERT INTO party_sequences (type, last_number) VALUES (?, ?)').run(type, nextNum);
+        (await db.prepare('INSERT INTO party_sequences (type, last_number) VALUES (?, ?)').run(type, nextNum));
       } else {
         nextNum = seqRow.last_number + 1;
-        db.prepare('UPDATE party_sequences SET last_number = ? WHERE type = ?').run(nextNum, type);
+        (await db.prepare('UPDATE party_sequences SET last_number = ? WHERE type = ?').run(nextNum, type));
       }
 
       code = `${prefix}-${nextNum.toString().padStart(4, '0')}`;
-      while (db.prepare('SELECT id FROM parties WHERE code = ?').get(code)) {
+      while ((await db.prepare('SELECT id FROM parties WHERE code = ?').get(code))) {
         nextNum++;
-        db.prepare('UPDATE party_sequences SET last_number = ? WHERE type = ?').run(nextNum, type);
+        (await db.prepare('UPDATE party_sequences SET last_number = ? WHERE type = ?').run(nextNum, type));
         code = `${prefix}-${nextNum.toString().padStart(4, '0')}`;
       }
 
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO parties (
           id, code, type, name_ar, name_en, tax_id, commercial_registry, phone, address, city, credit_limit, payment_terms_days
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2203,18 +2205,18 @@ apiRouter.post('/parties', requireAuth, requirePermission('parties.create', 'add
         tax_id || null, commercial_registry || null, phone || null, address || null,
         city || 'القاهرة', credit_limit ? parseFloat(credit_limit) : 0,
         payment_terms_days ? parseInt(payment_terms_days, 10) : 0
-      );
-    })();
+      ));
+    })());
 
-    logAudit(req.user!.id, 'CREATE_PARTY', 'parties', id, `إضافة طرف تجاري: ${code} - ${name_ar}`);
+    (await logAudit(req.user!.id, 'CREATE_PARTY', 'parties', id, `إضافة طرف تجاري: ${code} - ${name_ar}`));
     res.json({ success: true, id, code, message: `تمت إضافة ${type === 'supplier' ? 'المورد' : 'العميل'} "${name_ar}" برقم (${code}) بنجاح.` });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.put('/parties/:id', requireAuth, requirePermission('parties.edit', 'manage_settings'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM parties WHERE id = ?').get(req.params.id) as any;
+apiRouter.put('/parties/:id', requireAuth, requirePermission('parties.edit', 'manage_settings'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM parties WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'الطرف التجاري غير موجود.' });
 
   const { name_ar, name_en, type, tax_id, commercial_registry, phone, address, city, credit_limit, payment_terms_days, is_active } = req.body;
@@ -2224,11 +2226,11 @@ apiRouter.put('/parties/:id', requireAuth, requirePermission('parties.edit', 'ma
       return res.status(400).json({ error: 'نوع الطرف غير مدعوم. يرجى اختيار عميل (customer) أو مورد (supplier).' });
     }
     // Check if transactions exist before allowing party type change
-    const sCount = db.prepare('SELECT COUNT(*) as cnt FROM sales_invoices WHERE customer_id = ?').get(target.id) as { cnt: number };
-    const pCount = db.prepare('SELECT COUNT(*) as cnt FROM purchase_invoices WHERE supplier_id = ?').get(target.id) as { cnt: number };
-    const srCount = db.prepare('SELECT COUNT(*) as cnt FROM sales_returns WHERE customer_id = ?').get(target.id) as { cnt: number };
-    const prCount = db.prepare('SELECT COUNT(*) as cnt FROM purchase_returns WHERE supplier_id = ?').get(target.id) as { cnt: number };
-    const jeCount = db.prepare('SELECT COUNT(*) as cnt FROM journal_entry_lines WHERE party_id = ?').get(target.id) as { cnt: number };
+    const sCount = (await db.prepare('SELECT COUNT(*) as cnt FROM sales_invoices WHERE customer_id = ?').get(target.id)) as { cnt: number };
+    const pCount = (await db.prepare('SELECT COUNT(*) as cnt FROM purchase_invoices WHERE supplier_id = ?').get(target.id)) as { cnt: number };
+    const srCount = (await db.prepare('SELECT COUNT(*) as cnt FROM sales_returns WHERE customer_id = ?').get(target.id)) as { cnt: number };
+    const prCount = (await db.prepare('SELECT COUNT(*) as cnt FROM purchase_returns WHERE supplier_id = ?').get(target.id)) as { cnt: number };
+    const jeCount = (await db.prepare('SELECT COUNT(*) as cnt FROM journal_entry_lines WHERE party_id = ?').get(target.id)) as { cnt: number };
     const totalTx = sCount.cnt + pCount.cnt + srCount.cnt + prCount.cnt + jeCount.cnt;
     if (totalTx > 0) {
       return res.status(400).json({ error: `لا يمكن تغيير نوع الطرف لوجود معاملات مالية (${totalTx} حركة) مسجلة عليه.` });
@@ -2236,7 +2238,7 @@ apiRouter.put('/parties/:id', requireAuth, requirePermission('parties.edit', 'ma
   }
 
   try {
-    db.prepare(`
+    (await db.prepare(`
       UPDATE parties
       SET name_ar = COALESCE(?, name_ar),
           name_en = COALESCE(?, name_en),
@@ -2267,26 +2269,26 @@ apiRouter.put('/parties/:id', requireAuth, requirePermission('parties.edit', 'ma
       payment_terms_days !== undefined ? parseInt(payment_terms_days, 10) : null,
       is_active !== undefined ? (is_active ? 1 : 0) : null,
       target.id
-    );
+    ));
 
-    logAudit(req.user!.id, 'UPDATE_PARTY', 'parties', target.id, `تعديل الطرف التجاري: ${target.code} - ${name_ar || target.name_ar}`);
+    (await logAudit(req.user!.id, 'UPDATE_PARTY', 'parties', target.id, `تعديل الطرف التجاري: ${target.code} - ${name_ar || target.name_ar}`));
     res.json({ success: true, message: 'تم تحديث بيانات الطرف التجاري بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-apiRouter.delete('/parties/:id', requireAuth, requirePermission('parties.delete', 'manage_settings'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM parties WHERE id = ?').get(req.params.id) as any;
+apiRouter.delete('/parties/:id', requireAuth, requirePermission('parties.delete', 'manage_settings'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM parties WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'الطرف التجاري غير موجود.' });
 
   // Check all linked financial documents
-  const sCount = db.prepare('SELECT COUNT(*) as cnt FROM sales_invoices WHERE customer_id = ?').get(target.id) as { cnt: number };
-  const pCount = db.prepare('SELECT COUNT(*) as cnt FROM purchase_invoices WHERE supplier_id = ?').get(target.id) as { cnt: number };
-  const srCount = db.prepare('SELECT COUNT(*) as cnt FROM sales_returns WHERE customer_id = ?').get(target.id) as { cnt: number };
-  const prCount = db.prepare('SELECT COUNT(*) as cnt FROM purchase_returns WHERE supplier_id = ?').get(target.id) as { cnt: number };
-  const jeCount = db.prepare('SELECT COUNT(*) as cnt FROM journal_entry_lines WHERE party_id = ?').get(target.id) as { cnt: number };
-  const pvCount = db.prepare('SELECT COUNT(*) as cnt FROM payment_vouchers WHERE party_id = ?').get(target.id) as { cnt: number };
+  const sCount = (await db.prepare('SELECT COUNT(*) as cnt FROM sales_invoices WHERE customer_id = ?').get(target.id)) as { cnt: number };
+  const pCount = (await db.prepare('SELECT COUNT(*) as cnt FROM purchase_invoices WHERE supplier_id = ?').get(target.id)) as { cnt: number };
+  const srCount = (await db.prepare('SELECT COUNT(*) as cnt FROM sales_returns WHERE customer_id = ?').get(target.id)) as { cnt: number };
+  const prCount = (await db.prepare('SELECT COUNT(*) as cnt FROM purchase_returns WHERE supplier_id = ?').get(target.id)) as { cnt: number };
+  const jeCount = (await db.prepare('SELECT COUNT(*) as cnt FROM journal_entry_lines WHERE party_id = ?').get(target.id)) as { cnt: number };
+  const pvCount = (await db.prepare('SELECT COUNT(*) as cnt FROM payment_vouchers WHERE party_id = ?').get(target.id)) as { cnt: number };
 
   const totalTx = sCount.cnt + pCount.cnt + srCount.cnt + prCount.cnt + jeCount.cnt + pvCount.cnt;
   if (totalTx > 0) {
@@ -2296,12 +2298,12 @@ apiRouter.delete('/parties/:id', requireAuth, requirePermission('parties.delete'
   }
 
   try {
-    db.transaction(() => {
-      db.prepare('DELETE FROM party_contacts WHERE party_id = ?').run(target.id);
-      db.prepare('DELETE FROM parties WHERE id = ?').run(target.id);
-    })();
+    (await db.transaction(async () => {
+      (await db.prepare('DELETE FROM party_contacts WHERE party_id = ?').run(target.id));
+      (await db.prepare('DELETE FROM parties WHERE id = ?').run(target.id));
+    })());
 
-    logAudit(req.user!.id, 'DELETE_PARTY', 'parties', target.id, `حذف الطرف التجاري: ${target.code} - ${target.name_ar}`);
+    (await logAudit(req.user!.id, 'DELETE_PARTY', 'parties', target.id, `حذف الطرف التجاري: ${target.code} - ${target.name_ar}`));
     res.json({ success: true, message: `تم حذف الطرف "${target.name_ar}" بنجاح.` });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -2311,44 +2313,44 @@ apiRouter.delete('/parties/:id', requireAuth, requirePermission('parties.delete'
 // ----------------------------------------------------
 // 7. Item Categories Management (إدارة فئات الأصناف)
 // ----------------------------------------------------
-apiRouter.get('/categories', requireAuth, (req, res) => {
-  const categories = db.prepare(`
+apiRouter.get('/categories', requireAuth, async (req, res) => {
+  const categories = (await db.prepare(`
     SELECT c.*, p.name_ar as parent_name_ar,
            (SELECT COUNT(*) FROM items i WHERE i.category_id = c.id OR i.category = c.name_ar) as item_count
     FROM item_categories c
     LEFT JOIN item_categories p ON c.parent_id = p.id
     ORDER BY c.code ASC
-  `).all();
+  `).all());
   res.json({ categories });
 });
 
-apiRouter.post('/categories', requireAuth, requirePermission('manage_settings'), (req: AuthenticatedRequest, res) => {
+apiRouter.post('/categories', requireAuth, requirePermission('manage_settings'), async (req: AuthenticatedRequest, res) => {
   const { code, name_ar, name_en, parent_id, is_active } = req.body;
   if (!code || !name_ar) {
     return res.status(400).json({ error: 'كود الفئة والاسم العربي مطلوبان.' });
   }
 
-  const existing = db.prepare('SELECT id FROM item_categories WHERE code = ?').get(code);
+  const existing = (await db.prepare('SELECT id FROM item_categories WHERE code = ?').get(code));
   if (existing) {
     return res.status(400).json({ error: `كود الفئة "${code}" مسجل مسبقاً.` });
   }
 
   try {
     const id = `cat_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO item_categories (id, code, name_ar, name_en, parent_id, is_active)
       VALUES (?, ?, ?, ?, ?, ?)
-    `).run(id, code, name_ar, name_en || null, parent_id || null, is_active !== undefined ? (is_active ? 1 : 0) : 1);
+    `).run(id, code, name_ar, name_en || null, parent_id || null, is_active !== undefined ? (is_active ? 1 : 0) : 1));
 
-    logAudit(req.user!.id, 'CREATE_CATEGORY', 'item_categories', id, `إضافة فئة أصناف: ${code} - ${name_ar}`);
+    (await logAudit(req.user!.id, 'CREATE_CATEGORY', 'item_categories', id, `إضافة فئة أصناف: ${code} - ${name_ar}`));
     res.json({ success: true, id, message: `تمت إضافة الفئة "${name_ar}" بنجاح.` });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-apiRouter.put('/categories/:id', requireAuth, requirePermission('manage_settings'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM item_categories WHERE id = ?').get(req.params.id) as any;
+apiRouter.put('/categories/:id', requireAuth, requirePermission('manage_settings'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM item_categories WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'الفئة غير موجودة' });
 
   const { name_ar, name_en, parent_id, is_active } = req.body;
@@ -2359,7 +2361,7 @@ apiRouter.put('/categories/:id', requireAuth, requirePermission('manage_settings
   }
 
   try {
-    db.prepare(`
+    (await db.prepare(`
       UPDATE item_categories
       SET name_ar = COALESCE(?, name_ar),
           name_en = COALESCE(?, name_en),
@@ -2373,27 +2375,27 @@ apiRouter.put('/categories/:id', requireAuth, requirePermission('manage_settings
       parent_id || null,
       is_active !== undefined ? (is_active ? 1 : 0) : null,
       target.id
-    );
+    ));
 
-    logAudit(req.user!.id, 'UPDATE_CATEGORY', 'item_categories', target.id, `تعديل فئة الأصناف: ${target.code} - ${name_ar || target.name_ar}`);
+    (await logAudit(req.user!.id, 'UPDATE_CATEGORY', 'item_categories', target.id, `تعديل فئة الأصناف: ${target.code} - ${name_ar || target.name_ar}`));
     res.json({ success: true, message: 'تم تحديث بيانات الفئة بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-apiRouter.delete('/categories/:id', requireAuth, requirePermission('manage_settings'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM item_categories WHERE id = ?').get(req.params.id) as any;
+apiRouter.delete('/categories/:id', requireAuth, requirePermission('manage_settings'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM item_categories WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'الفئة غير موجودة' });
 
   // 1. Check child categories
-  const childCount = db.prepare('SELECT COUNT(*) as cnt FROM item_categories WHERE parent_id = ?').get(target.id) as { cnt: number };
+  const childCount = (await db.prepare('SELECT COUNT(*) as cnt FROM item_categories WHERE parent_id = ?').get(target.id)) as { cnt: number };
   if (childCount.cnt > 0) {
     return res.status(400).json({ error: `لا يمكن حذف الفئة لأنها فئة رئيسية تتبعها (${childCount.cnt}) فئات فرعية.` });
   }
 
   // 2. Check linked items
-  const itemsCount = db.prepare('SELECT COUNT(*) as cnt FROM items WHERE category_id = ? OR category = ?').get(target.id, target.name_ar) as { cnt: number };
+  const itemsCount = (await db.prepare('SELECT COUNT(*) as cnt FROM items WHERE category_id = ? OR category = ?').get(target.id, target.name_ar)) as { cnt: number };
   if (itemsCount.cnt > 0) {
     return res.status(400).json({
       error: `لا يمكن حذف الفئة لوجود (${itemsCount.cnt}) أصناف مرتبطة بها. يرجى نقل الأصناف إلى فئة أخرى أولاً أو تعطيل الفئة.`
@@ -2401,33 +2403,33 @@ apiRouter.delete('/categories/:id', requireAuth, requirePermission('manage_setti
   }
 
   try {
-    db.prepare('DELETE FROM item_categories WHERE id = ?').run(target.id);
-    logAudit(req.user!.id, 'DELETE_CATEGORY', 'item_categories', target.id, `حذف فئة الأصناف: ${target.code} - ${target.name_ar}`);
+    (await db.prepare('DELETE FROM item_categories WHERE id = ?').run(target.id));
+    (await logAudit(req.user!.id, 'DELETE_CATEGORY', 'item_categories', target.id, `حذف فئة الأصناف: ${target.code} - ${target.name_ar}`));
     res.json({ success: true, message: `تم حذف الفئة "${target.name_ar}" بنجاح.` });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.post('/categories/:id/transfer-items', requireAuth, requirePermission('manage_settings'), (req: AuthenticatedRequest, res) => {
+apiRouter.post('/categories/:id/transfer-items', requireAuth, requirePermission('manage_settings'), async (req: AuthenticatedRequest, res) => {
   const sourceCatId = req.params.id;
   const { targetCategoryId } = req.body;
   if (!targetCategoryId) return res.status(400).json({ error: 'الفئة البديلة المستهدفة مطلوبة.' });
 
-  const targetCat = db.prepare('SELECT * FROM item_categories WHERE id = ?').get(targetCategoryId) as any;
+  const targetCat = (await db.prepare('SELECT * FROM item_categories WHERE id = ?').get(targetCategoryId)) as any;
   if (!targetCat) return res.status(404).json({ error: 'الفئة المستهدفة غير موجودة' });
 
-  const sourceCat = db.prepare('SELECT * FROM item_categories WHERE id = ?').get(sourceCatId) as any;
+  const sourceCat = (await db.prepare('SELECT * FROM item_categories WHERE id = ?').get(sourceCatId)) as any;
   if (!sourceCat) return res.status(404).json({ error: 'الفئة المصدر غير موجودة' });
 
   try {
-    const updated = db.prepare(`
+    const updated = (await db.prepare(`
       UPDATE items 
       SET category_id = ?, category = ? 
       WHERE category_id = ? OR category = ?
-    `).run(targetCat.id, targetCat.name_ar, sourceCat.id, sourceCat.name_ar);
+    `).run(targetCat.id, targetCat.name_ar, sourceCat.id, sourceCat.name_ar));
 
-    logAudit(req.user!.id, 'TRANSFER_CATEGORY_ITEMS', 'item_categories', sourceCatId, `نقل ${updated.changes} صنف من "${sourceCat.name_ar}" إلى "${targetCat.name_ar}"`);
+    (await logAudit(req.user!.id, 'TRANSFER_CATEGORY_ITEMS', 'item_categories', sourceCatId, `نقل ${updated.changes} صنف من "${sourceCat.name_ar}" إلى "${targetCat.name_ar}"`));
     res.json({ success: true, movedCount: updated.changes, message: `تم نقل ${updated.changes} صنف بنجاح إلى "${targetCat.name_ar}".` });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -2437,10 +2439,10 @@ apiRouter.post('/categories/:id/transfer-items', requireAuth, requirePermission(
 // ----------------------------------------------------
 // 8. Items & Stock (Cost Redacted if unauthorized)
 // ----------------------------------------------------
-apiRouter.get('/items', requireAuth, requirePermission('inventory.view', 'items.view'), (req: AuthenticatedRequest, res) => {
+apiRouter.get('/items', requireAuth, requirePermission('inventory.view', 'items.view'), async (req: AuthenticatedRequest, res) => {
   const hasViewCost = req.user?.role === 'owner' || req.user?.permissions.includes('view_cost');
 
-  const items = db.prepare(`
+  const items = (await db.prepare(`
     SELECT i.*, c.name_ar as category_name_ar, c.code as category_code,
            COALESCE(SUM(ws.quantity), 0) as total_quantity
     FROM items i
@@ -2448,7 +2450,7 @@ apiRouter.get('/items', requireAuth, requirePermission('inventory.view', 'items.
     LEFT JOIN warehouse_stock ws ON i.id = ws.item_id
     GROUP BY i.id
     ORDER BY i.name_ar ASC
-  `).all() as any[];
+  `).all()) as any[];
 
   // Redact cost strictly if not permitted
   if (!hasViewCost) {
@@ -2461,15 +2463,15 @@ apiRouter.get('/items', requireAuth, requirePermission('inventory.view', 'items.
   res.json({ items });
 });
 
-apiRouter.get('/items/:id', requireAuth, requirePermission('inventory.view', 'items.view'), (req: AuthenticatedRequest, res) => {
+apiRouter.get('/items/:id', requireAuth, requirePermission('inventory.view', 'items.view'), async (req: AuthenticatedRequest, res) => {
   const hasViewCost = req.user?.role === 'owner' || req.user?.permissions.includes('view_cost');
-  const item = db.prepare(`
+  const item = (await db.prepare(`
     SELECT i.*, c.name_ar as category_name_ar,
            COALESCE((SELECT SUM(quantity) FROM warehouse_stock WHERE item_id = i.id), 0) as total_quantity
     FROM items i
     LEFT JOIN item_categories c ON i.category_id = c.id
     WHERE i.id = ?
-  `).get(req.params.id) as any;
+  `).get(req.params.id)) as any;
 
   if (!item) return res.status(404).json({ error: 'الصنف غير موجود' });
 
@@ -2481,7 +2483,7 @@ apiRouter.get('/items/:id', requireAuth, requirePermission('inventory.view', 'it
   res.json({ item });
 });
 
-apiRouter.post('/items', requireAuth, requirePermission('items.create', 'inventory.create_item', 'manage_settings'), (req: AuthenticatedRequest, res) => {
+apiRouter.post('/items', requireAuth, requirePermission('items.create', 'inventory.create_item', 'manage_settings'), async (req: AuthenticatedRequest, res) => {
   const { code, barcode, name_ar, name_en, category_id, category, item_type, unit_name, sale_price, tax_rate, min_stock_level, is_active, description } = req.body;
 
   if (!code || !name_ar || sale_price === undefined) {
@@ -2489,14 +2491,14 @@ apiRouter.post('/items', requireAuth, requirePermission('items.create', 'invento
   }
 
   // Check unique code
-  const codeCheck = db.prepare('SELECT id FROM items WHERE code = ?').get(code);
+  const codeCheck = (await db.prepare('SELECT id FROM items WHERE code = ?').get(code));
   if (codeCheck) {
     return res.status(400).json({ error: `كود الصنف "${code}" مسجل مسبقاً.` });
   }
 
   // Check unique barcode if provided
   if (barcode) {
-    const barCheck = db.prepare('SELECT id, name_ar FROM items WHERE barcode = ?').get(barcode) as any;
+    const barCheck = (await db.prepare('SELECT id, name_ar FROM items WHERE barcode = ?').get(barcode)) as any;
     if (barCheck) {
       return res.status(400).json({ error: `الباركود الدولي "${barcode}" مسجل مسبقاً للصنف "${barCheck.name_ar}".` });
     }
@@ -2505,7 +2507,7 @@ apiRouter.post('/items', requireAuth, requirePermission('items.create', 'invento
   // Resolve category name
   let catName = category || 'أجهزة ومعدات';
   if (category_id) {
-    const cat = db.prepare('SELECT name_ar FROM item_categories WHERE id = ?').get(category_id) as any;
+    const cat = (await db.prepare('SELECT name_ar FROM item_categories WHERE id = ?').get(category_id)) as any;
     if (cat) catName = cat.name_ar;
   }
 
@@ -2515,8 +2517,8 @@ apiRouter.post('/items', requireAuth, requirePermission('items.create', 'invento
     const parsedTax = tax_rate !== undefined ? parseFloat(tax_rate) : 14.0;
     const parsedMinStock = min_stock_level !== undefined ? parseFloat(min_stock_level) : 5;
 
-    db.transaction(() => {
-      db.prepare(`
+    (await db.transaction(async () => {
+      (await db.prepare(`
         INSERT INTO items (
           id, code, barcode, name_ar, name_en, category_id, category, item_type,
           base_unit, sale_price, cost_price, moving_avg_cost, tax_rate, min_stock_level, is_active, description
@@ -2526,35 +2528,35 @@ apiRouter.post('/items', requireAuth, requirePermission('items.create', 'invento
         category_id || null, catName, item_type || 'stock', unit_name || 'قطعة',
         parsedPrice, parsedTax, parsedMinStock,
         is_active !== undefined ? (is_active ? 1 : 0) : 1, description || null
-      );
+      ));
 
       // Initialize 0 stock across all warehouses for this stock item
       if ((item_type || 'stock') === 'stock') {
-        const warehouses = db.prepare('SELECT id FROM warehouses').all() as { id: string }[];
-        const insStock = db.prepare('INSERT OR IGNORE INTO warehouse_stock (warehouse_id, item_id, quantity) VALUES (?, ?, 0)');
+        const warehouses = (await db.prepare('SELECT id FROM warehouses').all()) as { id: string }[];
+        const insStock = db.prepare('INSERT IGNORE INTO warehouse_stock (warehouse_id, item_id, quantity) VALUES (?, ?, 0)');
         for (const wh of warehouses) {
-          insStock.run(wh.id, itemId);
+          (await insStock.run(wh.id, itemId));
         }
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'CREATE_ITEM', 'items', itemId, `إضافة صنف جديد: ${code} - ${name_ar}`);
+    (await logAudit(req.user!.id, 'CREATE_ITEM', 'items', itemId, `إضافة صنف جديد: ${code} - ${name_ar}`));
     res.json({ success: true, id: itemId, message: `تمت إضافة الصنف "${name_ar}" بنجاح.` });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-apiRouter.put('/items/:id', requireAuth, requirePermission('items.edit', 'inventory.edit_item', 'manage_settings'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM items WHERE id = ?').get(req.params.id) as any;
+apiRouter.put('/items/:id', requireAuth, requirePermission('items.edit', 'inventory.edit_item', 'manage_settings'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM items WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'الصنف غير موجود.' });
 
   const { barcode, name_ar, name_en, category_id, category, item_type, unit_name, sale_price, tax_rate, min_stock_level, is_active, description } = req.body;
 
   // Check if transactions exist before allowing item_type change
   if (item_type && item_type !== target.item_type) {
-    const txSales = db.prepare('SELECT COUNT(*) as cnt FROM sales_invoice_items WHERE item_id = ?').get(target.id) as { cnt: number };
-    const txPurchases = db.prepare('SELECT COUNT(*) as cnt FROM purchase_invoice_items WHERE item_id = ?').get(target.id) as { cnt: number };
+    const txSales = (await db.prepare('SELECT COUNT(*) as cnt FROM sales_invoice_items WHERE item_id = ?').get(target.id)) as { cnt: number };
+    const txPurchases = (await db.prepare('SELECT COUNT(*) as cnt FROM purchase_invoice_items WHERE item_id = ?').get(target.id)) as { cnt: number };
     if (txSales.cnt > 0 || txPurchases.cnt > 0) {
       return res.status(400).json({ error: 'لا يمكن تغيير نوع الصنف بعد وجود فواتير أو حركات مخزنية مسجلة عليه.' });
     }
@@ -2562,7 +2564,7 @@ apiRouter.put('/items/:id', requireAuth, requirePermission('items.edit', 'invent
 
   // Check unique barcode if changed
   if (barcode && barcode !== target.barcode) {
-    const barCheck = db.prepare('SELECT id, name_ar FROM items WHERE barcode = ? AND id != ?').get(barcode, target.id) as any;
+    const barCheck = (await db.prepare('SELECT id, name_ar FROM items WHERE barcode = ? AND id != ?').get(barcode, target.id)) as any;
     if (barCheck) {
       return res.status(400).json({ error: `الباركود الدولي "${barcode}" مسجل مسبقاً لصنف آخر (${barCheck.name_ar}).` });
     }
@@ -2570,14 +2572,14 @@ apiRouter.put('/items/:id', requireAuth, requirePermission('items.edit', 'invent
 
   let catName = target.category;
   if (category_id) {
-    const cat = db.prepare('SELECT name_ar FROM item_categories WHERE id = ?').get(category_id) as any;
+    const cat = (await db.prepare('SELECT name_ar FROM item_categories WHERE id = ?').get(category_id)) as any;
     if (cat) catName = cat.name_ar;
   } else if (category) {
     catName = category;
   }
 
   try {
-    db.prepare(`
+    (await db.prepare(`
       UPDATE items
       SET name_ar = COALESCE(?, name_ar),
           name_en = COALESCE(?, name_en),
@@ -2607,25 +2609,25 @@ apiRouter.put('/items/:id', requireAuth, requirePermission('items.edit', 'invent
       is_active !== undefined ? (is_active ? 1 : 0) : null,
       description || null,
       target.id
-    );
+    ));
 
-    logAudit(req.user!.id, 'UPDATE_ITEM', 'items', target.id, `تعديل الصنف: ${target.code} - ${name_ar || target.name_ar}`);
+    (await logAudit(req.user!.id, 'UPDATE_ITEM', 'items', target.id, `تعديل الصنف: ${target.code} - ${name_ar || target.name_ar}`));
     res.json({ success: true, message: 'تم تحديث بيانات الصنف بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-apiRouter.delete('/items/:id', requireAuth, requirePermission('items.delete', 'inventory.delete_item', 'manage_settings'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM items WHERE id = ?').get(req.params.id) as any;
+apiRouter.delete('/items/:id', requireAuth, requirePermission('items.delete', 'inventory.delete_item', 'manage_settings'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM items WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'الصنف غير موجود.' });
 
   // 1. Check transactions
-  const sCount = db.prepare('SELECT COUNT(*) as cnt FROM sales_invoice_items WHERE item_id = ?').get(target.id) as { cnt: number };
-  const pCount = db.prepare('SELECT COUNT(*) as cnt FROM purchase_invoice_items WHERE item_id = ?').get(target.id) as { cnt: number };
-  const srCount = db.prepare('SELECT COUNT(*) as cnt FROM sales_return_items WHERE item_id = ?').get(target.id) as { cnt: number };
-  const prCount = db.prepare('SELECT COUNT(*) as cnt FROM purchase_return_items WHERE item_id = ?').get(target.id) as { cnt: number };
-  const stCount = db.prepare('SELECT COUNT(*) as cnt FROM stock_transaction_items WHERE item_id = ?').get(target.id) as { cnt: number };
+  const sCount = (await db.prepare('SELECT COUNT(*) as cnt FROM sales_invoice_items WHERE item_id = ?').get(target.id)) as { cnt: number };
+  const pCount = (await db.prepare('SELECT COUNT(*) as cnt FROM purchase_invoice_items WHERE item_id = ?').get(target.id)) as { cnt: number };
+  const srCount = (await db.prepare('SELECT COUNT(*) as cnt FROM sales_return_items WHERE item_id = ?').get(target.id)) as { cnt: number };
+  const prCount = (await db.prepare('SELECT COUNT(*) as cnt FROM purchase_return_items WHERE item_id = ?').get(target.id)) as { cnt: number };
+  const stCount = (await db.prepare('SELECT COUNT(*) as cnt FROM stock_transaction_items WHERE item_id = ?').get(target.id)) as { cnt: number };
 
   const totalTx = sCount.cnt + pCount.cnt + srCount.cnt + prCount.cnt + stCount.cnt;
   if (totalTx > 0) {
@@ -2635,7 +2637,7 @@ apiRouter.delete('/items/:id', requireAuth, requirePermission('items.delete', 'i
   }
 
   // 2. Check stock balance
-  const stockRow = db.prepare('SELECT COALESCE(SUM(quantity), 0) as total_qty FROM warehouse_stock WHERE item_id = ?').get(target.id) as { total_qty: number };
+  const stockRow = (await db.prepare('SELECT COALESCE(SUM(quantity), 0) as total_qty FROM warehouse_stock WHERE item_id = ?').get(target.id)) as { total_qty: number };
   if (stockRow.total_qty > 0) {
     return res.status(400).json({
       error: `لا يمكن حذف الصنف لأن لديه رصيد مخزني حالي (${stockRow.total_qty} قطعة). يجب صرف أو تسوية الرصيد أولاً.`
@@ -2643,26 +2645,26 @@ apiRouter.delete('/items/:id', requireAuth, requirePermission('items.delete', 'i
   }
 
   try {
-    db.transaction(() => {
-      db.prepare('DELETE FROM warehouse_stock WHERE item_id = ?').run(target.id);
-      db.prepare('DELETE FROM items WHERE id = ?').run(target.id);
-    })();
+    (await db.transaction(async () => {
+      (await db.prepare('DELETE FROM warehouse_stock WHERE item_id = ?').run(target.id));
+      (await db.prepare('DELETE FROM items WHERE id = ?').run(target.id));
+    })());
 
-    logAudit(req.user!.id, 'DELETE_ITEM', 'items', target.id, `حذف الصنف: ${target.code} - ${target.name_ar}`);
+    (await logAudit(req.user!.id, 'DELETE_ITEM', 'items', target.id, `حذف الصنف: ${target.code} - ${target.name_ar}`));
     res.json({ success: true, message: `تم حذف الصنف "${target.name_ar}" بنجاح.` });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.get('/items/:id/stock-by-warehouse', requireAuth, (req, res) => {
-  const stock = db.prepare(`
+apiRouter.get('/items/:id/stock-by-warehouse', requireAuth, async (req, res) => {
+  const stock = (await db.prepare(`
     SELECT ws.*, w.name_ar as warehouse_name, b.name_ar as branch_name
     FROM warehouse_stock ws
     JOIN warehouses w ON ws.warehouse_id = w.id
     JOIN branches b ON w.branch_id = b.id
     WHERE ws.item_id = ?
-  `).all(req.params.id);
+  `).all(req.params.id));
 
   res.json({ stock });
 });
@@ -2670,7 +2672,7 @@ apiRouter.get('/items/:id/stock-by-warehouse', requireAuth, (req, res) => {
 // ----------------------------------------------------
 // 8. Sales Invoices (Fixed multi-line aggregation & cash receipt)
 // ----------------------------------------------------
-apiRouter.get('/sales/invoices', requireAuth, requirePermission('sales.view'), (req: AuthenticatedRequest, res) => {
+apiRouter.get('/sales/invoices', requireAuth, requirePermission('sales.view'), async (req: AuthenticatedRequest, res) => {
   const hasViewCost = req.user?.role === 'owner' || req.user?.permissions.includes('view_cost');
 
   let branchFilter = '';
@@ -2689,7 +2691,7 @@ apiRouter.get('/sales/invoices', requireAuth, requirePermission('sales.view'), (
     }
   }
 
-  const invoices = db.prepare(`
+  const invoices = (await db.prepare(`
     SELECT si.*, p.name_ar as customer_name, b.name_ar as branch_name, w.name_ar as warehouse_name
     FROM sales_invoices si
     JOIN parties p ON si.customer_id = p.id
@@ -2697,7 +2699,7 @@ apiRouter.get('/sales/invoices', requireAuth, requirePermission('sales.view'), (
     JOIN warehouses w ON si.warehouse_id = w.id
     ${branchFilter}
     ORDER BY si.invoice_date DESC, si.invoice_number DESC
-  `).all(...params) as any[];
+  `).all(...params)) as any[];
 
   if (!hasViewCost) {
     invoices.forEach(inv => {
@@ -2708,8 +2710,8 @@ apiRouter.get('/sales/invoices', requireAuth, requirePermission('sales.view'), (
   res.json({ invoices });
 });
 
-apiRouter.get('/sales/invoices/:id', requireAuth, requirePermission('sales.view'), (req: AuthenticatedRequest, res) => {
-  const invoice = db.prepare(`
+apiRouter.get('/sales/invoices/:id', requireAuth, requirePermission('sales.view'), async (req: AuthenticatedRequest, res) => {
+  const invoice = (await db.prepare(`
     SELECT si.*, p.name_ar as customer_name, p.tax_id as customer_tax_id, p.address as customer_address,
            b.name_ar as branch_name, w.name_ar as warehouse_name, je.entry_number as journal_number
     FROM sales_invoices si
@@ -2718,7 +2720,7 @@ apiRouter.get('/sales/invoices/:id', requireAuth, requirePermission('sales.view'
     JOIN warehouses w ON si.warehouse_id = w.id
     LEFT JOIN journal_entries je ON si.journal_entry_id = je.id
     WHERE si.id = ?
-  `).get(req.params.id) as any;
+  `).get(req.params.id)) as any;
 
   if (!invoice) return res.status(404).json({ error: 'الفاتورة غير موجودة' });
 
@@ -2731,12 +2733,12 @@ apiRouter.get('/sales/invoices/:id', requireAuth, requirePermission('sales.view'
     delete invoice.cogs_amount;
   }
 
-  const items = db.prepare(`
+  const items = (await db.prepare(`
     SELECT sii.*, i.name_ar as item_name, i.code as item_code, i.barcode, i.eta_item_code
     FROM sales_invoice_items sii
     JOIN items i ON sii.item_id = i.id
     WHERE sii.invoice_id = ?
-  `).all(req.params.id) as any[];
+  `).all(req.params.id)) as any[];
 
   if (!hasViewCost) {
     items.forEach(it => {
@@ -2748,8 +2750,8 @@ apiRouter.get('/sales/invoices/:id', requireAuth, requirePermission('sales.view'
   res.json({ invoice });
 });
 
-apiRouter.post('/sales/invoices', requireAuth, (req: AuthenticatedRequest, res) => {
-  if (checkIdempotency(req, res)) return;
+apiRouter.post('/sales/invoices', requireAuth, async (req: AuthenticatedRequest, res) => {
+  if ((await checkIdempotency(req, res))) return;
 
   const { branchId, warehouseId, customerId, invoiceDate, paymentType, items, notes, cashBoxId, bankAccountId, status } = req.body;
 
@@ -2775,11 +2777,11 @@ apiRouter.post('/sales/invoices', requireAuth, (req: AuthenticatedRequest, res) 
   try {
     const invId = `inv_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
     const effectiveDate = invoiceDate || new Date().toISOString().split('T')[0];
-    const period = getFiscalPeriodForDate(effectiveDate);
-    const invNumber = getNextDocumentNumber(isDraft ? 'INV-DFT' : 'INV', branchId, period.fiscal_year_id);
+    const period = (await getFiscalPeriodForDate(effectiveDate));
+    const invNumber = (await getNextDocumentNumber(isDraft ? 'INV-DFT' : 'INV', branchId, period.fiscal_year_id));
 
     // Validate party
-    const party = db.prepare('SELECT id, name_ar, credit_limit FROM parties WHERE id = ?').get(customerId) as any;
+    const party = (await db.prepare('SELECT id, name_ar, credit_limit FROM parties WHERE id = ?').get(customerId)) as any;
     if (!party) throw new Error('العميل المحدد غير موجود.');
 
     // 1. Validate inputs and calculate totals
@@ -2804,7 +2806,7 @@ apiRouter.post('/sales/invoices', requireAuth, (req: AuthenticatedRequest, res) 
         throw new Error('قيمة الخصم غير صحيحة.');
       }
 
-      const itemRow = db.prepare('SELECT id, name_ar, moving_avg_cost, sale_price, item_type FROM items WHERE id = ?').get(it.itemId) as any;
+      const itemRow = (await db.prepare('SELECT id, name_ar, moving_avg_cost, sale_price, item_type FROM items WHERE id = ?').get(it.itemId)) as any;
       if (!itemRow) throw new Error(`الصنف ${it.itemId} غير موجود`);
 
       const lineNet = qty.times(price).minus(discount);
@@ -2837,8 +2839,8 @@ apiRouter.post('/sales/invoices', requireAuth, (req: AuthenticatedRequest, res) 
 
     if (isDraft) {
       // Save Draft without inventory deduction or GL entry
-      db.transaction(() => {
-        db.prepare(`
+      (await db.transaction(async () => {
+        (await db.prepare(`
           INSERT INTO sales_invoices (
             id, invoice_number, branch_id, warehouse_id, customer_id, invoice_date, due_date,
             payment_type, subtotal, discount_amount, taxable_amount, tax_amount, withholding_tax_amount,
@@ -2849,7 +2851,7 @@ apiRouter.post('/sales/invoices', requireAuth, (req: AuthenticatedRequest, res) 
           paymentType || 'credit', subtotal.toNumber(), totalDiscount.toNumber(), taxableTotal.toNumber(),
           totalVat.toNumber(), totalWht.toNumber(), netTotalAmount.toNumber(), netTotalAmount.toNumber(),
           totalCogs.toNumber(), req.user!.id, notes || null
-        );
+        ));
 
         const insertItemStmt = db.prepare(`
           INSERT INTO sales_invoice_items (
@@ -2858,16 +2860,16 @@ apiRouter.post('/sales/invoices', requireAuth, (req: AuthenticatedRequest, res) 
         `);
 
         for (const it of calculatedItems) {
-          insertItemStmt.run(
+          (await insertItemStmt.run(
             `sii_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
             invId, it.itemId, it.quantity, it.unitPrice, it.costPrice, it.discountAmount, it.taxRate, it.taxAmount, it.totalAmount
-          );
+          ));
         }
-      })();
+      })());
 
-      logAudit(req.user!.id, 'CREATE_DRAFT_SALES_INVOICE', 'sales_invoices', invId, `إنشاء مسودة فاتورة مبيعات ${invNumber}`);
+      (await logAudit(req.user!.id, 'CREATE_DRAFT_SALES_INVOICE', 'sales_invoices', invId, `إنشاء مسودة فاتورة مبيعات ${invNumber}`));
       const responseData = { success: true, invoiceId: invId, invoiceNumber: invNumber, status: 'draft', message: 'تم حفظ مسودة فاتورة المبيعات بنجاح.' };
-      saveIdempotency(req.headers['idempotency-key'] as string, req.user!.id, '/sales/invoices', 200, responseData);
+      (await saveIdempotency(req.headers['idempotency-key'] as string, req.user!.id, '/sales/invoices', 200, responseData, req.body));
       return res.json(responseData);
     }
 
@@ -2877,19 +2879,19 @@ apiRouter.post('/sales/invoices', requireAuth, (req: AuthenticatedRequest, res) 
 
     if (isCash) {
       if (cashBoxId) {
-        const cb = db.prepare('SELECT account_id FROM cash_boxes WHERE id = ?').get(cashBoxId) as any;
+        const cb = (await db.prepare('SELECT account_id FROM cash_boxes WHERE id = ?').get(cashBoxId)) as any;
         if (cb) chosenCashAccountId = cb.account_id;
       } else if (bankAccountId) {
-        const ba = db.prepare('SELECT account_id FROM bank_accounts WHERE id = ?').get(bankAccountId) as any;
+        const ba = (await db.prepare('SELECT account_id FROM bank_accounts WHERE id = ?').get(bankAccountId)) as any;
         if (ba) chosenCashAccountId = ba.account_id;
         chosenCashboxOrBankId = bankAccountId;
       }
     }
 
     // ATOMIC TRANSACTION: Check aggregate stock, deduct, insert invoice & GL, and post cash receipt if cash
-    db.transaction(() => {
+    (await db.transaction(async () => {
       // 1. Multi-line Stock Check and Deduction
-      validateAndDeductStock(warehouseId, calculatedItems);
+      (await validateAndDeductStock(warehouseId, calculatedItems));
 
       const isAlex = branchId === 'br_alex';
       const inventoryAccount = isAlex ? 'acc_1142' : 'acc_1141';
@@ -2934,7 +2936,7 @@ apiRouter.post('/sales/invoices', requireAuth, (req: AuthenticatedRequest, res) 
         );
       }
 
-      const journalResult = postJournalEntry({
+      const journalResult = (await postJournalEntry({
         docType: 'SALES_INV',
         docId: invId,
         docNumber: invNumber,
@@ -2945,13 +2947,13 @@ apiRouter.post('/sales/invoices', requireAuth, (req: AuthenticatedRequest, res) 
         description: `فاتورة مبيعات رقم ${invNumber} للعميل ${party.name_ar}`,
         createdBy: req.user!.id,
         lines: glLines
-      });
+      }));
 
       // 3. Insert Sales Invoice
       const paidAmt = isCash ? netTotalAmount.toNumber() : 0;
       const remAmt = isCash ? 0 : netTotalAmount.toNumber();
 
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO sales_invoices (
           id, invoice_number, branch_id, warehouse_id, customer_id, invoice_date, due_date,
           payment_type, subtotal, discount_amount, taxable_amount, tax_amount, withholding_tax_amount,
@@ -2962,7 +2964,7 @@ apiRouter.post('/sales/invoices', requireAuth, (req: AuthenticatedRequest, res) 
         paymentType || 'credit', subtotal.toNumber(), totalDiscount.toNumber(), taxableTotal.toNumber(),
         totalVat.toNumber(), totalWht.toNumber(), netTotalAmount.toNumber(), paidAmt, remAmt,
         totalCogs.toNumber(), isCash ? 'paid' : 'posted', journalResult.entryId, req.user!.id, notes || null
-      );
+      ));
 
       // 4. Insert Items
       const insertItemStmt = db.prepare(`
@@ -2972,18 +2974,18 @@ apiRouter.post('/sales/invoices', requireAuth, (req: AuthenticatedRequest, res) 
       `);
 
       for (const it of calculatedItems) {
-        insertItemStmt.run(
+        (await insertItemStmt.run(
           `sii_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
           invId, it.itemId, it.quantity, it.unitPrice, it.costPrice, it.discountAmount, it.taxRate, it.taxAmount, it.totalAmount
-        );
+        ));
       }
 
       // 5. Automatic Receipt Voucher & Allocation for Cash Invoices
       if (isCash) {
-        const rcptNumber = getNextDocumentNumber('RV', branchId, period.fiscal_year_id);
+        const rcptNumber = (await getNextDocumentNumber('RV', branchId, period.fiscal_year_id));
         const pvId = `pv_cash_${invId}`;
         
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO payment_vouchers (
             id, voucher_number, voucher_type, branch_id, payment_method, cash_box_id, bank_account_id,
             party_id, voucher_date, amount, allocated_amount, unallocated_amount,
@@ -2994,19 +2996,19 @@ apiRouter.post('/sales/invoices', requireAuth, (req: AuthenticatedRequest, res) 
           cashBoxId || null, bankAccountId || null, customerId, effectiveDate,
           netTotalAmount.toNumber(), netTotalAmount.toNumber(),
           `تحصيل فوري عن فاتورة المبيعات ${invNumber}`, journalResult.entryId, req.user!.id
-        );
+        ));
 
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO voucher_allocations (id, voucher_id, invoice_type, invoice_id, allocated_amount)
           VALUES (?, ?, 'sales_invoice', ?, ?)
-        `).run(`va_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, pvId, invId, netTotalAmount.toNumber());
+        `).run(`va_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, pvId, invId, netTotalAmount.toNumber()));
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'CREATE_SALES_INVOICE', 'sales_invoices', invId, `إصدار فاتورة مبيعات ${invNumber}`);
+    (await logAudit(req.user!.id, 'CREATE_SALES_INVOICE', 'sales_invoices', invId, `إصدار فاتورة مبيعات ${invNumber}`));
 
     const responseData = { success: true, invoiceId: invId, invoiceNumber: invNumber, status: isCash ? 'paid' : 'posted' };
-    saveIdempotency(req.headers['idempotency-key'] as string, req.user!.id, '/sales/invoices', 200, responseData);
+    (await saveIdempotency(req.headers['idempotency-key'] as string, req.user!.id, '/sales/invoices', 200, responseData, req.body));
     res.json(responseData);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -3014,8 +3016,8 @@ apiRouter.post('/sales/invoices', requireAuth, (req: AuthenticatedRequest, res) 
 });
 
 // Edit Draft Sales Invoice
-apiRouter.put('/sales/invoices/:id', requireAuth, requirePermission('sales.edit_draft'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM sales_invoices WHERE id = ?').get(req.params.id) as any;
+apiRouter.put('/sales/invoices/:id', requireAuth, requirePermission('sales.edit_draft'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM sales_invoices WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'الفاتورة غير موجودة.' });
 
   if (target.status !== 'draft') {
@@ -3050,7 +3052,7 @@ apiRouter.put('/sales/invoices/:id', requireAuth, requirePermission('sales.edit_
       if (!qty.isFinite() || qty.isNegative() || qty.isZero()) throw new Error('الكمية يجب أن تكون رقماً موجباً.');
       if (!price.isFinite() || price.isNegative()) throw new Error('سعر الوحدة لا يمكن أن يكون سالباً.');
 
-      const itemRow = db.prepare('SELECT id, moving_avg_cost, item_type FROM items WHERE id = ?').get(it.itemId) as any;
+      const itemRow = (await db.prepare('SELECT id, moving_avg_cost, item_type FROM items WHERE id = ?').get(it.itemId)) as any;
       if (!itemRow) throw new Error(`الصنف ${it.itemId} غير موجود.`);
 
       const lineNet = qty.times(price).minus(discount);
@@ -3081,8 +3083,8 @@ apiRouter.put('/sales/invoices/:id', requireAuth, requirePermission('sales.edit_
     const totalWht = taxableTotal.times(0.01);
     const netTotalAmount = taxableTotal.plus(totalVat).minus(totalWht);
 
-    db.transaction(() => {
-      db.prepare(`
+    (await db.transaction(async () => {
+      (await db.prepare(`
         UPDATE sales_invoices
         SET branch_id = COALESCE(?, branch_id),
             warehouse_id = COALESCE(?, warehouse_id),
@@ -3104,9 +3106,9 @@ apiRouter.put('/sales/invoices/:id', requireAuth, requirePermission('sales.edit_
         subtotal.toNumber(), totalDiscount.toNumber(), taxableTotal.toNumber(), totalVat.toNumber(),
         totalWht.toNumber(), netTotalAmount.toNumber(), netTotalAmount.toNumber(), totalCogs.toNumber(),
         notes || null, target.id
-      );
+      ));
 
-      db.prepare('DELETE FROM sales_invoice_items WHERE invoice_id = ?').run(target.id);
+      (await db.prepare('DELETE FROM sales_invoice_items WHERE invoice_id = ?').run(target.id));
       const insertItemStmt = db.prepare(`
         INSERT INTO sales_invoice_items (
           id, invoice_id, item_id, unit_name, unit_factor, quantity, unit_price, cost_price, discount_amount, tax_rate, tax_amount, total_amount
@@ -3114,14 +3116,14 @@ apiRouter.put('/sales/invoices/:id', requireAuth, requirePermission('sales.edit_
       `);
 
       for (const it of calculatedItems) {
-        insertItemStmt.run(
+        (await insertItemStmt.run(
           `sii_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
           target.id, it.itemId, it.quantity, it.unitPrice, it.costPrice, it.discountAmount, it.taxRate, it.taxAmount, it.totalAmount
-        );
+        ));
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'UPDATE_DRAFT_SALES_INVOICE', 'sales_invoices', target.id, `تعديل مسودة فاتورة المبيعات ${target.invoice_number}`);
+    (await logAudit(req.user!.id, 'UPDATE_DRAFT_SALES_INVOICE', 'sales_invoices', target.id, `تعديل مسودة فاتورة المبيعات ${target.invoice_number}`));
     res.json({ success: true, message: 'تم تحديث مسودة فاتورة المبيعات بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -3129,8 +3131,8 @@ apiRouter.put('/sales/invoices/:id', requireAuth, requirePermission('sales.edit_
 });
 
 // Delete Draft Sales Invoice
-apiRouter.delete('/sales/invoices/:id', requireAuth, requirePermission('sales.delete_draft'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM sales_invoices WHERE id = ?').get(req.params.id) as any;
+apiRouter.delete('/sales/invoices/:id', requireAuth, requirePermission('sales.delete_draft'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM sales_invoices WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'الفاتورة غير موجودة.' });
 
   if (target.status !== 'draft') {
@@ -3142,12 +3144,12 @@ apiRouter.delete('/sales/invoices/:id', requireAuth, requirePermission('sales.de
   }
 
   try {
-    db.transaction(() => {
-      db.prepare('DELETE FROM sales_invoice_items WHERE invoice_id = ?').run(target.id);
-      db.prepare('DELETE FROM sales_invoices WHERE id = ?').run(target.id);
-    })();
+    (await db.transaction(async () => {
+      (await db.prepare('DELETE FROM sales_invoice_items WHERE invoice_id = ?').run(target.id));
+      (await db.prepare('DELETE FROM sales_invoices WHERE id = ?').run(target.id));
+    })());
 
-    logAudit(req.user!.id, 'DELETE_DRAFT_SALES_INVOICE', 'sales_invoices', target.id, `حذف مسودة فاتورة المبيعات ${target.invoice_number}`);
+    (await logAudit(req.user!.id, 'DELETE_DRAFT_SALES_INVOICE', 'sales_invoices', target.id, `حذف مسودة فاتورة المبيعات ${target.invoice_number}`));
     res.json({ success: true, message: `تم حذف مسودة الفاتورة "${target.invoice_number}" بنجاح.` });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -3155,8 +3157,8 @@ apiRouter.delete('/sales/invoices/:id', requireAuth, requirePermission('sales.de
 });
 
 // Post Draft Sales Invoice
-apiRouter.post('/sales/invoices/:id/post', requireAuth, requirePermission('sales.post'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM sales_invoices WHERE id = ?').get(req.params.id) as any;
+apiRouter.post('/sales/invoices/:id/post', requireAuth, requirePermission('sales.post'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM sales_invoices WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'الفاتورة غير موجودة.' });
 
   if (target.status !== 'draft') {
@@ -3167,15 +3169,15 @@ apiRouter.post('/sales/invoices/:id/post', requireAuth, requirePermission('sales
     return res.status(403).json({ error: 'غير مصرح لك بترحيل فواتير في هذا الفرع.' });
   }
 
-  const items = db.prepare('SELECT * FROM sales_invoice_items WHERE invoice_id = ?').all(target.id) as any[];
+  const items = (await db.prepare('SELECT * FROM sales_invoice_items WHERE invoice_id = ?').all(target.id)) as any[];
   if (!items || items.length === 0) {
     return res.status(400).json({ error: 'لا يمكن ترحيل فاتورة بدون بنود.' });
   }
 
   try {
-    const period = getFiscalPeriodForDate(target.invoice_date);
-    const postedInvNumber = getNextDocumentNumber('INV', target.branch_id, period.fiscal_year_id);
-    const party = db.prepare('SELECT id, name_ar FROM parties WHERE id = ?').get(target.customer_id) as any;
+    const period = (await getFiscalPeriodForDate(target.invoice_date));
+    const postedInvNumber = (await getNextDocumentNumber('INV', target.branch_id, period.fiscal_year_id));
+    const party = (await db.prepare('SELECT id, name_ar FROM parties WHERE id = ?').get(target.customer_id)) as any;
 
     const formattedItems = items.map(it => ({
       itemId: it.item_id,
@@ -3186,8 +3188,8 @@ apiRouter.post('/sales/invoices/:id/post', requireAuth, requirePermission('sales
       totalAmount: it.total_amount
     }));
 
-    db.transaction(() => {
-      validateAndDeductStock(target.warehouse_id, formattedItems);
+    (await db.transaction(async () => {
+      (await validateAndDeductStock(target.warehouse_id, formattedItems));
 
       const isAlex = target.branch_id === 'br_alex';
       const inventoryAccount = isAlex ? 'acc_1142' : 'acc_1141';
@@ -3228,7 +3230,7 @@ apiRouter.post('/sales/invoices/:id/post', requireAuth, requirePermission('sales
         );
       }
 
-      const journalResult = postJournalEntry({
+      const journalResult = (await postJournalEntry({
         docType: 'SALES_INV',
         docId: target.id,
         docNumber: postedInvNumber,
@@ -3239,9 +3241,9 @@ apiRouter.post('/sales/invoices/:id/post', requireAuth, requirePermission('sales
         description: `فاتورة مبيعات رقم ${postedInvNumber} للعميل ${party?.name_ar || ''}`,
         createdBy: req.user!.id,
         lines: glLines
-      });
+      }));
 
-      db.prepare(`
+      (await db.prepare(`
         UPDATE sales_invoices
         SET invoice_number = ?,
             status = ?,
@@ -3256,10 +3258,10 @@ apiRouter.post('/sales/invoices/:id/post', requireAuth, requirePermission('sales
         isCash ? 0 : target.total_amount,
         journalResult.entryId,
         target.id
-      );
-    })();
+      ));
+    })());
 
-    logAudit(req.user!.id, 'POST_SALES_INVOICE', 'sales_invoices', target.id, `اعتماد وترحيل فاتورة المبيعات برقم ${postedInvNumber}`);
+    (await logAudit(req.user!.id, 'POST_SALES_INVOICE', 'sales_invoices', target.id, `اعتماد وترحيل فاتورة المبيعات برقم ${postedInvNumber}`));
     res.json({ success: true, invoiceId: target.id, invoiceNumber: postedInvNumber, message: 'تم ترحيل واعتماد فاتورة المبيعات بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -3267,8 +3269,8 @@ apiRouter.post('/sales/invoices/:id/post', requireAuth, requirePermission('sales
 });
 
 // Reversal / Cancellation of Posted Sales Invoice
-apiRouter.post('/sales/invoices/:id/reverse', requireAuth, requirePermission('sales.reverse'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM sales_invoices WHERE id = ?').get(req.params.id) as any;
+apiRouter.post('/sales/invoices/:id/reverse', requireAuth, requirePermission('sales.reverse'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM sales_invoices WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'فاتورة المبيعات غير موجودة.' });
 
   if (target.status !== 'posted' && target.status !== 'paid') {
@@ -3285,18 +3287,18 @@ apiRouter.post('/sales/invoices/:id/reverse', requireAuth, requirePermission('sa
   }
 
   // 1. Check if invoice has active sales returns
-  const returnCheck = db.prepare("SELECT COUNT(*) as cnt FROM sales_returns WHERE original_invoice_id = ? AND status != 'reversed'").get(target.id) as { cnt: number };
+  const returnCheck = (await db.prepare("SELECT COUNT(*) as cnt FROM sales_returns WHERE original_invoice_id = ? AND status != 'reversed'").get(target.id)) as { cnt: number };
   if (returnCheck && returnCheck.cnt > 0) {
     return res.status(400).json({ error: `لا يمكن إلغاء الفاتورة لوجود (${returnCheck.cnt}) مردود مبيعات مسجل عليها مسبقاً. يرجى إلغاء المردود أولاً أو معالجة الفارق بمردود إضافي.` });
   }
 
   // 2. Check if credit invoice and has allocations from receipt vouchers
-  const allocCheck = db.prepare(`
+  const allocCheck = (await db.prepare(`
     SELECT va.allocated_amount, pv.voucher_number
     FROM voucher_allocations va
     JOIN payment_vouchers pv ON va.voucher_id = pv.id
     WHERE va.invoice_id = ? AND va.invoice_type = 'sales_invoice' AND pv.status != 'reversed'
-  `).all(target.id) as any[];
+  `).all(target.id)) as any[];
 
   if (target.payment_type !== 'cash' && allocCheck.length > 0) {
     return res.status(400).json({
@@ -3305,59 +3307,59 @@ apiRouter.post('/sales/invoices/:id/reverse', requireAuth, requirePermission('sa
   }
 
   try {
-    const items = db.prepare('SELECT * FROM sales_invoice_items WHERE invoice_id = ?').all(target.id) as any[];
+    const items = (await db.prepare('SELECT * FROM sales_invoice_items WHERE invoice_id = ?').all(target.id)) as any[];
 
-    db.transaction(() => {
+    (await db.transaction(async () => {
       // 1. Reverse the associated journal entry
       let reversalJeNumber = '';
       if (target.journal_entry_id) {
-        const revJe = reverseJournalEntry(target.journal_entry_id, `إلغاء وعكس فاتورة المبيعات ${target.invoice_number}: ${reason}`, req.user!.id, db, true);
+        const revJe = (await reverseJournalEntry(target.journal_entry_id, `إلغاء وعكس فاتورة المبيعات ${target.invoice_number}: ${reason}`, req.user!.id, db, true));
         reversalJeNumber = revJe.reverseNumber;
       }
 
       // 2. Restore warehouse inventory for stock items
       for (const it of items) {
-        const itemInfo = db.prepare('SELECT item_type FROM items WHERE id = ?').get(it.item_id) as any;
+        const itemInfo = (await db.prepare('SELECT item_type FROM items WHERE id = ?').get(it.item_id)) as any;
         if (itemInfo && itemInfo.item_type === 'stock') {
-          db.prepare(`
+          (await db.prepare(`
             INSERT INTO warehouse_stock (warehouse_id, item_id, quantity)
             VALUES (?, ?, ?)
-            ON CONFLICT(warehouse_id, item_id) DO UPDATE SET quantity = quantity + ?
-          `).run(target.warehouse_id, it.item_id, it.quantity, it.quantity);
+            ON DUPLICATE KEY UPDATE quantity = quantity + ?
+          `).run(target.warehouse_id, it.item_id, it.quantity, it.quantity));
         }
       }
 
       // 3. If instant cash invoice, reverse the associated payment voucher and refund cashbox
       if (target.payment_type === 'cash') {
-        const linkedVoucher = db.prepare(`
+        const linkedVoucher = (await db.prepare(`
           SELECT pv.* FROM payment_vouchers pv
           JOIN voucher_allocations va ON pv.id = va.voucher_id
           WHERE va.invoice_id = ? AND va.invoice_type = 'sales_invoice' AND pv.status != 'reversed'
-        `).get(target.id) as any;
+        `).get(target.id)) as any;
 
         if (linkedVoucher) {
           if (linkedVoucher.journal_entry_id) {
-            reverseJournalEntry(linkedVoucher.journal_entry_id, `عكس سند قبض النقدية المرتبط بالفاتورة الملغاة ${target.invoice_number}`, req.user!.id);
+            (await reverseJournalEntry(linkedVoucher.journal_entry_id, `عكس سند قبض النقدية المرتبط بالفاتورة الملغاة ${target.invoice_number}`, req.user!.id));
           }
           if (linkedVoucher.cash_box_id) {
-            db.prepare('UPDATE cash_boxes SET current_balance = current_balance - ? WHERE id = ?').run(linkedVoucher.amount, linkedVoucher.cash_box_id);
+            (await db.prepare('UPDATE cash_boxes SET current_balance = current_balance - ? WHERE id = ?').run(linkedVoucher.amount, linkedVoucher.cash_box_id));
           }
-          db.prepare("UPDATE payment_vouchers SET status = 'reversed', notes = COALESCE(notes || ' | ', '') || 'تم الإلغاء لعكس الفاتورة ' || ? WHERE id = ?").run(target.invoice_number, linkedVoucher.id);
+          (await db.prepare("UPDATE payment_vouchers SET status = 'reversed', notes = CONCAT(COALESCE(CONCAT(notes, ' | '), ''), 'تم الإلغاء لعكس الفاتورة ', ?) WHERE id = ?").run(target.invoice_number, linkedVoucher.id));
         }
       }
 
       // 4. Update sales invoice status to 'reversed'
       const noteAppend = ` | تم الإلغاء والعكس بالقيد (${reversalJeNumber || 'N/A'}) بسبب: ${reason}`;
-      db.prepare(`
+      (await db.prepare(`
         UPDATE sales_invoices
         SET status = 'reversed',
             remaining_amount = 0,
-            notes = COALESCE(notes || '', '') || ?
+            notes = CONCAT(COALESCE(notes, ''), ?)
         WHERE id = ?
-      `).run(noteAppend, target.id);
-    })();
+      `).run(noteAppend, target.id));
+    })());
 
-    logAudit(req.user!.id, 'REVERSE_SALES_INVOICE', 'sales_invoices', target.id, `إلغاء وعكس فاتورة المبيعات ${target.invoice_number} - السبب: ${reason}`);
+    (await logAudit(req.user!.id, 'REVERSE_SALES_INVOICE', 'sales_invoices', target.id, `إلغاء وعكس فاتورة المبيعات ${target.invoice_number} - السبب: ${reason}`));
     res.json({
       success: true,
       message: `تم إلغاء وعكس فاتورة المبيعات "${target.invoice_number}" بنجاح وإعادة البضاعة للمخزن وعكس الأثر المالي في الأستاذ العام.`
@@ -3370,7 +3372,7 @@ apiRouter.post('/sales/invoices/:id/reverse', requireAuth, requirePermission('sa
 // ----------------------------------------------------
 // 9. Purchase Invoices (Full Implementation)
 // ----------------------------------------------------
-apiRouter.get('/purchases/invoices', requireAuth, requirePermission('purchases.view'), (req: AuthenticatedRequest, res) => {
+apiRouter.get('/purchases/invoices', requireAuth, requirePermission('purchases.view'), async (req: AuthenticatedRequest, res) => {
   let branchFilter = '';
   const params: any[] = [];
   if (req.user?.role !== 'owner' && req.user?.allowed_branch_ids !== '*') {
@@ -3387,7 +3389,7 @@ apiRouter.get('/purchases/invoices', requireAuth, requirePermission('purchases.v
     }
   }
 
-  const invoices = db.prepare(`
+  const invoices = (await db.prepare(`
     SELECT pi.*, p.name_ar as supplier_name, b.name_ar as branch_name, w.name_ar as warehouse_name
     FROM purchase_invoices pi
     JOIN parties p ON pi.supplier_id = p.id
@@ -3395,12 +3397,12 @@ apiRouter.get('/purchases/invoices', requireAuth, requirePermission('purchases.v
     JOIN warehouses w ON pi.warehouse_id = w.id
     ${branchFilter}
     ORDER BY pi.invoice_date DESC, pi.invoice_number DESC
-  `).all(...params);
+  `).all(...params));
   res.json({ invoices });
 });
 
-apiRouter.get('/purchases/invoices/:id', requireAuth, requirePermission('purchases.view'), (req: AuthenticatedRequest, res) => {
-  const invoice = db.prepare(`
+apiRouter.get('/purchases/invoices/:id', requireAuth, requirePermission('purchases.view'), async (req: AuthenticatedRequest, res) => {
+  const invoice = (await db.prepare(`
     SELECT pi.*, p.name_ar as supplier_name, p.tax_id as supplier_tax_id, p.address as supplier_address,
            b.name_ar as branch_name, w.name_ar as warehouse_name, je.entry_number as journal_number
     FROM purchase_invoices pi
@@ -3409,7 +3411,7 @@ apiRouter.get('/purchases/invoices/:id', requireAuth, requirePermission('purchas
     JOIN warehouses w ON pi.warehouse_id = w.id
     LEFT JOIN journal_entries je ON pi.journal_entry_id = je.id
     WHERE pi.id = ?
-  `).get(req.params.id) as any;
+  `).get(req.params.id)) as any;
 
   if (!invoice) return res.status(404).json({ error: 'فاتورة المشتريات غير موجودة' });
 
@@ -3417,19 +3419,19 @@ apiRouter.get('/purchases/invoices/:id', requireAuth, requirePermission('purchas
     return res.status(403).json({ error: 'الفرع التابع له الفاتورة خارج نطاق الفروع المصرح لك بها.' });
   }
 
-  const items = db.prepare(`
+  const items = (await db.prepare(`
     SELECT pii.*, i.name_ar as item_name, i.code as item_code, i.barcode
     FROM purchase_invoice_items pii
     JOIN items i ON pii.item_id = i.id
     WHERE pii.invoice_id = ?
-  `).all(req.params.id);
+  `).all(req.params.id));
 
   invoice.items = items;
   res.json({ invoice });
 });
 
-apiRouter.post('/purchases/invoices', requireAuth, (req: AuthenticatedRequest, res) => {
-  if (checkIdempotency(req, res)) return;
+apiRouter.post('/purchases/invoices', requireAuth, async (req: AuthenticatedRequest, res) => {
+  if ((await checkIdempotency(req, res))) return;
 
   const { branchId, warehouseId, supplierId, supplierInvoiceNumber, invoiceDate, paymentType, items, notes, cashBoxId, bankAccountId, status } = req.body;
 
@@ -3458,7 +3460,7 @@ apiRouter.post('/purchases/invoices', requireAuth, (req: AuthenticatedRequest, r
 
   // Prevent duplicate supplier invoice number
   if (supplierInvoiceNumber) {
-    const dup = db.prepare('SELECT id, invoice_number FROM purchase_invoices WHERE supplier_id = ? AND supplier_invoice_number = ?').get(supplierId, supplierInvoiceNumber) as any;
+    const dup = (await db.prepare('SELECT id, invoice_number FROM purchase_invoices WHERE supplier_id = ? AND supplier_invoice_number = ?').get(supplierId, supplierInvoiceNumber)) as any;
     if (dup) {
       return res.status(400).json({ error: `رقم فاتورة المورد "${supplierInvoiceNumber}" مسجل مسبقاً في النظام برقم (${dup.invoice_number}). يمنع تكرار فاتورة المورد لنفس المورد.` });
     }
@@ -3467,10 +3469,10 @@ apiRouter.post('/purchases/invoices', requireAuth, (req: AuthenticatedRequest, r
   try {
     const pId = `pur_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
     const effectiveDate = invoiceDate || new Date().toISOString().split('T')[0];
-    const period = getFiscalPeriodForDate(effectiveDate);
-    const pNumber = getNextDocumentNumber(isDraft ? 'PINV-DFT' : 'PINV', branchId, period.fiscal_year_id);
+    const period = (await getFiscalPeriodForDate(effectiveDate));
+    const pNumber = (await getNextDocumentNumber(isDraft ? 'PINV-DFT' : 'PINV', branchId, period.fiscal_year_id));
 
-    const supplier = db.prepare('SELECT id, name_ar FROM parties WHERE id = ?').get(supplierId) as any;
+    const supplier = (await db.prepare('SELECT id, name_ar FROM parties WHERE id = ?').get(supplierId)) as any;
     if (!supplier) throw new Error('المورد المحدد غير موجود.');
 
     let subtotal = new Decimal(0);
@@ -3510,8 +3512,8 @@ apiRouter.post('/purchases/invoices', requireAuth, (req: AuthenticatedRequest, r
     const netTotalAmount = taxableTotal.plus(totalVat).minus(totalWht);
 
     if (isDraft) {
-      db.transaction(() => {
-        db.prepare(`
+      (await db.transaction(async () => {
+        (await db.prepare(`
           INSERT INTO purchase_invoices (
             id, invoice_number, supplier_invoice_number, branch_id, warehouse_id, supplier_id,
             invoice_date, due_date, payment_type, subtotal, discount_amount, taxable_amount,
@@ -3523,7 +3525,7 @@ apiRouter.post('/purchases/invoices', requireAuth, (req: AuthenticatedRequest, r
           effectiveDate, effectiveDate, paymentType || 'credit', subtotal.toNumber(), totalDiscount.toNumber(),
           taxableTotal.toNumber(), totalVat.toNumber(), totalWht.toNumber(), netTotalAmount.toNumber(),
           netTotalAmount.toNumber(), req.user!.id, notes || null
-        );
+        ));
 
         const insertLineStmt = db.prepare(`
           INSERT INTO purchase_invoice_items (
@@ -3532,16 +3534,16 @@ apiRouter.post('/purchases/invoices', requireAuth, (req: AuthenticatedRequest, r
         `);
 
         for (const it of calculatedItems) {
-          insertLineStmt.run(
+          (await insertLineStmt.run(
             `pii_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
             pId, it.itemId, it.quantity, it.unitPrice, it.discountAmount, it.taxRate, it.taxAmount, it.totalAmount
-          );
+          ));
         }
-      })();
+      })());
 
-      logAudit(req.user!.id, 'CREATE_DRAFT_PURCHASE_INVOICE', 'purchase_invoices', pId, `حفظ مسودة فاتورة مشتريات ${pNumber}`);
+      (await logAudit(req.user!.id, 'CREATE_DRAFT_PURCHASE_INVOICE', 'purchase_invoices', pId, `حفظ مسودة فاتورة مشتريات ${pNumber}`));
       const responseData = { success: true, invoiceId: pId, invoiceNumber: pNumber, status: 'draft', message: 'تم حفظ مسودة فاتورة المشتريات بنجاح.' };
-      saveIdempotency(req.headers['idempotency-key'] as string, req.user!.id, '/purchases/invoices', 200, responseData);
+      (await saveIdempotency(req.headers['idempotency-key'] as string, req.user!.id, '/purchases/invoices', 200, responseData, req.body));
       return res.json(responseData);
     }
 
@@ -3549,20 +3551,20 @@ apiRouter.post('/purchases/invoices', requireAuth, (req: AuthenticatedRequest, r
     let chosenCashAccountId = 'acc_1111';
     if (isCash) {
       if (cashBoxId) {
-        const cb = db.prepare('SELECT account_id FROM cash_boxes WHERE id = ?').get(cashBoxId) as any;
+        const cb = (await db.prepare('SELECT account_id FROM cash_boxes WHERE id = ?').get(cashBoxId)) as any;
         if (cb) chosenCashAccountId = cb.account_id;
       } else if (bankAccountId) {
-        const ba = db.prepare('SELECT account_id FROM bank_accounts WHERE id = ?').get(bankAccountId) as any;
+        const ba = (await db.prepare('SELECT account_id FROM bank_accounts WHERE id = ?').get(bankAccountId)) as any;
         if (ba) chosenCashAccountId = ba.account_id;
       }
     }
 
-    db.transaction(() => {
+    (await db.transaction(async () => {
       // 1. Post GL Journal Entry
       const isAlex = branchId === 'br_alex';
       const inventoryAccount = isAlex ? 'acc_1142' : 'acc_1141';
 
-      const journalResult = postJournalEntry({
+      const journalResult = (await postJournalEntry({
         docType: 'PUR_INV',
         docId: pId,
         docNumber: pNumber,
@@ -3582,13 +3584,13 @@ apiRouter.post('/purchases/invoices', requireAuth, (req: AuthenticatedRequest, r
           // Credit Withholding Tax Payable (1%)
           { accountId: 'acc_2132', debit: 0, credit: totalWht.toNumber(), description: `أمانات ضريبة الخصم والتحصيل 1% فاتورة ${pNumber}` }
         ]
-      });
+      }));
 
       // 2. Insert Purchase Invoice Record
       const paidAmt = isCash ? netTotalAmount.toNumber() : 0;
       const remAmt = isCash ? 0 : netTotalAmount.toNumber();
 
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO purchase_invoices (
           id, invoice_number, supplier_invoice_number, branch_id, warehouse_id, supplier_id,
           invoice_date, due_date, payment_type, subtotal, discount_amount, taxable_amount,
@@ -3600,7 +3602,7 @@ apiRouter.post('/purchases/invoices', requireAuth, (req: AuthenticatedRequest, r
         effectiveDate, effectiveDate, paymentType || 'credit', subtotal.toNumber(), totalDiscount.toNumber(),
         taxableTotal.toNumber(), totalVat.toNumber(), totalWht.toNumber(), netTotalAmount.toNumber(),
         paidAmt, remAmt, journalResult.entryId, req.user!.id, notes || null
-      );
+      ));
 
       // 3. Update Inventory & Weighted Moving Average Cost
       const insertLineStmt = db.prepare(`
@@ -3610,14 +3612,14 @@ apiRouter.post('/purchases/invoices', requireAuth, (req: AuthenticatedRequest, r
       `);
 
       for (const it of calculatedItems) {
-        insertLineStmt.run(
+        (await insertLineStmt.run(
           `pii_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           pId, it.itemId, it.quantity, it.unitPrice, it.discountAmount, it.taxRate, it.taxAmount, it.totalAmount
-        );
+        ));
 
         // Recalculate moving average cost:
-        const currentItem = db.prepare('SELECT moving_avg_cost FROM items WHERE id = ?').get(it.itemId) as any;
-        const currentStockRow = db.prepare('SELECT SUM(quantity) as total_qty FROM warehouse_stock WHERE item_id = ?').get(it.itemId) as any;
+        const currentItem = (await db.prepare('SELECT moving_avg_cost FROM items WHERE id = ?').get(it.itemId)) as any;
+        const currentStockRow = (await db.prepare('SELECT SUM(quantity) as total_qty FROM warehouse_stock WHERE item_id = ?').get(it.itemId)) as any;
         const curQty = currentStockRow?.total_qty || 0;
         const curCost = currentItem?.moving_avg_cost || it.unitPrice;
 
@@ -3626,21 +3628,21 @@ apiRouter.post('/purchases/invoices', requireAuth, (req: AuthenticatedRequest, r
           ? Math.round((((curQty * curCost) + (it.quantity * it.unitPrice)) / newTotalQty) * 100) / 100
           : it.unitPrice;
 
-        db.prepare('UPDATE items SET moving_avg_cost = ? WHERE id = ?').run(newAvgCost, it.itemId);
+        (await db.prepare('UPDATE items SET moving_avg_cost = ? WHERE id = ?').run(newAvgCost, it.itemId));
 
         // Safe increment of warehouse stock (upsert)
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO warehouse_stock (warehouse_id, item_id, quantity)
           VALUES (?, ?, ?)
-          ON CONFLICT(warehouse_id, item_id) DO UPDATE SET quantity = quantity + ?
-        `).run(warehouseId, it.itemId, it.quantity, it.quantity);
+          ON DUPLICATE KEY UPDATE quantity = quantity + ?
+        `).run(warehouseId, it.itemId, it.quantity, it.quantity));
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'CREATE_PURCHASE_INVOICE', 'purchase_invoices', pId, `تسجيل فاتورة مشتريات ${pNumber}`);
+    (await logAudit(req.user!.id, 'CREATE_PURCHASE_INVOICE', 'purchase_invoices', pId, `تسجيل فاتورة مشتريات ${pNumber}`));
 
     const responseData = { success: true, invoiceId: pId, invoiceNumber: pNumber, status: 'posted' };
-    saveIdempotency(req.headers['idempotency-key'] as string, req.user!.id, '/purchases/invoices', 200, responseData);
+    (await saveIdempotency(req.headers['idempotency-key'] as string, req.user!.id, '/purchases/invoices', 200, responseData, req.body));
     res.json(responseData);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -3648,8 +3650,8 @@ apiRouter.post('/purchases/invoices', requireAuth, (req: AuthenticatedRequest, r
 });
 
 // Edit Draft Purchase Invoice
-apiRouter.put('/purchases/invoices/:id', requireAuth, requirePermission('purchases.edit_draft'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM purchase_invoices WHERE id = ?').get(req.params.id) as any;
+apiRouter.put('/purchases/invoices/:id', requireAuth, requirePermission('purchases.edit_draft'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM purchase_invoices WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'فاتورة المشتريات غير موجودة.' });
 
   if (target.status !== 'draft') {
@@ -3706,8 +3708,8 @@ apiRouter.put('/purchases/invoices/:id', requireAuth, requirePermission('purchas
     const totalWht = taxableTotal.times(0.01);
     const netTotalAmount = taxableTotal.plus(totalVat).minus(totalWht);
 
-    db.transaction(() => {
-      db.prepare(`
+    (await db.transaction(async () => {
+      (await db.prepare(`
         UPDATE purchase_invoices
         SET branch_id = COALESCE(?, branch_id),
             warehouse_id = COALESCE(?, warehouse_id),
@@ -3729,9 +3731,9 @@ apiRouter.put('/purchases/invoices/:id', requireAuth, requirePermission('purchas
         invoiceDate || null, paymentType || null, subtotal.toNumber(), totalDiscount.toNumber(),
         taxableTotal.toNumber(), totalVat.toNumber(), totalWht.toNumber(), netTotalAmount.toNumber(),
         netTotalAmount.toNumber(), notes || null, target.id
-      );
+      ));
 
-      db.prepare('DELETE FROM purchase_invoice_items WHERE invoice_id = ?').run(target.id);
+      (await db.prepare('DELETE FROM purchase_invoice_items WHERE invoice_id = ?').run(target.id));
       const insertLineStmt = db.prepare(`
         INSERT INTO purchase_invoice_items (
           id, invoice_id, item_id, unit_name, unit_factor, quantity, unit_price, discount_amount, tax_rate, tax_amount, total_amount
@@ -3739,14 +3741,14 @@ apiRouter.put('/purchases/invoices/:id', requireAuth, requirePermission('purchas
       `);
 
       for (const it of calculatedItems) {
-        insertLineStmt.run(
+        (await insertLineStmt.run(
           `pii_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           target.id, it.itemId, it.quantity, it.unitPrice, it.discountAmount, it.taxRate, it.taxAmount, it.totalAmount
-        );
+        ));
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'UPDATE_DRAFT_PURCHASE_INVOICE', 'purchase_invoices', target.id, `تعديل مسودة فاتورة المشتريات ${target.invoice_number}`);
+    (await logAudit(req.user!.id, 'UPDATE_DRAFT_PURCHASE_INVOICE', 'purchase_invoices', target.id, `تعديل مسودة فاتورة المشتريات ${target.invoice_number}`));
     res.json({ success: true, message: 'تم تحديث مسودة فاتورة المشتريات بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -3754,8 +3756,8 @@ apiRouter.put('/purchases/invoices/:id', requireAuth, requirePermission('purchas
 });
 
 // Delete Draft Purchase Invoice
-apiRouter.delete('/purchases/invoices/:id', requireAuth, requirePermission('purchases.delete_draft'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM purchase_invoices WHERE id = ?').get(req.params.id) as any;
+apiRouter.delete('/purchases/invoices/:id', requireAuth, requirePermission('purchases.delete_draft'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM purchase_invoices WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'فاتورة المشتريات غير موجودة.' });
 
   if (target.status !== 'draft') {
@@ -3767,12 +3769,12 @@ apiRouter.delete('/purchases/invoices/:id', requireAuth, requirePermission('purc
   }
 
   try {
-    db.transaction(() => {
-      db.prepare('DELETE FROM purchase_invoice_items WHERE invoice_id = ?').run(target.id);
-      db.prepare('DELETE FROM purchase_invoices WHERE id = ?').run(target.id);
-    })();
+    (await db.transaction(async () => {
+      (await db.prepare('DELETE FROM purchase_invoice_items WHERE invoice_id = ?').run(target.id));
+      (await db.prepare('DELETE FROM purchase_invoices WHERE id = ?').run(target.id));
+    })());
 
-    logAudit(req.user!.id, 'DELETE_DRAFT_PURCHASE_INVOICE', 'purchase_invoices', target.id, `حذف مسودة فاتورة المشتريات ${target.invoice_number}`);
+    (await logAudit(req.user!.id, 'DELETE_DRAFT_PURCHASE_INVOICE', 'purchase_invoices', target.id, `حذف مسودة فاتورة المشتريات ${target.invoice_number}`));
     res.json({ success: true, message: `تم حذف مسودة فاتورة الشراء "${target.invoice_number}" بنجاح.` });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -3780,8 +3782,8 @@ apiRouter.delete('/purchases/invoices/:id', requireAuth, requirePermission('purc
 });
 
 // Post Draft Purchase Invoice
-apiRouter.post('/purchases/invoices/:id/post', requireAuth, requirePermission('purchases.post'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM purchase_invoices WHERE id = ?').get(req.params.id) as any;
+apiRouter.post('/purchases/invoices/:id/post', requireAuth, requirePermission('purchases.post'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM purchase_invoices WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'فاتورة المشتريات غير موجودة.' });
 
   if (target.status !== 'draft') {
@@ -3792,22 +3794,22 @@ apiRouter.post('/purchases/invoices/:id/post', requireAuth, requirePermission('p
     return res.status(403).json({ error: 'الفرع التابع له الفاتورة خارج نطاق الفروع المصرح لك بها.' });
   }
 
-  const items = db.prepare('SELECT * FROM purchase_invoice_items WHERE invoice_id = ?').all(target.id) as any[];
+  const items = (await db.prepare('SELECT * FROM purchase_invoice_items WHERE invoice_id = ?').all(target.id)) as any[];
   if (!items || items.length === 0) {
     return res.status(400).json({ error: 'لا يمكن ترحيل فاتورة مشتريات بدون بنود.' });
   }
 
   try {
-    const period = getFiscalPeriodForDate(target.invoice_date);
-    const postedNumber = getNextDocumentNumber('PINV', target.branch_id, period.fiscal_year_id);
-    const supplier = db.prepare('SELECT id, name_ar FROM parties WHERE id = ?').get(target.supplier_id) as any;
+    const period = (await getFiscalPeriodForDate(target.invoice_date));
+    const postedNumber = (await getNextDocumentNumber('PINV', target.branch_id, period.fiscal_year_id));
+    const supplier = (await db.prepare('SELECT id, name_ar FROM parties WHERE id = ?').get(target.supplier_id)) as any;
 
-    db.transaction(() => {
+    (await db.transaction(async () => {
       const isAlex = target.branch_id === 'br_alex';
       const inventoryAccount = isAlex ? 'acc_1142' : 'acc_1141';
       const isCash = target.payment_type === 'cash';
 
-      const journalResult = postJournalEntry({
+      const journalResult = (await postJournalEntry({
         docType: 'PUR_INV',
         docId: target.id,
         docNumber: postedNumber,
@@ -3823,11 +3825,11 @@ apiRouter.post('/purchases/invoices/:id/post', requireAuth, requirePermission('p
           { accountId: isCash ? 'acc_1111' : 'acc_2111', partyId: isCash ? null : target.supplier_id, debit: 0, credit: target.total_amount, description: `استحقاق فاتورة مشتريات ${postedNumber}` },
           { accountId: 'acc_2132', debit: 0, credit: target.withholding_tax_amount, description: `أمانات ضريبة الخصم والتحصيل 1% فاتورة ${postedNumber}` }
         ]
-      });
+      }));
 
       for (const it of items) {
-        const currentItem = db.prepare('SELECT moving_avg_cost FROM items WHERE id = ?').get(it.item_id) as any;
-        const currentStockRow = db.prepare('SELECT SUM(quantity) as total_qty FROM warehouse_stock WHERE item_id = ?').get(it.item_id) as any;
+        const currentItem = (await db.prepare('SELECT moving_avg_cost FROM items WHERE id = ?').get(it.item_id)) as any;
+        const currentStockRow = (await db.prepare('SELECT SUM(quantity) as total_qty FROM warehouse_stock WHERE item_id = ?').get(it.item_id)) as any;
         const curQty = currentStockRow?.total_qty || 0;
         const curCost = currentItem?.moving_avg_cost || it.unit_price;
 
@@ -3836,16 +3838,16 @@ apiRouter.post('/purchases/invoices/:id/post', requireAuth, requirePermission('p
           ? Math.round((((curQty * curCost) + (it.quantity * it.unit_price)) / newTotalQty) * 100) / 100
           : it.unit_price;
 
-        db.prepare('UPDATE items SET moving_avg_cost = ? WHERE id = ?').run(newAvgCost, it.item_id);
+        (await db.prepare('UPDATE items SET moving_avg_cost = ? WHERE id = ?').run(newAvgCost, it.item_id));
 
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO warehouse_stock (warehouse_id, item_id, quantity)
           VALUES (?, ?, ?)
-          ON CONFLICT(warehouse_id, item_id) DO UPDATE SET quantity = quantity + ?
-        `).run(target.warehouse_id, it.item_id, it.quantity, it.quantity);
+          ON DUPLICATE KEY UPDATE quantity = quantity + ?
+        `).run(target.warehouse_id, it.item_id, it.quantity, it.quantity));
       }
 
-      db.prepare(`
+      (await db.prepare(`
         UPDATE purchase_invoices
         SET invoice_number = ?,
             status = 'posted',
@@ -3859,10 +3861,10 @@ apiRouter.post('/purchases/invoices/:id/post', requireAuth, requirePermission('p
         isCash ? 0 : target.total_amount,
         journalResult.entryId,
         target.id
-      );
-    })();
+      ));
+    })());
 
-    logAudit(req.user!.id, 'POST_PURCHASE_INVOICE', 'purchase_invoices', target.id, `اعتماد وترحيل فاتورة المشتريات برقم ${postedNumber}`);
+    (await logAudit(req.user!.id, 'POST_PURCHASE_INVOICE', 'purchase_invoices', target.id, `اعتماد وترحيل فاتورة المشتريات برقم ${postedNumber}`));
     res.json({ success: true, invoiceId: target.id, invoiceNumber: postedNumber, message: 'تم ترحيل واعتماد فاتورة المشتريات بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -3870,8 +3872,8 @@ apiRouter.post('/purchases/invoices/:id/post', requireAuth, requirePermission('p
 });
 
 // Reversal / Cancellation of Posted Purchase Invoice
-apiRouter.post('/purchases/invoices/:id/reverse', requireAuth, requirePermission('purchases.reverse'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM purchase_invoices WHERE id = ?').get(req.params.id) as any;
+apiRouter.post('/purchases/invoices/:id/reverse', requireAuth, requirePermission('purchases.reverse'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM purchase_invoices WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'فاتورة المشتريات غير موجودة.' });
 
   if (target.status !== 'posted' && target.status !== 'paid' && target.status !== 'partially_paid') {
@@ -3888,18 +3890,18 @@ apiRouter.post('/purchases/invoices/:id/reverse', requireAuth, requirePermission
   }
 
   // 1. Check if invoice has active purchase returns
-  const returnCheck = db.prepare("SELECT COUNT(*) as cnt FROM purchase_returns WHERE original_invoice_id = ? AND status != 'reversed'").get(target.id) as { cnt: number };
+  const returnCheck = (await db.prepare("SELECT COUNT(*) as cnt FROM purchase_returns WHERE original_invoice_id = ? AND status != 'reversed'").get(target.id)) as { cnt: number };
   if (returnCheck && returnCheck.cnt > 0) {
     return res.status(400).json({ error: `لا يمكن إلغاء الفاتورة لوجود (${returnCheck.cnt}) مردود مشتريات مسجل عليها مسبقاً. يرجى إلغاء المردود أولاً.` });
   }
 
   // 2. Check if credit invoice has payment voucher allocations
-  const allocCheck = db.prepare(`
+  const allocCheck = (await db.prepare(`
     SELECT va.allocated_amount, pv.voucher_number
     FROM voucher_allocations va
     JOIN payment_vouchers pv ON va.voucher_id = pv.id
     WHERE va.invoice_id = ? AND va.invoice_type = 'purchase_invoice' AND pv.status != 'reversed'
-  `).all(target.id) as any[];
+  `).all(target.id)) as any[];
 
   if (target.payment_type !== 'cash' && allocCheck.length > 0) {
     return res.status(400).json({
@@ -3908,10 +3910,10 @@ apiRouter.post('/purchases/invoices/:id/reverse', requireAuth, requirePermission
   }
 
   // 3. Check stock balance for items before deduction
-  const items = db.prepare('SELECT * FROM purchase_invoice_items WHERE invoice_id = ?').all(target.id) as any[];
-  if (!isNegativeStockAllowed()) {
+  const items = (await db.prepare('SELECT * FROM purchase_invoice_items WHERE invoice_id = ?').all(target.id)) as any[];
+  if (!(await isNegativeStockAllowed())) {
     for (const it of items) {
-      const stockRow = db.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(target.warehouse_id, it.item_id) as any;
+      const stockRow = (await db.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(target.warehouse_id, it.item_id)) as any;
       const currentQty = stockRow ? stockRow.quantity : 0;
       if (currentQty < it.quantity) {
         return res.status(400).json({
@@ -3922,54 +3924,54 @@ apiRouter.post('/purchases/invoices/:id/reverse', requireAuth, requirePermission
   }
 
   try {
-    db.transaction(() => {
+    (await db.transaction(async () => {
       // 1. Reverse the associated journal entry
       let reversalJeNumber = '';
       if (target.journal_entry_id) {
-        const revJe = reverseJournalEntry(target.journal_entry_id, `إلغاء وعكس فاتورة المشتريات ${target.invoice_number}: ${reason}`, req.user!.id, db, true);
+        const revJe = (await reverseJournalEntry(target.journal_entry_id, `إلغاء وعكس فاتورة المشتريات ${target.invoice_number}: ${reason}`, req.user!.id, db, true));
         reversalJeNumber = revJe.reverseNumber;
       }
 
       // 2. Deduct warehouse inventory for items
       for (const it of items) {
-        db.prepare(`
+        (await db.prepare(`
           UPDATE warehouse_stock
           SET quantity = quantity - ?
           WHERE warehouse_id = ? AND item_id = ?
-        `).run(it.quantity, target.warehouse_id, it.item_id);
+        `).run(it.quantity, target.warehouse_id, it.item_id));
       }
 
       // 3. If cash invoice, reverse associated payment voucher
       if (target.payment_type === 'cash') {
-        const linkedVoucher = db.prepare(`
+        const linkedVoucher = (await db.prepare(`
           SELECT pv.* FROM payment_vouchers pv
           JOIN voucher_allocations va ON pv.id = va.voucher_id
           WHERE va.invoice_id = ? AND va.invoice_type = 'purchase_invoice' AND pv.status != 'reversed'
-        `).get(target.id) as any;
+        `).get(target.id)) as any;
 
         if (linkedVoucher) {
           if (linkedVoucher.journal_entry_id) {
-            reverseJournalEntry(linkedVoucher.journal_entry_id, `عكس سند صرف النقدية المرتبط بالفاتورة الملغاة ${target.invoice_number}`, req.user!.id);
+            (await reverseJournalEntry(linkedVoucher.journal_entry_id, `عكس سند صرف النقدية المرتبط بالفاتورة الملغاة ${target.invoice_number}`, req.user!.id));
           }
           if (linkedVoucher.cash_box_id) {
-            db.prepare('UPDATE cash_boxes SET current_balance = current_balance + ? WHERE id = ?').run(linkedVoucher.amount, linkedVoucher.cash_box_id);
+            (await db.prepare('UPDATE cash_boxes SET current_balance = current_balance + ? WHERE id = ?').run(linkedVoucher.amount, linkedVoucher.cash_box_id));
           }
-          db.prepare("UPDATE payment_vouchers SET status = 'reversed', notes = COALESCE(notes || ' | ', '') || 'تم الإلغاء لعكس الفاتورة ' || ? WHERE id = ?").run(target.invoice_number, linkedVoucher.id);
+          (await db.prepare("UPDATE payment_vouchers SET status = 'reversed', notes = CONCAT(COALESCE(CONCAT(notes, ' | '), ''), 'تم الإلغاء لعكس الفاتورة ', ?) WHERE id = ?").run(target.invoice_number, linkedVoucher.id));
         }
       }
 
       // 4. Update purchase invoice status to 'reversed'
       const noteAppend = ` | تم الإلغاء والعكس بالقيد (${reversalJeNumber || 'N/A'}) بسبب: ${reason}`;
-      db.prepare(`
+      (await db.prepare(`
         UPDATE purchase_invoices
         SET status = 'reversed',
             remaining_amount = 0,
-            notes = COALESCE(notes || '', '') || ?
+            notes = CONCAT(COALESCE(notes, ''), ?)
         WHERE id = ?
-      `).run(noteAppend, target.id);
-    })();
+      `).run(noteAppend, target.id));
+    })());
 
-    logAudit(req.user!.id, 'REVERSE_PURCHASE_INVOICE', 'purchase_invoices', target.id, `إلغاء وعكس فاتورة المشتريات ${target.invoice_number} - السبب: ${reason}`);
+    (await logAudit(req.user!.id, 'REVERSE_PURCHASE_INVOICE', 'purchase_invoices', target.id, `إلغاء وعكس فاتورة المشتريات ${target.invoice_number} - السبب: ${reason}`));
     res.json({
       success: true,
       message: `تم إلغاء وعكس فاتورة المشتريات "${target.invoice_number}" بنجاح وخصم البضاعة من المخزن وعكس الأثر المالي في الأستاذ العام.`
@@ -3982,7 +3984,7 @@ apiRouter.post('/purchases/invoices/:id/reverse', requireAuth, requirePermission
 // ----------------------------------------------------
 // 10. Sales Returns (مردودات المبيعات - دورة المسودة والترحيل الكاملة)
 // ----------------------------------------------------
-apiRouter.get('/sales/returns', requireAuth, requirePermission('sales_returns.view'), (req: AuthenticatedRequest, res) => {
+apiRouter.get('/sales/returns', requireAuth, requirePermission('sales_returns.view'), async (req: AuthenticatedRequest, res) => {
   let branchFilter = '';
   const params: any[] = [];
   if (req.user?.role !== 'owner' && req.user?.allowed_branch_ids !== '*') {
@@ -3999,7 +4001,7 @@ apiRouter.get('/sales/returns', requireAuth, requirePermission('sales_returns.vi
     }
   }
 
-  const returns = db.prepare(`
+  const returns = (await db.prepare(`
     SELECT sr.*, p.name_ar as customer_name, b.name_ar as branch_name, w.name_ar as warehouse_name,
            si.invoice_number as original_invoice_number
     FROM sales_returns sr
@@ -4009,12 +4011,12 @@ apiRouter.get('/sales/returns', requireAuth, requirePermission('sales_returns.vi
     LEFT JOIN sales_invoices si ON sr.original_invoice_id = si.id
     ${branchFilter}
     ORDER BY sr.return_date DESC, sr.return_number DESC
-  `).all(...params);
+  `).all(...params));
   res.json({ returns });
 });
 
-apiRouter.get('/sales/returns/:id', requireAuth, requirePermission('sales_returns.view'), (req: AuthenticatedRequest, res) => {
-  const returnDoc = db.prepare(`
+apiRouter.get('/sales/returns/:id', requireAuth, requirePermission('sales_returns.view'), async (req: AuthenticatedRequest, res) => {
+  const returnDoc = (await db.prepare(`
     SELECT sr.*, p.name_ar as customer_name, b.name_ar as branch_name, w.name_ar as warehouse_name,
            si.invoice_number as original_invoice_number, je.entry_number as journal_number
     FROM sales_returns sr
@@ -4024,7 +4026,7 @@ apiRouter.get('/sales/returns/:id', requireAuth, requirePermission('sales_return
     LEFT JOIN sales_invoices si ON sr.original_invoice_id = si.id
     LEFT JOIN journal_entries je ON sr.journal_entry_id = je.id
     WHERE sr.id = ?
-  `).get(req.params.id) as any;
+  `).get(req.params.id)) as any;
 
   if (!returnDoc) return res.status(404).json({ error: 'مردود المبيعات غير موجود.' });
 
@@ -4032,25 +4034,25 @@ apiRouter.get('/sales/returns/:id', requireAuth, requirePermission('sales_return
     return res.status(403).json({ error: 'الفرع التابع له مردود المبيعات خارج نطاق الفروع المصرح لك بها.' });
   }
 
-  const items = db.prepare(`
+  const items = (await db.prepare(`
     SELECT sri.*, i.name_ar as item_name, i.code as item_code, i.barcode
     FROM sales_return_items sri
     JOIN items i ON sri.item_id = i.id
     WHERE sri.return_id = ?
-  `).all(req.params.id);
+  `).all(req.params.id));
 
   returnDoc.items = items;
   res.json({ returnDoc });
 });
 
-apiRouter.post('/sales/returns', requireAuth, (req: AuthenticatedRequest, res) => {
+apiRouter.post('/sales/returns', requireAuth, async (req: AuthenticatedRequest, res) => {
   const { originalInvoiceId, warehouseId, returnDate, refundType, items, notes, status } = req.body;
 
   if (!originalInvoiceId || !items || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'بيانات مردود المبيعات غير مكتملة.' });
   }
 
-  const origInv = db.prepare('SELECT * FROM sales_invoices WHERE id = ?').get(originalInvoiceId) as any;
+  const origInv = (await db.prepare('SELECT * FROM sales_invoices WHERE id = ?').get(originalInvoiceId)) as any;
   if (!origInv) return res.status(404).json({ error: 'الفاتورة الأصلية غير موجودة.' });
 
   if (!isBranchAllowed(req.user, origInv.branch_id)) {
@@ -4071,8 +4073,8 @@ apiRouter.post('/sales/returns', requireAuth, (req: AuthenticatedRequest, res) =
   try {
     const retId = `ret_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const effectiveDate = returnDate || new Date().toISOString().split('T')[0];
-    const period = getFiscalPeriodForDate(effectiveDate);
-    const retNumber = getNextDocumentNumber(isDraft ? 'SR-DFT' : 'SR', origInv.branch_id, period.fiscal_year_id);
+    const period = (await getFiscalPeriodForDate(effectiveDate));
+    const retNumber = (await getNextDocumentNumber(isDraft ? 'SR-DFT' : 'SR', origInv.branch_id, period.fiscal_year_id));
 
     // Aggregate requested quantities by item to prevent duplicate line bypass
     const appliedReturnsByLine: Record<string, number> = {};
@@ -4084,21 +4086,21 @@ apiRouter.post('/sales/returns', requireAuth, (req: AuthenticatedRequest, res) =
     for (const it of items) {
       let origLine: any = null;
       if (it.originalInvoiceItemId || it.origLineId) {
-        origLine = db.prepare(`
+        origLine = (await db.prepare(`
           SELECT sii.*, i.moving_avg_cost, i.name_ar as item_name, i.item_type
           FROM sales_invoice_items sii
           JOIN items i ON sii.item_id = i.id
           WHERE sii.id = ? AND sii.invoice_id = ?
-        `).get(it.originalInvoiceItemId || it.origLineId, originalInvoiceId);
+        `).get(it.originalInvoiceItemId || it.origLineId, originalInvoiceId));
       }
       if (!origLine) {
-        origLine = db.prepare(`
+        origLine = (await db.prepare(`
           SELECT sii.*, i.moving_avg_cost, i.name_ar as item_name, i.item_type
           FROM sales_invoice_items sii
           JOIN items i ON sii.item_id = i.id
           WHERE sii.invoice_id = ? AND sii.item_id = ?
           LIMIT 1
-        `).get(originalInvoiceId, it.itemId);
+        `).get(originalInvoiceId, it.itemId));
       }
 
       if (!origLine) throw new Error(`الصنف ${it.itemId} غير مسجل بالفاتورة الأصلية.`);
@@ -4152,8 +4154,8 @@ apiRouter.post('/sales/returns', requireAuth, (req: AuthenticatedRequest, res) =
 
     if (isDraft) {
       // Save Draft without GL or stock changes
-      db.transaction(() => {
-        db.prepare(`
+      (await db.transaction(async () => {
+        (await db.prepare(`
           INSERT INTO sales_returns (
             id, return_number, original_invoice_id, branch_id, warehouse_id, customer_id,
             return_date, refund_type, subtotal, tax_amount, withholding_tax_amount,
@@ -4164,10 +4166,10 @@ apiRouter.post('/sales/returns', requireAuth, (req: AuthenticatedRequest, res) =
           effectiveDate, refundType || 'credit_note', subtotal.toNumber(), totalVat.toNumber(), totalWht.toNumber(),
           netReturnAmount.toNumber(), isCashRefund ? netReturnAmount.toNumber() : 0, totalCogsReversed.toNumber(),
           req.user!.id, notes || null
-        );
+        ));
 
         for (const it of validatedItems) {
-          db.prepare(`
+          (await db.prepare(`
             INSERT INTO sales_return_items (
               id, return_id, original_invoice_item_id, item_id, unit_name, unit_factor,
               quantity, unit_price, unit_cost, tax_rate, tax_amount, total_amount
@@ -4175,20 +4177,20 @@ apiRouter.post('/sales/returns', requireAuth, (req: AuthenticatedRequest, res) =
           `).run(
             `sri_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
             retId, it.origLineId, it.itemId, it.quantity, it.unitPrice, it.unitCost, it.taxRate, it.taxAmount, it.totalAmount
-          );
+          ));
         }
-      })();
+      })());
 
-      logAudit(req.user!.id, 'CREATE_DRAFT_SALES_RETURN', 'sales_returns', retId, `إنشاء مسودة مردود مبيعات ${retNumber}`);
+      (await logAudit(req.user!.id, 'CREATE_DRAFT_SALES_RETURN', 'sales_returns', retId, `إنشاء مسودة مردود مبيعات ${retNumber}`));
       return res.json({ success: true, returnId: retId, returnNumber: retNumber, status: 'draft', message: 'تم حفظ مسودة مردود المبيعات بنجاح دون أي أثر مالي أو مخزني.' });
     }
 
     // Direct Post
-    db.transaction(() => {
+    (await db.transaction(async () => {
       const isAlex = origInv.branch_id === 'br_alex';
       const inventoryAccount = isAlex ? 'acc_1142' : 'acc_1141';
 
-      const journalResult = postJournalEntry({
+      const journalResult = (await postJournalEntry({
         docType: 'SALES_RET',
         docId: retId,
         docNumber: retNumber,
@@ -4206,9 +4208,9 @@ apiRouter.post('/sales/returns', requireAuth, (req: AuthenticatedRequest, res) =
           { accountId: inventoryAccount, debit: totalCogsReversed.toNumber(), credit: 0, description: `إعادة مخزون مرتجع مبيعات ${retNumber}` },
           { accountId: 'acc_5111', debit: 0, credit: totalCogsReversed.toNumber(), description: `عكس تكلفة مبيعات مرتجع ${retNumber}` }
         ]
-      });
+      }));
 
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO sales_returns (
           id, return_number, original_invoice_id, branch_id, warehouse_id, customer_id,
           return_date, refund_type, subtotal, tax_amount, withholding_tax_amount,
@@ -4219,18 +4221,18 @@ apiRouter.post('/sales/returns', requireAuth, (req: AuthenticatedRequest, res) =
         effectiveDate, refundType || 'credit_note', subtotal.toNumber(), totalVat.toNumber(), totalWht.toNumber(),
         netReturnAmount.toNumber(), isCashRefund ? netReturnAmount.toNumber() : 0, totalCogsReversed.toNumber(),
         journalResult.entryId, req.user!.id, notes || null
-      );
+      ));
 
       if (!isCashRefund) {
-        db.prepare(`
+        (await db.prepare(`
           UPDATE sales_invoices
           SET remaining_amount = MAX(0, remaining_amount - ?)
           WHERE id = ?
-        `).run(netReturnAmount.toNumber(), originalInvoiceId);
+        `).run(netReturnAmount.toNumber(), originalInvoiceId));
       }
 
       for (const it of validatedItems) {
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO sales_return_items (
             id, return_id, original_invoice_item_id, item_id, unit_name, unit_factor,
             quantity, unit_price, unit_cost, tax_rate, tax_amount, total_amount
@@ -4238,23 +4240,23 @@ apiRouter.post('/sales/returns', requireAuth, (req: AuthenticatedRequest, res) =
         `).run(
           `sri_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           retId, it.origLineId, it.itemId, it.quantity, it.unitPrice, it.unitCost, it.taxRate, it.taxAmount, it.totalAmount
-        );
+        ));
 
-        db.prepare(`
+        (await db.prepare(`
           UPDATE sales_invoice_items 
           SET returned_quantity = returned_quantity + ? 
           WHERE id = ?
-        `).run(it.quantity, it.origLineId);
+        `).run(it.quantity, it.origLineId));
 
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO warehouse_stock (warehouse_id, item_id, quantity)
           VALUES (?, ?, ?)
-          ON CONFLICT(warehouse_id, item_id) DO UPDATE SET quantity = quantity + ?
-        `).run(warehouseId || origInv.warehouse_id, it.itemId, it.quantity, it.quantity);
+          ON DUPLICATE KEY UPDATE quantity = quantity + ?
+        `).run(warehouseId || origInv.warehouse_id, it.itemId, it.quantity, it.quantity));
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'CREATE_SALES_RETURN', 'sales_returns', retId, `تسجيل مردود مبيعات ${retNumber}`);
+    (await logAudit(req.user!.id, 'CREATE_SALES_RETURN', 'sales_returns', retId, `تسجيل مردود مبيعات ${retNumber}`));
     res.json({ success: true, returnId: retId, returnNumber: retNumber, status: 'posted', message: 'تم ترحيل واعتماد مردود المبيعات بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4262,8 +4264,8 @@ apiRouter.post('/sales/returns', requireAuth, (req: AuthenticatedRequest, res) =
 });
 
 // Edit Draft Sales Return
-apiRouter.put('/sales/returns/:id', requireAuth, requirePermission('sales_returns.edit_draft'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM sales_returns WHERE id = ?').get(req.params.id) as any;
+apiRouter.put('/sales/returns/:id', requireAuth, requirePermission('sales_returns.edit_draft'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM sales_returns WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'مردود المبيعات غير موجود.' });
 
   if (target.status !== 'draft') {
@@ -4289,21 +4291,21 @@ apiRouter.put('/sales/returns/:id', requireAuth, requirePermission('sales_return
     for (const it of items) {
       let origLine: any = null;
       if (it.originalInvoiceItemId || it.origLineId) {
-        origLine = db.prepare(`
+        origLine = (await db.prepare(`
           SELECT sii.*, i.moving_avg_cost, i.name_ar as item_name, i.item_type
           FROM sales_invoice_items sii
           JOIN items i ON sii.item_id = i.id
           WHERE sii.id = ? AND sii.invoice_id = ?
-        `).get(it.originalInvoiceItemId || it.origLineId, target.original_invoice_id);
+        `).get(it.originalInvoiceItemId || it.origLineId, target.original_invoice_id));
       }
       if (!origLine) {
-        origLine = db.prepare(`
+        origLine = (await db.prepare(`
           SELECT sii.*, i.moving_avg_cost, i.name_ar as item_name, i.item_type
           FROM sales_invoice_items sii
           JOIN items i ON sii.item_id = i.id
           WHERE sii.invoice_id = ? AND sii.item_id = ?
           LIMIT 1
-        `).get(target.original_invoice_id, it.itemId);
+        `).get(target.original_invoice_id, it.itemId));
       }
 
       if (!origLine) throw new Error(`الصنف ${it.itemId} غير مسجل بالفاتورة الأصلية.`);
@@ -4356,8 +4358,8 @@ apiRouter.put('/sales/returns/:id', requireAuth, requirePermission('sales_return
     const effRefundType = refundType || target.refund_type;
     const isCashRefund = effRefundType === 'cash';
 
-    db.transaction(() => {
-      db.prepare(`
+    (await db.transaction(async () => {
+      (await db.prepare(`
         UPDATE sales_returns
         SET return_date = COALESCE(?, return_date),
             refund_type = COALESCE(?, refund_type),
@@ -4373,11 +4375,11 @@ apiRouter.put('/sales/returns/:id', requireAuth, requirePermission('sales_return
         returnDate || null, effRefundType || null, subtotal.toNumber(), totalVat.toNumber(),
         totalWht.toNumber(), netReturnAmount.toNumber(), isCashRefund ? netReturnAmount.toNumber() : 0,
         totalCogsReversed.toNumber(), notes || null, target.id
-      );
+      ));
 
-      db.prepare('DELETE FROM sales_return_items WHERE return_id = ?').run(target.id);
+      (await db.prepare('DELETE FROM sales_return_items WHERE return_id = ?').run(target.id));
       for (const it of validatedItems) {
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO sales_return_items (
             id, return_id, original_invoice_item_id, item_id, unit_name, unit_factor,
             quantity, unit_price, unit_cost, tax_rate, tax_amount, total_amount
@@ -4385,11 +4387,11 @@ apiRouter.put('/sales/returns/:id', requireAuth, requirePermission('sales_return
         `).run(
           `sri_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           target.id, it.origLineId, it.itemId, it.quantity, it.unitPrice, it.unitCost, it.taxRate, it.taxAmount, it.totalAmount
-        );
+        ));
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'UPDATE_DRAFT_SALES_RETURN', 'sales_returns', target.id, `تعديل مسودة مردود مبيعات ${target.return_number}`);
+    (await logAudit(req.user!.id, 'UPDATE_DRAFT_SALES_RETURN', 'sales_returns', target.id, `تعديل مسودة مردود مبيعات ${target.return_number}`));
     res.json({ success: true, message: 'تم تحديث مسودة مردود المبيعات بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4397,8 +4399,8 @@ apiRouter.put('/sales/returns/:id', requireAuth, requirePermission('sales_return
 });
 
 // Delete Draft Sales Return
-apiRouter.delete('/sales/returns/:id', requireAuth, requirePermission('sales_returns.delete_draft'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM sales_returns WHERE id = ?').get(req.params.id) as any;
+apiRouter.delete('/sales/returns/:id', requireAuth, requirePermission('sales_returns.delete_draft'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM sales_returns WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'مردود المبيعات غير موجود.' });
 
   if (target.status !== 'draft') {
@@ -4410,12 +4412,12 @@ apiRouter.delete('/sales/returns/:id', requireAuth, requirePermission('sales_ret
   }
 
   try {
-    db.transaction(() => {
-      db.prepare('DELETE FROM sales_return_items WHERE return_id = ?').run(target.id);
-      db.prepare('DELETE FROM sales_returns WHERE id = ?').run(target.id);
-    })();
+    (await db.transaction(async () => {
+      (await db.prepare('DELETE FROM sales_return_items WHERE return_id = ?').run(target.id));
+      (await db.prepare('DELETE FROM sales_returns WHERE id = ?').run(target.id));
+    })());
 
-    logAudit(req.user!.id, 'DELETE_DRAFT_SALES_RETURN', 'sales_returns', target.id, `حذف مسودة مردود مبيعات ${target.return_number}`);
+    (await logAudit(req.user!.id, 'DELETE_DRAFT_SALES_RETURN', 'sales_returns', target.id, `حذف مسودة مردود مبيعات ${target.return_number}`));
     res.json({ success: true, message: `تم حذف مسودة مردود المبيعات "${target.return_number}" بنجاح.` });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -4423,8 +4425,8 @@ apiRouter.delete('/sales/returns/:id', requireAuth, requirePermission('sales_ret
 });
 
 // Post Draft Sales Return
-apiRouter.post('/sales/returns/:id/post', requireAuth, requirePermission('sales_returns.post'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM sales_returns WHERE id = ?').get(req.params.id) as any;
+apiRouter.post('/sales/returns/:id/post', requireAuth, requirePermission('sales_returns.post'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM sales_returns WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'مردود المبيعات غير موجود.' });
 
   if (target.status !== 'draft') {
@@ -4435,28 +4437,28 @@ apiRouter.post('/sales/returns/:id/post', requireAuth, requirePermission('sales_
     return res.status(403).json({ error: 'الفرع التابع له مردود المبيعات خارج نطاق الفروع المصرح لك بها.' });
   }
 
-  const items = db.prepare(`
+  const items = (await db.prepare(`
     SELECT sri.*, i.item_type
     FROM sales_return_items sri
     JOIN items i ON sri.item_id = i.id
     WHERE sri.return_id = ?
-  `).all(target.id) as any[];
+  `).all(target.id)) as any[];
 
   if (!items || items.length === 0) {
     return res.status(400).json({ error: 'لا يمكن ترحيل مردود مبيعات بدون بنود.' });
   }
 
-  const origInv = db.prepare('SELECT * FROM sales_invoices WHERE id = ?').get(target.original_invoice_id) as any;
+  const origInv = (await db.prepare('SELECT * FROM sales_invoices WHERE id = ?').get(target.original_invoice_id)) as any;
   if (!origInv) return res.status(404).json({ error: 'الفاتورة الأصلية غير موجودة.' });
 
   try {
-    const period = getFiscalPeriodForDate(target.return_date);
-    const postedNumber = getNextDocumentNumber('SR', target.branch_id, period.fiscal_year_id);
+    const period = (await getFiscalPeriodForDate(target.return_date));
+    const postedNumber = (await getNextDocumentNumber('SR', target.branch_id, period.fiscal_year_id));
     const isCashRefund = target.refund_type === 'cash';
 
     // Verify current available return quantities
     for (const it of items) {
-      const origLine = db.prepare('SELECT quantity, returned_quantity, item_id FROM sales_invoice_items WHERE id = ?').get(it.original_invoice_item_id) as any;
+      const origLine = (await db.prepare('SELECT quantity, returned_quantity, item_id FROM sales_invoice_items WHERE id = ?').get(it.original_invoice_item_id)) as any;
       if (!origLine) throw new Error(`سطر الفاتورة ${it.original_invoice_item_id} غير موجود.`);
       const remainingQty = origLine.quantity - (origLine.returned_quantity || 0);
       if (it.quantity > remainingQty) {
@@ -4464,11 +4466,11 @@ apiRouter.post('/sales/returns/:id/post', requireAuth, requirePermission('sales_
       }
     }
 
-    db.transaction(() => {
+    (await db.transaction(async () => {
       const isAlex = target.branch_id === 'br_alex';
       const inventoryAccount = isAlex ? 'acc_1142' : 'acc_1141';
 
-      const journalResult = postJournalEntry({
+      const journalResult = (await postJournalEntry({
         docType: 'SALES_RET',
         docId: target.id,
         docNumber: postedNumber,
@@ -4486,42 +4488,42 @@ apiRouter.post('/sales/returns/:id/post', requireAuth, requirePermission('sales_
           { accountId: inventoryAccount, debit: target.cogs_reversed_amount, credit: 0, description: `إعادة مخزون مرتجع مبيعات ${postedNumber}` },
           { accountId: 'acc_5111', debit: 0, credit: target.cogs_reversed_amount, description: `عكس تكلفة مبيعات مرتجع ${postedNumber}` }
         ]
-      });
+      }));
 
-      db.prepare(`
+      (await db.prepare(`
         UPDATE sales_returns
         SET return_number = ?,
             status = 'posted',
             journal_entry_id = ?
         WHERE id = ?
-      `).run(postedNumber, journalResult.entryId, target.id);
+      `).run(postedNumber, journalResult.entryId, target.id));
 
       if (!isCashRefund) {
-        db.prepare(`
+        (await db.prepare(`
           UPDATE sales_invoices
           SET remaining_amount = MAX(0, remaining_amount - ?)
           WHERE id = ?
-        `).run(target.total_amount, target.original_invoice_id);
+        `).run(target.total_amount, target.original_invoice_id));
       }
 
       for (const it of items) {
-        db.prepare(`
+        (await db.prepare(`
           UPDATE sales_invoice_items 
           SET returned_quantity = returned_quantity + ? 
           WHERE id = ?
-        `).run(it.quantity, it.original_invoice_item_id);
+        `).run(it.quantity, it.original_invoice_item_id));
 
         if (it.item_type === 'stock') {
-          db.prepare(`
+          (await db.prepare(`
             INSERT INTO warehouse_stock (warehouse_id, item_id, quantity)
             VALUES (?, ?, ?)
-            ON CONFLICT(warehouse_id, item_id) DO UPDATE SET quantity = quantity + ?
-          `).run(target.warehouse_id, it.item_id, it.quantity, it.quantity);
+            ON DUPLICATE KEY UPDATE quantity = quantity + ?
+          `).run(target.warehouse_id, it.item_id, it.quantity, it.quantity));
         }
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'POST_SALES_RETURN', 'sales_returns', target.id, `اعتماد وترحيل مردود المبيعات برقم ${postedNumber}`);
+    (await logAudit(req.user!.id, 'POST_SALES_RETURN', 'sales_returns', target.id, `اعتماد وترحيل مردود المبيعات برقم ${postedNumber}`));
     res.json({ success: true, returnId: target.id, returnNumber: postedNumber, message: 'تم ترحيل واعتماد مردود المبيعات بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4529,8 +4531,8 @@ apiRouter.post('/sales/returns/:id/post', requireAuth, requirePermission('sales_
 });
 
 // Reversal for Posted Sales Return
-apiRouter.post('/sales/returns/:id/reverse', requireAuth, requirePermission('sales_returns.reverse'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM sales_returns WHERE id = ?').get(req.params.id) as any;
+apiRouter.post('/sales/returns/:id/reverse', requireAuth, requirePermission('sales_returns.reverse'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM sales_returns WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'مردود المبيعات غير موجود.' });
 
   if (target.status !== 'posted') {
@@ -4541,23 +4543,23 @@ apiRouter.post('/sales/returns/:id/reverse', requireAuth, requirePermission('sal
     return res.status(403).json({ error: 'الفرع التابع له مردود المبيعات خارج نطاق الفروع المصرح لك بها.' });
   }
 
-  const items = db.prepare(`
+  const items = (await db.prepare(`
     SELECT sri.*, i.item_type
     FROM sales_return_items sri
     JOIN items i ON sri.item_id = i.id
     WHERE sri.return_id = ?
-  `).all(target.id) as any[];
+  `).all(target.id)) as any[];
 
   try {
-    const period = getFiscalPeriodForDate(target.return_date);
-    const reversalNumber = getNextDocumentNumber('REV-SR', target.branch_id, period.fiscal_year_id);
+    const period = (await getFiscalPeriodForDate(target.return_date));
+    const reversalNumber = (await getNextDocumentNumber('REV-SR', target.branch_id, period.fiscal_year_id));
     const isAlex = target.branch_id === 'br_alex';
     const inventoryAccount = isAlex ? 'acc_1142' : 'acc_1141';
     const isCashRefund = target.refund_type === 'cash';
 
-    db.transaction(() => {
+    (await db.transaction(async () => {
       // Create reversal journal entry
-      const journalResult = postJournalEntry({
+      const journalResult = (await postJournalEntry({
         docType: 'REV_SR',
         docId: target.id,
         docNumber: reversalNumber,
@@ -4575,43 +4577,43 @@ apiRouter.post('/sales/returns/:id/reverse', requireAuth, requirePermission('sal
           { accountId: inventoryAccount, debit: 0, credit: target.cogs_reversed_amount, description: `عكس إعادة مخزون مرتجع ${target.return_number}` },
           { accountId: 'acc_5111', debit: target.cogs_reversed_amount, credit: 0, description: `إعادة إثبات تكلفة مبيعات ${target.return_number}` }
         ]
-      });
+      }));
 
-      db.prepare(`
+      (await db.prepare(`
         UPDATE sales_returns
         SET status = 'reversed',
-            notes = COALESCE(notes || ' | ', '') || 'تم العكس بالقيد ' || ?
+            notes = CONCAT(COALESCE(CONCAT(notes, ' | '), ''), 'تم العكس بالقيد ', ?)
         WHERE id = ?
-      `).run(journalResult.entryNumber, target.id);
+      `).run(journalResult.entryNumber, target.id));
 
       if (!isCashRefund) {
-        db.prepare(`
+        (await db.prepare(`
           UPDATE sales_invoices
           SET remaining_amount = remaining_amount + ?
           WHERE id = ?
-        `).run(target.total_amount, target.original_invoice_id);
+        `).run(target.total_amount, target.original_invoice_id));
       }
 
       for (const it of items) {
         if (it.original_invoice_item_id) {
-          db.prepare(`
+          (await db.prepare(`
             UPDATE sales_invoice_items
             SET returned_quantity = MAX(0, returned_quantity - ?)
             WHERE id = ?
-          `).run(it.quantity, it.original_invoice_item_id);
+          `).run(it.quantity, it.original_invoice_item_id));
         }
 
         if (it.item_type === 'stock') {
-          db.prepare(`
+          (await db.prepare(`
             UPDATE warehouse_stock
             SET quantity = MAX(0, quantity - ?)
             WHERE warehouse_id = ? AND item_id = ?
-          `).run(it.quantity, target.warehouse_id, it.item_id);
+          `).run(it.quantity, target.warehouse_id, it.item_id));
         }
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'REVERSE_SALES_RETURN', 'sales_returns', target.id, `عكس مردود المبيعات ${target.return_number}`);
+    (await logAudit(req.user!.id, 'REVERSE_SALES_RETURN', 'sales_returns', target.id, `عكس مردود المبيعات ${target.return_number}`));
     res.json({ success: true, message: `تم عكس مردود المبيعات "${target.return_number}" بنجاح.` });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4621,7 +4623,7 @@ apiRouter.post('/sales/returns/:id/reverse', requireAuth, requirePermission('sal
 // ----------------------------------------------------
 // 11. Purchase Returns (مردودات المشتريات - دورة المسودة والترحيل الكاملة)
 // ----------------------------------------------------
-apiRouter.get('/purchases/returns', requireAuth, requirePermission('purchase_returns.view'), (req: AuthenticatedRequest, res) => {
+apiRouter.get('/purchases/returns', requireAuth, requirePermission('purchase_returns.view'), async (req: AuthenticatedRequest, res) => {
   let branchFilter = '';
   const params: any[] = [];
   if (req.user?.role !== 'owner' && req.user?.allowed_branch_ids !== '*') {
@@ -4638,7 +4640,7 @@ apiRouter.get('/purchases/returns', requireAuth, requirePermission('purchase_ret
     }
   }
 
-  const returns = db.prepare(`
+  const returns = (await db.prepare(`
     SELECT pr.*, p.name_ar as supplier_name, b.name_ar as branch_name, w.name_ar as warehouse_name,
            pi.invoice_number as original_invoice_number
     FROM purchase_returns pr
@@ -4648,12 +4650,12 @@ apiRouter.get('/purchases/returns', requireAuth, requirePermission('purchase_ret
     LEFT JOIN purchase_invoices pi ON pr.original_invoice_id = pi.id
     ${branchFilter}
     ORDER BY pr.return_date DESC, pr.return_number DESC
-  `).all(...params);
+  `).all(...params));
   res.json({ returns });
 });
 
-apiRouter.get('/purchases/returns/:id', requireAuth, requirePermission('purchase_returns.view'), (req: AuthenticatedRequest, res) => {
-  const returnDoc = db.prepare(`
+apiRouter.get('/purchases/returns/:id', requireAuth, requirePermission('purchase_returns.view'), async (req: AuthenticatedRequest, res) => {
+  const returnDoc = (await db.prepare(`
     SELECT pr.*, p.name_ar as supplier_name, b.name_ar as branch_name, w.name_ar as warehouse_name,
            pi.invoice_number as original_invoice_number, je.entry_number as journal_number
     FROM purchase_returns pr
@@ -4663,7 +4665,7 @@ apiRouter.get('/purchases/returns/:id', requireAuth, requirePermission('purchase
     LEFT JOIN purchase_invoices pi ON pr.original_invoice_id = pi.id
     LEFT JOIN journal_entries je ON pr.journal_entry_id = je.id
     WHERE pr.id = ?
-  `).get(req.params.id) as any;
+  `).get(req.params.id)) as any;
 
   if (!returnDoc) return res.status(404).json({ error: 'مردود المشتريات غير موجود.' });
 
@@ -4671,25 +4673,25 @@ apiRouter.get('/purchases/returns/:id', requireAuth, requirePermission('purchase
     return res.status(403).json({ error: 'الفرع التابع له مردود المشتريات خارج نطاق الفروع المصرح لك بها.' });
   }
 
-  const items = db.prepare(`
+  const items = (await db.prepare(`
     SELECT pri.*, i.name_ar as item_name, i.code as item_code, i.barcode, i.item_type
     FROM purchase_return_items pri
     JOIN items i ON pri.item_id = i.id
     WHERE pri.return_id = ?
-  `).all(req.params.id);
+  `).all(req.params.id));
 
   returnDoc.items = items;
   res.json({ returnDoc });
 });
 
-apiRouter.post('/purchases/returns', requireAuth, (req: AuthenticatedRequest, res) => {
+apiRouter.post('/purchases/returns', requireAuth, async (req: AuthenticatedRequest, res) => {
   const { originalInvoiceId, warehouseId, returnDate, items, notes, status } = req.body;
 
   if (!originalInvoiceId || !items || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'بيانات مردود المشتريات غير مكتملة.' });
   }
 
-  const origInv = db.prepare('SELECT * FROM purchase_invoices WHERE id = ?').get(originalInvoiceId) as any;
+  const origInv = (await db.prepare('SELECT * FROM purchase_invoices WHERE id = ?').get(originalInvoiceId)) as any;
   if (!origInv) return res.status(404).json({ error: 'فاتورة الشراء الأصلية غير موجودة.' });
 
   if (!isBranchAllowed(req.user, origInv.branch_id)) {
@@ -4710,8 +4712,8 @@ apiRouter.post('/purchases/returns', requireAuth, (req: AuthenticatedRequest, re
   try {
     const retId = `pret_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const effectiveDate = returnDate || new Date().toISOString().split('T')[0];
-    const period = getFiscalPeriodForDate(effectiveDate);
-    const retNumber = getNextDocumentNumber(isDraft ? 'PR-DFT' : 'PR', origInv.branch_id, period.fiscal_year_id);
+    const period = (await getFiscalPeriodForDate(effectiveDate));
+    const retNumber = (await getNextDocumentNumber(isDraft ? 'PR-DFT' : 'PR', origInv.branch_id, period.fiscal_year_id));
 
     let subtotal = new Decimal(0);
     let totalVat = new Decimal(0);
@@ -4721,21 +4723,21 @@ apiRouter.post('/purchases/returns', requireAuth, (req: AuthenticatedRequest, re
     for (const it of items) {
       let origLine: any = null;
       if (it.originalInvoiceItemId || it.origLineId) {
-        origLine = db.prepare(`
+        origLine = (await db.prepare(`
           SELECT pii.*, i.name_ar as item_name, i.item_type
           FROM purchase_invoice_items pii
           JOIN items i ON pii.item_id = i.id
           WHERE pii.id = ? AND pii.invoice_id = ?
-        `).get(it.originalInvoiceItemId || it.origLineId, originalInvoiceId);
+        `).get(it.originalInvoiceItemId || it.origLineId, originalInvoiceId));
       }
       if (!origLine) {
-        origLine = db.prepare(`
+        origLine = (await db.prepare(`
           SELECT pii.*, i.name_ar as item_name, i.item_type
           FROM purchase_invoice_items pii
           JOIN items i ON pii.item_id = i.id
           WHERE pii.invoice_id = ? AND pii.item_id = ?
           LIMIT 1
-        `).get(originalInvoiceId, it.itemId);
+        `).get(originalInvoiceId, it.itemId));
       }
 
       if (!origLine) throw new Error(`الصنف ${it.itemId} غير مسجل بالفاتورة الأصلية.`);
@@ -4758,7 +4760,7 @@ apiRouter.post('/purchases/returns', requireAuth, (req: AuthenticatedRequest, re
 
       if (!isDraft && origLine.item_type === 'stock') {
         // Stock check only when posting stock items
-        const stockRow = db.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(warehouseId || origInv.warehouse_id, it.itemId) as any;
+        const stockRow = (await db.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(warehouseId || origInv.warehouse_id, it.itemId)) as any;
         const currentStock = stockRow ? stockRow.quantity : 0;
         if (currentStock < returnQty.toNumber()) {
           throw new Error(`رصيد المخزن الحالي (${currentStock}) غير كافٍ لإرجاع كمية (${returnQty.toNumber()}) من الصنف "${origLine.item_name}".`);
@@ -4789,8 +4791,8 @@ apiRouter.post('/purchases/returns', requireAuth, (req: AuthenticatedRequest, re
 
     if (isDraft) {
       // Save Draft without GL or stock changes
-      db.transaction(() => {
-        db.prepare(`
+      (await db.transaction(async () => {
+        (await db.prepare(`
           INSERT INTO purchase_returns (
             id, return_number, original_invoice_id, branch_id, warehouse_id, supplier_id,
             return_date, subtotal, tax_amount, withholding_tax_amount, total_amount,
@@ -4800,30 +4802,30 @@ apiRouter.post('/purchases/returns', requireAuth, (req: AuthenticatedRequest, re
           retId, retNumber, originalInvoiceId, origInv.branch_id, warehouseId || origInv.warehouse_id, origInv.supplier_id,
           effectiveDate, subtotal.toNumber(), totalVat.toNumber(), totalWht.toNumber(), netReturnAmount.toNumber(),
           req.user!.id, notes || null
-        );
+        ));
 
         for (const it of validatedItems) {
-          db.prepare(`
+          (await db.prepare(`
             INSERT INTO purchase_return_items (
               id, return_id, original_invoice_item_id, item_id, quantity, unit_price, tax_rate, tax_amount, total_amount
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
           `).run(
             `pri_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
             retId, it.origLineId, it.itemId, it.quantity, it.unitPrice, it.taxRate, it.taxAmount, it.totalAmount
-          );
+          ));
         }
-      })();
+      })());
 
-      logAudit(req.user!.id, 'CREATE_DRAFT_PURCHASE_RETURN', 'purchase_returns', retId, `إنشاء مسودة مردود مشتريات ${retNumber}`);
+      (await logAudit(req.user!.id, 'CREATE_DRAFT_PURCHASE_RETURN', 'purchase_returns', retId, `إنشاء مسودة مردود مشتريات ${retNumber}`));
       return res.json({ success: true, returnId: retId, returnNumber: retNumber, status: 'draft', message: 'تم حفظ مسودة مردود المشتريات بنجاح دون أي أثر على المخزون أو الحسابات.' });
     }
 
     // Direct Post
-    db.transaction(() => {
+    (await db.transaction(async () => {
       const isAlex = origInv.branch_id === 'br_alex';
       const inventoryAccount = isAlex ? 'acc_1142' : 'acc_1141';
 
-      const journalResult = postJournalEntry({
+      const journalResult = (await postJournalEntry({
         docType: 'PUR_RET',
         docId: retId,
         docNumber: retNumber,
@@ -4839,9 +4841,9 @@ apiRouter.post('/purchases/returns', requireAuth, (req: AuthenticatedRequest, re
           { accountId: inventoryAccount, debit: 0, credit: subtotal.toNumber(), description: `خصم مخزون بضاعة مرتجعة للمورد ${retNumber}` },
           { accountId: 'acc_1151', debit: 0, credit: totalVat.toNumber(), description: `عكس ضريبة مدخلات مشتريات ${retNumber}` }
         ]
-      });
+      }));
 
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO purchase_returns (
           id, return_number, original_invoice_id, branch_id, warehouse_id, supplier_id,
           return_date, subtotal, tax_amount, withholding_tax_amount, total_amount,
@@ -4851,41 +4853,41 @@ apiRouter.post('/purchases/returns', requireAuth, (req: AuthenticatedRequest, re
         retId, retNumber, originalInvoiceId, origInv.branch_id, warehouseId || origInv.warehouse_id, origInv.supplier_id,
         effectiveDate, subtotal.toNumber(), totalVat.toNumber(), totalWht.toNumber(), netReturnAmount.toNumber(),
         journalResult.entryId, req.user!.id, notes || null
-      );
+      ));
 
-      db.prepare(`
+      (await db.prepare(`
         UPDATE purchase_invoices
         SET remaining_amount = MAX(0, remaining_amount - ?)
         WHERE id = ?
-      `).run(netReturnAmount.toNumber(), originalInvoiceId);
+      `).run(netReturnAmount.toNumber(), originalInvoiceId));
 
       for (const it of validatedItems) {
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO purchase_return_items (
             id, return_id, original_invoice_item_id, item_id, quantity, unit_price, tax_rate, tax_amount, total_amount
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           `pri_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           retId, it.origLineId, it.itemId, it.quantity, it.unitPrice, it.taxRate, it.taxAmount, it.totalAmount
-        );
+        ));
 
-        db.prepare(`
+        (await db.prepare(`
           UPDATE purchase_invoice_items 
           SET returned_quantity = returned_quantity + ? 
           WHERE id = ?
-        `).run(it.quantity, it.origLineId);
+        `).run(it.quantity, it.origLineId));
 
         if (it.itemType === 'stock') {
-          db.prepare(`
+          (await db.prepare(`
             UPDATE warehouse_stock 
             SET quantity = quantity - ? 
             WHERE warehouse_id = ? AND item_id = ?
-          `).run(it.quantity, warehouseId || origInv.warehouse_id, it.itemId);
+          `).run(it.quantity, warehouseId || origInv.warehouse_id, it.itemId));
         }
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'CREATE_PURCHASE_RETURN', 'purchase_returns', retId, `تسجيل مردود مشتريات ${retNumber}`);
+    (await logAudit(req.user!.id, 'CREATE_PURCHASE_RETURN', 'purchase_returns', retId, `تسجيل مردود مشتريات ${retNumber}`));
     res.json({ success: true, returnId: retId, returnNumber: retNumber, status: 'posted', message: 'تم ترحيل واعتماد مردود المشتريات بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -4893,8 +4895,8 @@ apiRouter.post('/purchases/returns', requireAuth, (req: AuthenticatedRequest, re
 });
 
 // Edit Draft Purchase Return
-apiRouter.put('/purchases/returns/:id', requireAuth, requirePermission('purchase_returns.edit_draft'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM purchase_returns WHERE id = ?').get(req.params.id) as any;
+apiRouter.put('/purchases/returns/:id', requireAuth, requirePermission('purchase_returns.edit_draft'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM purchase_returns WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'مردود المشتريات غير موجود.' });
 
   if (target.status !== 'draft') {
@@ -4919,21 +4921,21 @@ apiRouter.put('/purchases/returns/:id', requireAuth, requirePermission('purchase
     for (const it of items) {
       let origLine: any = null;
       if (it.originalInvoiceItemId || it.origLineId) {
-        origLine = db.prepare(`
+        origLine = (await db.prepare(`
           SELECT pii.*, i.name_ar as item_name, i.item_type
           FROM purchase_invoice_items pii
           JOIN items i ON pii.item_id = i.id
           WHERE pii.id = ? AND pii.invoice_id = ?
-        `).get(it.originalInvoiceItemId || it.origLineId, target.original_invoice_id);
+        `).get(it.originalInvoiceItemId || it.origLineId, target.original_invoice_id));
       }
       if (!origLine) {
-        origLine = db.prepare(`
+        origLine = (await db.prepare(`
           SELECT pii.*, i.name_ar as item_name, i.item_type
           FROM purchase_invoice_items pii
           JOIN items i ON pii.item_id = i.id
           WHERE pii.invoice_id = ? AND pii.item_id = ?
           LIMIT 1
-        `).get(target.original_invoice_id, it.itemId);
+        `).get(target.original_invoice_id, it.itemId));
       }
 
       if (!origLine) throw new Error(`الصنف ${it.itemId} غير مسجل بالفاتورة الأصلية.`);
@@ -4976,8 +4978,8 @@ apiRouter.put('/purchases/returns/:id', requireAuth, requirePermission('purchase
     const totalWht = subtotal.times(0.01);
     const netReturnAmount = subtotal.plus(totalVat).minus(totalWht);
 
-    db.transaction(() => {
-      db.prepare(`
+    (await db.transaction(async () => {
+      (await db.prepare(`
         UPDATE purchase_returns
         SET return_date = COALESCE(?, return_date),
             subtotal = ?,
@@ -4989,22 +4991,22 @@ apiRouter.put('/purchases/returns/:id', requireAuth, requirePermission('purchase
       `).run(
         returnDate || null, subtotal.toNumber(), totalVat.toNumber(),
         totalWht.toNumber(), netReturnAmount.toNumber(), notes || null, target.id
-      );
+      ));
 
-      db.prepare('DELETE FROM purchase_return_items WHERE return_id = ?').run(target.id);
+      (await db.prepare('DELETE FROM purchase_return_items WHERE return_id = ?').run(target.id));
       for (const it of validatedItems) {
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO purchase_return_items (
             id, return_id, original_invoice_item_id, item_id, quantity, unit_price, tax_rate, tax_amount, total_amount
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           `pri_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           target.id, it.origLineId, it.itemId, it.quantity, it.unitPrice, it.taxRate, it.taxAmount, it.totalAmount
-        );
+        ));
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'UPDATE_DRAFT_PURCHASE_RETURN', 'purchase_returns', target.id, `تعديل مسودة مردود مشتريات ${target.return_number}`);
+    (await logAudit(req.user!.id, 'UPDATE_DRAFT_PURCHASE_RETURN', 'purchase_returns', target.id, `تعديل مسودة مردود مشتريات ${target.return_number}`));
     res.json({ success: true, message: 'تم تحديث مسودة مردود المشتريات بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -5012,8 +5014,8 @@ apiRouter.put('/purchases/returns/:id', requireAuth, requirePermission('purchase
 });
 
 // Delete Draft Purchase Return
-apiRouter.delete('/purchases/returns/:id', requireAuth, requirePermission('purchase_returns.delete_draft'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM purchase_returns WHERE id = ?').get(req.params.id) as any;
+apiRouter.delete('/purchases/returns/:id', requireAuth, requirePermission('purchase_returns.delete_draft'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM purchase_returns WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'مردود المشتريات غير موجود.' });
 
   if (target.status !== 'draft') {
@@ -5025,12 +5027,12 @@ apiRouter.delete('/purchases/returns/:id', requireAuth, requirePermission('purch
   }
 
   try {
-    db.transaction(() => {
-      db.prepare('DELETE FROM purchase_return_items WHERE return_id = ?').run(target.id);
-      db.prepare('DELETE FROM purchase_returns WHERE id = ?').run(target.id);
-    })();
+    (await db.transaction(async () => {
+      (await db.prepare('DELETE FROM purchase_return_items WHERE return_id = ?').run(target.id));
+      (await db.prepare('DELETE FROM purchase_returns WHERE id = ?').run(target.id));
+    })());
 
-    logAudit(req.user!.id, 'DELETE_DRAFT_PURCHASE_RETURN', 'purchase_returns', target.id, `حذف مسودة مردود مشتريات ${target.return_number}`);
+    (await logAudit(req.user!.id, 'DELETE_DRAFT_PURCHASE_RETURN', 'purchase_returns', target.id, `حذف مسودة مردود مشتريات ${target.return_number}`));
     res.json({ success: true, message: `تم حذف مسودة مردود المشتريات "${target.return_number}" بنجاح.` });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -5038,8 +5040,8 @@ apiRouter.delete('/purchases/returns/:id', requireAuth, requirePermission('purch
 });
 
 // Post Draft Purchase Return
-apiRouter.post('/purchases/returns/:id/post', requireAuth, requirePermission('purchase_returns.post'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM purchase_returns WHERE id = ?').get(req.params.id) as any;
+apiRouter.post('/purchases/returns/:id/post', requireAuth, requirePermission('purchase_returns.post'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM purchase_returns WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'مردود المشتريات غير موجود.' });
 
   if (target.status !== 'draft') {
@@ -5050,32 +5052,32 @@ apiRouter.post('/purchases/returns/:id/post', requireAuth, requirePermission('pu
     return res.status(403).json({ error: 'الفرع التابع له مردود المشتريات خارج نطاق الفروع المصرح لك بها.' });
   }
 
-  const items = db.prepare(`
+  const items = (await db.prepare(`
     SELECT pri.*, i.item_type
     FROM purchase_return_items pri
     JOIN items i ON pri.item_id = i.id
     WHERE pri.return_id = ?
-  `).all(target.id) as any[];
+  `).all(target.id)) as any[];
 
   if (!items || items.length === 0) {
     return res.status(400).json({ error: 'لا يمكن ترحيل مردود مشتريات بدون بنود.' });
   }
 
-  const origInv = db.prepare('SELECT * FROM purchase_invoices WHERE id = ?').get(target.original_invoice_id) as any;
+  const origInv = (await db.prepare('SELECT * FROM purchase_invoices WHERE id = ?').get(target.original_invoice_id)) as any;
   if (!origInv) return res.status(404).json({ error: 'فاتورة الشراء الأصلية غير موجودة.' });
 
   try {
-    const period = getFiscalPeriodForDate(target.return_date);
-    const postedNumber = getNextDocumentNumber('PR', target.branch_id, period.fiscal_year_id);
+    const period = (await getFiscalPeriodForDate(target.return_date));
+    const postedNumber = (await getNextDocumentNumber('PR', target.branch_id, period.fiscal_year_id));
 
     // Verify stock and remaining returnable quantity per line
     for (const it of items) {
       let origLine: any = null;
       if (it.original_invoice_item_id) {
-        origLine = db.prepare('SELECT id, quantity, returned_quantity FROM purchase_invoice_items WHERE id = ?').get(it.original_invoice_item_id) as any;
+        origLine = (await db.prepare('SELECT id, quantity, returned_quantity FROM purchase_invoice_items WHERE id = ?').get(it.original_invoice_item_id)) as any;
       }
       if (!origLine) {
-        origLine = db.prepare('SELECT id, quantity, returned_quantity FROM purchase_invoice_items WHERE invoice_id = ? AND item_id = ? LIMIT 1').get(target.original_invoice_id, it.item_id) as any;
+        origLine = (await db.prepare('SELECT id, quantity, returned_quantity FROM purchase_invoice_items WHERE invoice_id = ? AND item_id = ? LIMIT 1').get(target.original_invoice_id, it.item_id)) as any;
       }
       if (!origLine) throw new Error(`الصنف ${it.item_id} غير موجود بالفاتورة الأصلية.`);
 
@@ -5085,7 +5087,7 @@ apiRouter.post('/purchases/returns/:id/post', requireAuth, requirePermission('pu
       }
 
       if (it.item_type === 'stock') {
-        const stockRow = db.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(target.warehouse_id, it.item_id) as any;
+        const stockRow = (await db.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(target.warehouse_id, it.item_id)) as any;
         const currentStock = stockRow ? stockRow.quantity : 0;
         if (currentStock < it.quantity) {
           throw new Error(`رصيد المخزن الحالي (${currentStock}) غير كافٍ لإرجاع كمية (${it.quantity}) للمورد.`);
@@ -5093,11 +5095,11 @@ apiRouter.post('/purchases/returns/:id/post', requireAuth, requirePermission('pu
       }
     }
 
-    db.transaction(() => {
+    (await db.transaction(async () => {
       const isAlex = target.branch_id === 'br_alex';
       const inventoryAccount = isAlex ? 'acc_1142' : 'acc_1141';
 
-      const journalResult = postJournalEntry({
+      const journalResult = (await postJournalEntry({
         docType: 'PUR_RET',
         docId: target.id,
         docNumber: postedNumber,
@@ -5113,48 +5115,48 @@ apiRouter.post('/purchases/returns/:id/post', requireAuth, requirePermission('pu
           { accountId: inventoryAccount, debit: 0, credit: target.subtotal, description: `خصم مخزون بضاعة مرتجعة للمورد ${postedNumber}` },
           { accountId: 'acc_1151', debit: 0, credit: target.tax_amount, description: `عكس ضريبة مدخلات مشتريات ${postedNumber}` }
         ]
-      });
+      }));
 
-      db.prepare(`
+      (await db.prepare(`
         UPDATE purchase_returns
         SET return_number = ?,
             status = 'posted',
             journal_entry_id = ?
         WHERE id = ?
-      `).run(postedNumber, journalResult.entryId, target.id);
+      `).run(postedNumber, journalResult.entryId, target.id));
 
-      db.prepare(`
+      (await db.prepare(`
         UPDATE purchase_invoices
         SET remaining_amount = MAX(0, remaining_amount - ?)
         WHERE id = ?
-      `).run(target.total_amount, target.original_invoice_id);
+      `).run(target.total_amount, target.original_invoice_id));
 
       for (const it of items) {
         if (it.original_invoice_item_id) {
-          db.prepare(`
+          (await db.prepare(`
             UPDATE purchase_invoice_items 
             SET returned_quantity = returned_quantity + ? 
             WHERE id = ?
-          `).run(it.quantity, it.original_invoice_item_id);
+          `).run(it.quantity, it.original_invoice_item_id));
         } else {
-          db.prepare(`
+          (await db.prepare(`
             UPDATE purchase_invoice_items 
             SET returned_quantity = returned_quantity + ? 
             WHERE invoice_id = ? AND item_id = ?
-          `).run(it.quantity, target.original_invoice_id, it.item_id);
+          `).run(it.quantity, target.original_invoice_id, it.item_id));
         }
 
         if (it.item_type === 'stock') {
-          db.prepare(`
+          (await db.prepare(`
             UPDATE warehouse_stock 
             SET quantity = quantity - ? 
             WHERE warehouse_id = ? AND item_id = ?
-          `).run(it.quantity, target.warehouse_id, it.item_id);
+          `).run(it.quantity, target.warehouse_id, it.item_id));
         }
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'POST_PURCHASE_RETURN', 'purchase_returns', target.id, `اعتماد وترحيل مردود المشتريات برقم ${postedNumber}`);
+    (await logAudit(req.user!.id, 'POST_PURCHASE_RETURN', 'purchase_returns', target.id, `اعتماد وترحيل مردود المشتريات برقم ${postedNumber}`));
     res.json({ success: true, returnId: target.id, returnNumber: postedNumber, message: 'تم ترحيل واعتماد مردود المشتريات بنجاح.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -5162,8 +5164,8 @@ apiRouter.post('/purchases/returns/:id/post', requireAuth, requirePermission('pu
 });
 
 // Reversal for Posted Purchase Return
-apiRouter.post('/purchases/returns/:id/reverse', requireAuth, requirePermission('purchase_returns.reverse'), (req: AuthenticatedRequest, res) => {
-  const target = db.prepare('SELECT * FROM purchase_returns WHERE id = ?').get(req.params.id) as any;
+apiRouter.post('/purchases/returns/:id/reverse', requireAuth, requirePermission('purchase_returns.reverse'), async (req: AuthenticatedRequest, res) => {
+  const target = (await db.prepare('SELECT * FROM purchase_returns WHERE id = ?').get(req.params.id)) as any;
   if (!target) return res.status(404).json({ error: 'مردود المشتريات غير موجود.' });
 
   if (target.status !== 'posted') {
@@ -5174,22 +5176,22 @@ apiRouter.post('/purchases/returns/:id/reverse', requireAuth, requirePermission(
     return res.status(403).json({ error: 'الفرع التابع له مردود المشتريات خارج نطاق الفروع المصرح لك بها.' });
   }
 
-  const items = db.prepare(`
+  const items = (await db.prepare(`
     SELECT pri.*, i.item_type
     FROM purchase_return_items pri
     JOIN items i ON pri.item_id = i.id
     WHERE pri.return_id = ?
-  `).all(target.id) as any[];
+  `).all(target.id)) as any[];
 
   try {
-    const period = getFiscalPeriodForDate(target.return_date);
-    const reversalNumber = getNextDocumentNumber('REV-PR', target.branch_id, period.fiscal_year_id);
+    const period = (await getFiscalPeriodForDate(target.return_date));
+    const reversalNumber = (await getNextDocumentNumber('REV-PR', target.branch_id, period.fiscal_year_id));
     const isAlex = target.branch_id === 'br_alex';
     const inventoryAccount = isAlex ? 'acc_1142' : 'acc_1141';
 
-    db.transaction(() => {
+    (await db.transaction(async () => {
       // Create reversal journal entry
-      const journalResult = postJournalEntry({
+      const journalResult = (await postJournalEntry({
         docType: 'REV_PR',
         docId: target.id,
         docNumber: reversalNumber,
@@ -5205,47 +5207,47 @@ apiRouter.post('/purchases/returns/:id/reverse', requireAuth, requirePermission(
           { accountId: inventoryAccount, debit: target.subtotal, credit: 0, description: `إعادة مخزون بضاعة مشتريات ${target.return_number}` },
           { accountId: 'acc_1151', debit: target.tax_amount, credit: 0, description: `إعادة ضريبة مدخلات ${target.return_number}` }
         ]
-      });
+      }));
 
-      db.prepare(`
+      (await db.prepare(`
         UPDATE purchase_returns
         SET status = 'reversed',
-            notes = COALESCE(notes || ' | ', '') || 'تم العكس بالقيد ' || ?
+            notes = CONCAT(COALESCE(CONCAT(notes, ' | '), ''), 'تم العكس بالقيد ', ?)
         WHERE id = ?
-      `).run(journalResult.entryNumber, target.id);
+      `).run(journalResult.entryNumber, target.id));
 
-      db.prepare(`
+      (await db.prepare(`
         UPDATE purchase_invoices
         SET remaining_amount = remaining_amount + ?
         WHERE id = ?
-      `).run(target.total_amount, target.original_invoice_id);
+      `).run(target.total_amount, target.original_invoice_id));
 
       for (const it of items) {
         if (it.original_invoice_item_id) {
-          db.prepare(`
+          (await db.prepare(`
             UPDATE purchase_invoice_items 
             SET returned_quantity = MAX(0, returned_quantity - ?) 
             WHERE id = ?
-          `).run(it.quantity, it.original_invoice_item_id);
+          `).run(it.quantity, it.original_invoice_item_id));
         } else {
-          db.prepare(`
+          (await db.prepare(`
             UPDATE purchase_invoice_items 
             SET returned_quantity = MAX(0, returned_quantity - ?) 
             WHERE invoice_id = ? AND item_id = ?
-          `).run(it.quantity, target.original_invoice_id, it.item_id);
+          `).run(it.quantity, target.original_invoice_id, it.item_id));
         }
 
         if (it.item_type === 'stock') {
-          db.prepare(`
+          (await db.prepare(`
             INSERT INTO warehouse_stock (warehouse_id, item_id, quantity)
             VALUES (?, ?, ?)
-            ON CONFLICT(warehouse_id, item_id) DO UPDATE SET quantity = quantity + ?
-          `).run(target.warehouse_id, it.item_id, it.quantity, it.quantity);
+            ON DUPLICATE KEY UPDATE quantity = quantity + ?
+          `).run(target.warehouse_id, it.item_id, it.quantity, it.quantity));
         }
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'REVERSE_PURCHASE_RETURN', 'purchase_returns', target.id, `عكس مردود المشتريات ${target.return_number}`);
+    (await logAudit(req.user!.id, 'REVERSE_PURCHASE_RETURN', 'purchase_returns', target.id, `عكس مردود المشتريات ${target.return_number}`));
     res.json({ success: true, message: `تم عكس مردود المشتريات "${target.return_number}" بنجاح.` });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -5255,8 +5257,8 @@ apiRouter.post('/purchases/returns/:id/reverse', requireAuth, requirePermission(
 // ----------------------------------------------------
 // 12. Treasury & Vouchers with Real Allocations
 // ----------------------------------------------------
-apiRouter.get('/treasury/vouchers', requireAuth, requirePermission('treasury.view'), (req, res) => {
-  const vouchers = db.prepare(`
+apiRouter.get('/treasury/vouchers', requireAuth, requirePermission('treasury.view'), async (req, res) => {
+  const vouchers = (await db.prepare(`
     SELECT pv.*, b.name_ar as branch_name, p.name_ar as party_name,
            cb.name_ar as cashbox_name, ba.bank_name, je.entry_number as journal_number
     FROM payment_vouchers pv
@@ -5266,13 +5268,13 @@ apiRouter.get('/treasury/vouchers', requireAuth, requirePermission('treasury.vie
     LEFT JOIN bank_accounts ba ON pv.bank_account_id = ba.id
     LEFT JOIN journal_entries je ON pv.journal_entry_id = je.id
     ORDER BY pv.voucher_date DESC, pv.voucher_number DESC
-  `).all();
+  `).all());
 
   res.json({ vouchers });
 });
 
-apiRouter.get('/treasury/vouchers/:id', requireAuth, requirePermission('treasury.view'), (req, res) => {
-  const voucher = db.prepare(`
+apiRouter.get('/treasury/vouchers/:id', requireAuth, requirePermission('treasury.view'), async (req, res) => {
+  const voucher = (await db.prepare(`
     SELECT pv.*, b.name_ar as branch_name, p.name_ar as party_name, p.code as party_code,
            cb.name_ar as cashbox_name, ba.bank_name, je.entry_number as journal_number
     FROM payment_vouchers pv
@@ -5282,11 +5284,11 @@ apiRouter.get('/treasury/vouchers/:id', requireAuth, requirePermission('treasury
     LEFT JOIN bank_accounts ba ON pv.bank_account_id = ba.id
     LEFT JOIN journal_entries je ON pv.journal_entry_id = je.id
     WHERE pv.id = ?
-  `).get(req.params.id) as any;
+  `).get(req.params.id)) as any;
 
   if (!voucher) return res.status(404).json({ error: 'السند غير موجود.' });
 
-  const allocations = db.prepare(`
+  const allocations = (await db.prepare(`
     SELECT va.*,
       CASE 
         WHEN va.invoice_type = 'sales_invoice' THEN (SELECT invoice_number FROM sales_invoices WHERE id = va.invoice_id)
@@ -5294,12 +5296,12 @@ apiRouter.get('/treasury/vouchers/:id', requireAuth, requirePermission('treasury
       END as invoice_number
     FROM voucher_allocations va
     WHERE va.voucher_id = ?
-  `).all(voucher.id);
+  `).all(voucher.id));
 
   res.json({ voucher, allocations });
 });
 
-apiRouter.post('/treasury/vouchers', requireAuth, (req: AuthenticatedRequest, res) => {
+apiRouter.post('/treasury/vouchers', requireAuth, async (req: AuthenticatedRequest, res) => {
   const { voucherType, branchId, paymentMethod, cashBoxId, bankAccountId, partyId, directAccountId, voucherDate, amount, description, allocations } = req.body;
 
   if (!voucherType || !['receipt', 'payment'].includes(voucherType)) {
@@ -5332,7 +5334,7 @@ apiRouter.post('/treasury/vouchers', requireAuth, (req: AuthenticatedRequest, re
   }
 
   const effectiveDate = voucherDate || new Date().toISOString().split('T')[0];
-  const period = getFiscalPeriodForDate(effectiveDate);
+  const period = (await getFiscalPeriodForDate(effectiveDate));
   if (period.is_closed === 1) {
     return res.status(400).json({ error: `الفترة المالية المقابلة لتاريخ السند (${effectiveDate}) مقفلة ولا يمكن الترحيل فيها.` });
   }
@@ -5343,7 +5345,7 @@ apiRouter.post('/treasury/vouchers', requireAuth, (req: AuthenticatedRequest, re
     if (!bankAccountId) {
       return res.status(400).json({ error: 'يرجى اختيار الحساب البنكي عند التحويل البنكي.' });
     }
-    const bank = db.prepare('SELECT id, account_id FROM bank_accounts WHERE id = ?').get(bankAccountId) as any;
+    const bank = (await db.prepare('SELECT id, account_id FROM bank_accounts WHERE id = ?').get(bankAccountId)) as any;
     if (!bank) return res.status(400).json({ error: 'الحساب البنكي المحدد غير موجود.' });
     treasuryAccount = bank.account_id;
   } else {
@@ -5351,7 +5353,7 @@ apiRouter.post('/treasury/vouchers', requireAuth, (req: AuthenticatedRequest, re
     if (!isCashboxAllowed(req.user, cashBoxId)) {
       return res.status(403).json({ error: 'الخزينة المحددة خارج نطاق الخزائن المصرح لك بها.' });
     }
-    const cashBox = db.prepare('SELECT id, account_id, branch_id FROM cash_boxes WHERE id = ?').get(cashBoxId) as any;
+    const cashBox = (await db.prepare('SELECT id, account_id, branch_id FROM cash_boxes WHERE id = ?').get(cashBoxId)) as any;
     if (!cashBox) return res.status(400).json({ error: 'الخزينة النقدية غير موجودة.' });
     if (cashBox.branch_id !== branchId) {
       return res.status(400).json({ error: 'الخزينة المحددة لا تتبع الفرع المختار للسند.' });
@@ -5361,7 +5363,7 @@ apiRouter.post('/treasury/vouchers', requireAuth, (req: AuthenticatedRequest, re
 
   let opposingAccount = directAccountId;
   if (partyId) {
-    const party = db.prepare('SELECT id, type, name_ar FROM parties WHERE id = ?').get(partyId) as any;
+    const party = (await db.prepare('SELECT id, type, name_ar FROM parties WHERE id = ?').get(partyId)) as any;
     if (!party) return res.status(400).json({ error: 'الطرف المحدد غير موجود.' });
     if (party.type === 'supplier') {
       opposingAccount = 'acc_2111'; // موردون
@@ -5387,7 +5389,7 @@ apiRouter.post('/treasury/vouchers', requireAuth, (req: AuthenticatedRequest, re
           if (invType !== 'sales_invoice') {
             return res.status(400).json({ error: 'سند القبض يخصص فقط لفواتير المبيعات.' });
           }
-          const inv = db.prepare('SELECT id, invoice_number, customer_id, status, remaining_amount FROM sales_invoices WHERE id = ?').get(alloc.invoiceId) as any;
+          const inv = (await db.prepare('SELECT id, invoice_number, customer_id, status, remaining_amount FROM sales_invoices WHERE id = ?').get(alloc.invoiceId)) as any;
           if (!inv) return res.status(400).json({ error: `فاتورة المبيعات (${alloc.invoiceId}) غير موجودة.` });
           if (inv.status === 'draft') return res.status(400).json({ error: `لا يمكن تخصيص السند لفاتورة مسودة (${inv.invoice_number}) غير مرحلة.` });
           if (partyId && inv.customer_id !== partyId) {
@@ -5401,7 +5403,7 @@ apiRouter.post('/treasury/vouchers', requireAuth, (req: AuthenticatedRequest, re
           if (invType !== 'purchase_invoice') {
             return res.status(400).json({ error: 'سند الصرف يخصص فقط لفواتير المشتريات.' });
           }
-          const inv = db.prepare('SELECT id, invoice_number, supplier_id, status, remaining_amount FROM purchase_invoices WHERE id = ?').get(alloc.invoiceId) as any;
+          const inv = (await db.prepare('SELECT id, invoice_number, supplier_id, status, remaining_amount FROM purchase_invoices WHERE id = ?').get(alloc.invoiceId)) as any;
           if (!inv) return res.status(400).json({ error: `فاتورة المشتريات (${alloc.invoiceId}) غير موجودة.` });
           if (inv.status === 'draft') return res.status(400).json({ error: `لا يمكن تخصيص السند لفاتورة مسودة (${inv.invoice_number}) غير مرحلة.` });
           if (partyId && inv.supplier_id !== partyId) {
@@ -5429,10 +5431,10 @@ apiRouter.post('/treasury/vouchers', requireAuth, (req: AuthenticatedRequest, re
   const unallocatedAmount = voucherAmount.minus(totalAllocated).toNumber();
   const vId = `pv_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
   const prefix = voucherType === 'receipt' ? 'RV' : 'PV';
-  const vNumber = getNextDocumentNumber(prefix, branchId, period.fiscal_year_id);
+  const vNumber = (await getNextDocumentNumber(prefix, branchId, period.fiscal_year_id));
 
   try {
-    db.transaction(() => {
+    (await db.transaction(async () => {
       // 1. Post GL Journal Entry
       const lines = voucherType === 'receipt'
         ? [
@@ -5444,7 +5446,7 @@ apiRouter.post('/treasury/vouchers', requireAuth, (req: AuthenticatedRequest, re
             { accountId: treasuryAccount, debit: 0, credit: voucherAmount.toNumber(), description: `صرف من الخزينة/البنك: ${description || ''}` }
           ];
 
-      const journalResult = postJournalEntry({
+      const journalResult = (await postJournalEntry({
         docType: voucherType === 'receipt' ? 'RCPT' : 'PYMT',
         docId: vId,
         docNumber: vNumber,
@@ -5455,10 +5457,10 @@ apiRouter.post('/treasury/vouchers', requireAuth, (req: AuthenticatedRequest, re
         description: `${voucherType === 'receipt' ? 'سند قبض' : 'سند صرف'} رقم ${vNumber}: ${description || ''}`,
         createdBy: req.user!.id,
         lines
-      });
+      }));
 
       // 2. Insert Payment Voucher Record
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO payment_vouchers (
           id, voucher_number, voucher_type, branch_id, payment_method, cash_box_id, bank_account_id,
           party_id, direct_account_id, voucher_date, amount, allocated_amount, unallocated_amount,
@@ -5468,109 +5470,109 @@ apiRouter.post('/treasury/vouchers', requireAuth, (req: AuthenticatedRequest, re
         vId, vNumber, voucherType, branchId, paymentMethod || 'cash', cashBoxId || null, bankAccountId || null,
         partyId || null, directAccountId || null, effectiveDate, voucherAmount.toNumber(), totalAllocated.toNumber(), unallocatedAmount,
         description || '', journalResult.entryId, req.user!.id
-      );
+      ));
 
       // 3. Update Cash Box or Bank Account Balance
       if (cashBoxId) {
         const delta = voucherType === 'receipt' ? voucherAmount.toNumber() : -voucherAmount.toNumber();
-        db.prepare('UPDATE cash_boxes SET current_balance = current_balance + ? WHERE id = ?').run(delta, cashBoxId);
+        (await db.prepare('UPDATE cash_boxes SET current_balance = current_balance + ? WHERE id = ?').run(delta, cashBoxId));
       } else if (bankAccountId) {
         const delta = voucherType === 'receipt' ? voucherAmount.toNumber() : -voucherAmount.toNumber();
-        db.prepare('UPDATE bank_accounts SET current_balance = current_balance + ? WHERE id = ?').run(delta, bankAccountId);
+        (await db.prepare('UPDATE bank_accounts SET current_balance = current_balance + ? WHERE id = ?').run(delta, bankAccountId));
       }
 
       // 4. Party Sub-ledger is updated via GL journal entry lines above with partyId
 
       // 5. Insert Allocations & Update Invoices
       for (const alloc of validatedAllocations) {
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO voucher_allocations (id, voucher_id, invoice_type, invoice_id, allocated_amount)
           VALUES (?, ?, ?, ?, ?)
-        `).run(`va_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, vId, alloc.invoiceType, alloc.invoiceId, alloc.amount);
+        `).run(`va_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, vId, alloc.invoiceType, alloc.invoiceId, alloc.amount));
 
         if (alloc.invoiceType === 'sales_invoice') {
-          db.prepare(`
+          (await db.prepare(`
             UPDATE sales_invoices 
             SET paid_amount = paid_amount + ?,
                 remaining_amount = MAX(remaining_amount - ?, 0),
                 status = CASE WHEN remaining_amount - ? <= 0 THEN 'paid' ELSE 'partially_paid' END
             WHERE id = ?
-          `).run(alloc.amount, alloc.amount, alloc.amount, alloc.invoiceId);
+          `).run(alloc.amount, alloc.amount, alloc.amount, alloc.invoiceId));
         } else if (alloc.invoiceType === 'purchase_invoice') {
-          db.prepare(`
+          (await db.prepare(`
             UPDATE purchase_invoices 
             SET paid_amount = paid_amount + ?,
                 remaining_amount = MAX(remaining_amount - ?, 0),
                 status = CASE WHEN remaining_amount - ? <= 0 THEN 'paid' ELSE 'partially_paid' END
             WHERE id = ?
-          `).run(alloc.amount, alloc.amount, alloc.amount, alloc.invoiceId);
+          `).run(alloc.amount, alloc.amount, alloc.amount, alloc.invoiceId));
         }
       }
-    })();
+    })());
 
-    logAudit(req.user!.id, 'CREATE_VOUCHER', 'payment_vouchers', vId, `إصدار ${voucherType === 'receipt' ? 'سند قبض' : 'سند صرف'} رقم ${vNumber}`);
+    (await logAudit(req.user!.id, 'CREATE_VOUCHER', 'payment_vouchers', vId, `إصدار ${voucherType === 'receipt' ? 'سند قبض' : 'سند صرف'} رقم ${vNumber}`));
     res.json({ success: true, voucherId: vId, voucherNumber: vNumber, message: `تم إصدار وتوثيق ${voucherType === 'receipt' ? 'سند القبض' : 'سند الصرف'} رقم ${vNumber} بنجاح.` });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-apiRouter.post('/treasury/vouchers/:id/reverse', requireAuth, requirePermission('treasury.reverse', 'reverse'), (req: AuthenticatedRequest, res) => {
-  const voucher = db.prepare('SELECT * FROM payment_vouchers WHERE id = ?').get(req.params.id) as any;
+apiRouter.post('/treasury/vouchers/:id/reverse', requireAuth, requirePermission('treasury.reverse', 'reverse'), async (req: AuthenticatedRequest, res) => {
+  const voucher = (await db.prepare('SELECT * FROM payment_vouchers WHERE id = ?').get(req.params.id)) as any;
   if (!voucher) return res.status(404).json({ error: 'السند غير موجود.' });
   if (voucher.status === 'reversed') return res.status(400).json({ error: 'السند ملغى ومعكوس بالفعل.' });
 
-  const period = getFiscalPeriodForDate(new Date().toISOString().split('T')[0]);
+  const period = (await getFiscalPeriodForDate(new Date().toISOString().split('T')[0]));
   if (period.is_closed === 1) {
     return res.status(400).json({ error: 'الفترة المالية الحالية مقفلة ولا يمكن عكس السند فيها.' });
   }
 
   try {
-    db.transaction(() => {
+    (await db.transaction(async () => {
       // 1. Reverse GL entry
       if (voucher.journal_entry_id) {
-        reverseJournalEntry(voucher.journal_entry_id, `إلغاء وعكس سند الخزينة ${voucher.voucher_number}`, req.user!.id);
+        (await reverseJournalEntry(voucher.journal_entry_id, `إلغاء وعكس سند الخزينة ${voucher.voucher_number}`, req.user!.id));
       }
 
       // 2. Reverse Cashbox/Bank balance
       const vAmount = voucher.amount;
       if (voucher.cash_box_id) {
         const delta = voucher.voucher_type === 'receipt' ? -vAmount : vAmount;
-        db.prepare('UPDATE cash_boxes SET current_balance = current_balance + ? WHERE id = ?').run(delta, voucher.cash_box_id);
+        (await db.prepare('UPDATE cash_boxes SET current_balance = current_balance + ? WHERE id = ?').run(delta, voucher.cash_box_id));
       } else if (voucher.bank_account_id) {
         const delta = voucher.voucher_type === 'receipt' ? -vAmount : vAmount;
-        db.prepare('UPDATE bank_accounts SET current_balance = current_balance + ? WHERE id = ?').run(delta, voucher.bank_account_id);
+        (await db.prepare('UPDATE bank_accounts SET current_balance = current_balance + ? WHERE id = ?').run(delta, voucher.bank_account_id));
       }
 
       // 3. Party Sub-ledger is reversed via reverseJournalEntry above with partyId
 
       // 4. Reverse Allocations on invoices
-      const allocs = db.prepare('SELECT * FROM voucher_allocations WHERE voucher_id = ?').all(voucher.id) as any[];
+      const allocs = (await db.prepare('SELECT * FROM voucher_allocations WHERE voucher_id = ?').all(voucher.id)) as any[];
       for (const a of allocs) {
         if (a.invoice_type === 'sales_invoice') {
-          db.prepare(`
+          (await db.prepare(`
             UPDATE sales_invoices
             SET paid_amount = MAX(paid_amount - ?, 0),
                 remaining_amount = remaining_amount + ?,
                 status = CASE WHEN paid_amount - ? <= 0 THEN 'posted' ELSE 'partially_paid' END
             WHERE id = ?
-          `).run(a.allocated_amount, a.allocated_amount, a.allocated_amount, a.invoice_id);
+          `).run(a.allocated_amount, a.allocated_amount, a.allocated_amount, a.invoice_id));
         } else if (a.invoice_type === 'purchase_invoice') {
-          db.prepare(`
+          (await db.prepare(`
             UPDATE purchase_invoices
             SET paid_amount = MAX(paid_amount - ?, 0),
                 remaining_amount = remaining_amount + ?,
                 status = CASE WHEN paid_amount - ? <= 0 THEN 'posted' ELSE 'partially_paid' END
             WHERE id = ?
-          `).run(a.allocated_amount, a.allocated_amount, a.allocated_amount, a.invoice_id);
+          `).run(a.allocated_amount, a.allocated_amount, a.allocated_amount, a.invoice_id));
         }
       }
 
       // 5. Mark voucher as reversed
-      db.prepare('UPDATE payment_vouchers SET status = "reversed" WHERE id = ?').run(voucher.id);
+      (await db.prepare('UPDATE payment_vouchers SET status = "reversed" WHERE id = ?').run(voucher.id));
 
-      logAudit(req.user!.id, 'REVERSE_VOUCHER', 'payment_vouchers', voucher.id, `عكس وإلغاء ${voucher.voucher_type === 'receipt' ? 'سند قبض' : 'سند صرف'} رقم ${voucher.voucher_number}`);
-    })();
+      (await logAudit(req.user!.id, 'REVERSE_VOUCHER', 'payment_vouchers', voucher.id, `عكس وإلغاء ${voucher.voucher_type === 'receipt' ? 'سند قبض' : 'سند صرف'} رقم ${voucher.voucher_number}`));
+    })());
 
     res.json({ success: true, message: `تم عكس وإلغاء السند رقم "${voucher.voucher_number}" وتحديث الأرصدة بنجاح.` });
   } catch (err: any) {
@@ -5583,7 +5585,7 @@ apiRouter.post('/treasury/vouchers/:id/reverse', requireAuth, requirePermission(
 // ----------------------------------------------------
 
 // 1. Trial Balance (Fixed Join & Status Filtering)
-apiRouter.get('/reports/trial-balance', requireAuth, requirePermission('reports.view'), (req, res) => {
+apiRouter.get('/reports/trial-balance', requireAuth, requirePermission('reports.view'), async (req, res) => {
   const fromDate = typeof req.query.fromDate === 'string' ? req.query.fromDate : null;
   const toDate = typeof req.query.toDate === 'string' ? req.query.toDate : null;
   const branchId = typeof req.query.branchId === 'string' && req.query.branchId !== 'all' ? req.query.branchId : null;
@@ -5650,7 +5652,7 @@ apiRouter.get('/reports/trial-balance', requireAuth, requirePermission('reports.
   if (toDate) params.push(toDate);
   if (branchId) params.push(branchId);
 
-  const accounts = db.prepare(query).all(...params) as any[];
+  const accounts = (await db.prepare(query).all(...params)) as any[];
 
   let totalDebit = new Decimal(0);
   let totalCredit = new Decimal(0);
@@ -5696,7 +5698,7 @@ apiRouter.get('/reports/trial-balance', requireAuth, requirePermission('reports.
 });
 
 // 2. Income Statement (Protected: requires view_profit permission)
-apiRouter.get('/reports/income-statement', requireAuth, requirePermission('reports.view'), (req: AuthenticatedRequest, res) => {
+apiRouter.get('/reports/income-statement', requireAuth, requirePermission('reports.view'), async (req: AuthenticatedRequest, res) => {
   if (req.user?.role !== 'owner' && !req.user?.permissions.includes('view_profit')) {
     return res.status(403).json({ error: 'غير مصرح لك بالاطلاع على قائمة الدخل وأرباح المنشأة.' });
   }
@@ -5709,32 +5711,32 @@ apiRouter.get('/reports/income-statement', requireAuth, requirePermission('repor
   if (fromDate) { filterSql += ' AND je.entry_date >= ?'; params.push(fromDate); }
   if (toDate) { filterSql += ' AND je.entry_date <= ?'; params.push(toDate); }
 
-  const revenues = db.prepare(`
+  const revenues = (await db.prepare(`
     SELECT a.code, a.name_ar, ROUND(SUM(jel.credit - jel.debit), 2) as amount
     FROM accounts a
     JOIN journal_entry_lines jel ON a.id = jel.account_id
     JOIN journal_entries je ON jel.entry_id = je.id
     ${filterSql} AND a.account_type = 'revenue'
     GROUP BY a.id
-  `).all(...params) as any[];
+  `).all(...params)) as any[];
 
-  const cogs = db.prepare(`
+  const cogs = (await db.prepare(`
     SELECT a.code, a.name_ar, ROUND(SUM(jel.debit - jel.credit), 2) as amount
     FROM accounts a
     JOIN journal_entry_lines jel ON a.id = jel.account_id
     JOIN journal_entries je ON jel.entry_id = je.id
     ${filterSql} AND a.account_type = 'cogs'
     GROUP BY a.id
-  `).all(...params) as any[];
+  `).all(...params)) as any[];
 
-  const expenses = db.prepare(`
+  const expenses = (await db.prepare(`
     SELECT a.code, a.name_ar, ROUND(SUM(jel.debit - jel.credit), 2) as amount
     FROM accounts a
     JOIN journal_entry_lines jel ON a.id = jel.account_id
     JOIN journal_entries je ON jel.entry_id = je.id
     ${filterSql} AND a.account_type = 'expense'
     GROUP BY a.id
-  `).all(...params) as any[];
+  `).all(...params)) as any[];
 
   const totalRevenue = revenues.reduce((s, r) => s + (r.amount || 0), 0);
   const totalCogs = cogs.reduce((s, c) => s + (c.amount || 0), 0);
@@ -5755,7 +5757,7 @@ apiRouter.get('/reports/income-statement', requireAuth, requirePermission('repor
 });
 
 // 3. Balance Sheet
-apiRouter.get('/reports/balance-sheet', requireAuth, requirePermission('reports.view'), (req, res) => {
+apiRouter.get('/reports/balance-sheet', requireAuth, requirePermission('reports.view'), async (req, res) => {
   const asOfDate = typeof req.query.asOfDate === 'string' ? req.query.asOfDate : null;
   let dateFilter = "WHERE je.status = 'posted'";
   const params: any[] = [];
@@ -5764,7 +5766,7 @@ apiRouter.get('/reports/balance-sheet', requireAuth, requirePermission('reports.
     params.push(asOfDate);
   }
 
-  const assets = db.prepare(`
+  const assets = (await db.prepare(`
     SELECT a.code, a.name_ar, a.nature,
            ROUND(SUM(CASE WHEN a.nature = 'debit' THEN (jel.debit - jel.credit) ELSE (jel.credit - jel.debit) END), 2) as balance
     FROM accounts a
@@ -5773,9 +5775,9 @@ apiRouter.get('/reports/balance-sheet', requireAuth, requirePermission('reports.
     ${dateFilter} AND a.account_type = 'asset'
     GROUP BY a.id
     HAVING balance != 0
-  `).all(...params) as any[];
+  `).all(...params)) as any[];
 
-  const liabilities = db.prepare(`
+  const liabilities = (await db.prepare(`
     SELECT a.code, a.name_ar,
            ROUND(SUM(jel.credit - jel.debit), 2) as balance
     FROM accounts a
@@ -5784,9 +5786,9 @@ apiRouter.get('/reports/balance-sheet', requireAuth, requirePermission('reports.
     ${dateFilter} AND a.account_type = 'liability'
     GROUP BY a.id
     HAVING balance != 0
-  `).all(...params) as any[];
+  `).all(...params)) as any[];
 
-  const equity = db.prepare(`
+  const equity = (await db.prepare(`
     SELECT a.code, a.name_ar,
            ROUND(SUM(jel.credit - jel.debit), 2) as balance
     FROM accounts a
@@ -5795,7 +5797,7 @@ apiRouter.get('/reports/balance-sheet', requireAuth, requirePermission('reports.
     ${dateFilter} AND a.account_type = 'equity'
     GROUP BY a.id
     HAVING balance != 0
-  `).all(...params) as any[];
+  `).all(...params)) as any[];
 
   const totalAssets = assets.reduce((s, a) => s + (a.nature === 'credit' ? -a.balance : a.balance), 0);
   const totalLiabilities = liabilities.reduce((s, l) => s + l.balance, 0);
@@ -5813,7 +5815,7 @@ apiRouter.get('/reports/balance-sheet', requireAuth, requirePermission('reports.
 });
 
 // 4. Egyptian VAT Return
-apiRouter.get('/reports/vat-return', requireAuth, requirePermission('reports.view'), (req, res) => {
+apiRouter.get('/reports/vat-return', requireAuth, requirePermission('reports.view'), async (req, res) => {
   const fromDate = typeof req.query.fromDate === 'string' ? req.query.fromDate : null;
   const toDate = typeof req.query.toDate === 'string' ? req.query.toDate : null;
 
@@ -5822,26 +5824,26 @@ apiRouter.get('/reports/vat-return', requireAuth, requirePermission('reports.vie
   if (fromDate) { filter += ' AND je.entry_date >= ?'; params.push(fromDate); }
   if (toDate) { filter += ' AND je.entry_date <= ?'; params.push(toDate); }
 
-  const outputVat = db.prepare(`
+  const outputVat = (await db.prepare(`
     SELECT COALESCE(SUM(jel.credit - jel.debit), 0) as vat_amount
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
     ${filter} AND jel.account_id = 'acc_2131'
-  `).get(...params) as any;
+  `).get(...params)) as any;
 
-  const inputVat = db.prepare(`
+  const inputVat = (await db.prepare(`
     SELECT COALESCE(SUM(jel.debit - jel.credit), 0) as vat_amount
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
     ${filter} AND jel.account_id = 'acc_1151'
-  `).get(...params) as any;
+  `).get(...params)) as any;
 
-  const wht = db.prepare(`
+  const wht = (await db.prepare(`
     SELECT COALESCE(SUM(jel.debit - jel.credit), 0) as wht_amount
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
     ${filter} AND jel.account_id = 'acc_1152'
-  `).get(...params) as any;
+  `).get(...params)) as any;
 
   const netVatPayable = (outputVat.vat_amount || 0) - (inputVat.vat_amount || 0);
 
@@ -5858,15 +5860,15 @@ apiRouter.get('/reports/vat-return', requireAuth, requirePermission('reports.vie
 // ----------------------------------------------------
 // 14. Egyptian Tax Authority (ETA) Sandbox Simulation
 // ----------------------------------------------------
-apiRouter.post('/eta/simulate-submission/:invoiceId', requireAuth, (req: AuthenticatedRequest, res) => {
-  const inv = db.prepare(`
+apiRouter.post('/eta/simulate-submission/:invoiceId', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const inv = (await db.prepare(`
     SELECT si.*, p.name_ar as customer_name, p.tax_id as customer_tax, p.commercial_registry,
            c.tax_id as issuer_tax, c.legal_name as issuer_name
     FROM sales_invoices si
     JOIN parties p ON si.customer_id = p.id
     JOIN companies c ON 1=1
     WHERE si.id = ?
-  `).get(req.params.invoiceId) as any;
+  `).get(req.params.invoiceId)) as any;
 
   if (!inv) return res.status(404).json({ error: 'الفاتورة غير موجودة' });
 
@@ -5888,19 +5890,19 @@ apiRouter.post('/eta/simulate-submission/:invoiceId', requireAuth, (req: Authent
   const hash = crypto.createHash('sha256').update(docPayload).digest('hex');
 
   // Clearly mark as Simulated Acceptance (not real production approval)
-  db.prepare(`
+  (await db.prepare(`
     UPDATE sales_invoices 
     SET eta_status = 'SimulationAccepted', eta_uuid = ?, eta_submission_id = ?
     WHERE id = ?
-  `).run(submissionUuid, submissionUuid, inv.id);
+  `).run(submissionUuid, submissionUuid, inv.id));
 
-  db.prepare(`
+  (await db.prepare(`
     INSERT INTO eta_submissions (
       id, invoice_id, submission_uuid, eta_document_id, status, eta_code, hash_signature, json_payload
     ) VALUES (?, ?, ?, ?, 'SimulationAccepted', 'SIM_200_VALID', ?, ?)
-  `).run(`eta_${Date.now()}`, inv.id, submissionUuid, `ETA-SIM-${inv.invoice_number}`, hash, docPayload);
+  `).run(`eta_${Date.now()}`, inv.id, submissionUuid, `ETA-SIM-${inv.invoice_number}`, hash, docPayload));
 
-  logAudit(req.user!.id, 'ETA_SIMULATION', 'sales_invoices', inv.id, `محاكاة التحقق من الفاتورة إلكترونياً بنجاح: ${inv.invoice_number}`);
+  (await logAudit(req.user!.id, 'ETA_SIMULATION', 'sales_invoices', inv.id, `محاكاة التحقق من الفاتورة إلكترونياً بنجاح: ${inv.invoice_number}`));
 
   res.json({
     success: true,
@@ -5914,10 +5916,10 @@ apiRouter.post('/eta/simulate-submission/:invoiceId', requireAuth, (req: Authent
 // ----------------------------------------------------
 // 15. Automated Acceptance Test Runner (Isolated Test DB Only!)
 // ----------------------------------------------------
-apiRouter.post('/tests/run', requireAuth, requirePermission('manage_settings'), (req: AuthenticatedRequest, res) => {
+apiRouter.post('/tests/run', requireAuth, requirePermission('manage_settings'), async (req: AuthenticatedRequest, res) => {
   try {
     // Run tests exclusively in an isolated database environment!
-    const testResults = runAllFinancialTests();
+    const testResults = (await runAllFinancialTests());
     res.json(testResults);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -5927,14 +5929,14 @@ apiRouter.post('/tests/run', requireAuth, requirePermission('manage_settings'), 
 // ----------------------------------------------------
 // 16. Immutable Audit Logs
 // ----------------------------------------------------
-apiRouter.get('/audit-logs', requireAuth, (req, res) => {
-  const logs = db.prepare(`
+apiRouter.get('/audit-logs', requireAuth, async (req, res) => {
+  const logs = (await db.prepare(`
     SELECT al.*, u.display_name, u.username
     FROM audit_logs al
     LEFT JOIN users u ON al.user_id = u.id
     ORDER BY al.created_at DESC
     LIMIT 100
-  `).all();
+  `).all());
 
   res.json({ logs });
 });

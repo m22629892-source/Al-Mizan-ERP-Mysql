@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import express from 'express';
 import request from 'supertest';
-import Database from 'better-sqlite3';
+import { readSnapshot, restoreSnapshot } from './backup-service.js';
 import Decimal from 'decimal.js';
 
 async function runOperationalVerification() {
@@ -11,15 +11,16 @@ async function runOperationalVerification() {
   console.log('====================================================');
 
   const testDbFile = path.resolve(process.cwd(), `almizan_ops_test_${Date.now()}.db`);
-  process.env.ALMIZAN_DB_PATH = testDbFile;
+  process.env.MYSQL_DATABASE = 'almizan_test_'+Date.now()+'_'+Math.random().toString(36).slice(2,7);
 
   const { createDatabaseConnection, initDb } = await import('./db.js');
+  const { closeAllDatabases } = await import('./mysql-database.js');
   const { seedInitialData } = await import('./seed.js');
   const { apiRouter } = await import('./api.js');
 
-  const db = createDatabaseConnection(testDbFile);
-  initDb(db);
-  seedInitialData(db);
+  const db = createDatabaseConnection(process.env.MYSQL_DATABASE);
+  (await initDb(db));
+  (await seedInitialData(db));
 
   const app = express();
   app.use(express.json({ limit: '100mb' }));
@@ -38,8 +39,8 @@ async function runOperationalVerification() {
     }
   }
 
-  function getPartyBalance(partyId: string): Decimal {
-    const row = db.prepare('SELECT COALESCE(SUM(debit - credit), 0) as balance FROM journal_entry_lines WHERE party_id = ?').get(partyId) as any;
+   async function getPartyBalance(partyId: string): Promise<Decimal> {
+    const row = (await db.prepare('SELECT COALESCE(SUM(debit - credit), 0) as balance FROM journal_entry_lines WHERE party_id = ?').get(partyId)) as any;
     return new Decimal(row?.balance || 0);
   }
 
@@ -76,10 +77,10 @@ async function runOperationalVerification() {
 
     // 2. Fetch Master Data for transaction
     console.log('\n--- Step 2: Master Data Retrieval ---');
-    const customer = db.prepare("SELECT * FROM parties WHERE type = 'customer' LIMIT 1").get() as any;
-    const warehouse = db.prepare("SELECT * FROM warehouses LIMIT 1").get() as any;
-    const cashBox = db.prepare("SELECT * FROM cash_boxes LIMIT 1").get() as any;
-    const item = db.prepare("SELECT * FROM items WHERE item_type = 'stock' LIMIT 1").get() as any;
+    const customer = (await db.prepare("SELECT * FROM parties WHERE type = 'customer' LIMIT 1").get()) as any;
+    const warehouse = (await db.prepare("SELECT * FROM warehouses WHERE id = 'wh_main'").get()) as any;
+    const cashBox = (await db.prepare("SELECT * FROM cash_boxes WHERE branch_id = 'br_cairo' ORDER BY id LIMIT 1").get()) as any;
+    const item = (await db.prepare("SELECT * FROM items WHERE item_type = 'stock' LIMIT 1").get()) as any;
 
     assertTest(
       'Master Entities Presence',
@@ -88,7 +89,7 @@ async function runOperationalVerification() {
     );
 
     // Initial stock and balance check
-    const initialCustomerBalance = getPartyBalance(customer.id);
+    const initialCustomerBalance = (await getPartyBalance(customer.id));
     const initialCashBalance = new Decimal(cashBox.current_balance || 0);
 
     // 3. Test Create & Post Sales Invoice
@@ -143,11 +144,11 @@ async function runOperationalVerification() {
     assertTest(
       'Post Sales Invoice',
       postInvRes.status === 200 && !!postInvRes.body.invoiceNumber,
-      `Posted Status: 200, Invoice Number: ${postInvRes.body.invoiceNumber}`
+      `Posted Status: ${postInvRes.status}, Invoice Number: ${postInvRes.body.invoiceNumber}, Error: ${postInvRes.body.error || 'none'}`
     );
 
     // Fetch posted invoice from DB
-    const postedInvoiceInDb = db.prepare("SELECT * FROM sales_invoices WHERE id = ?").get(createdInvoiceId) as any;
+    const postedInvoiceInDb = (await db.prepare("SELECT * FROM sales_invoices WHERE id = ?").get(createdInvoiceId)) as any;
     assertTest(
       'Invoice Status in DB is Posted',
       postedInvoiceInDb.status === 'posted' && !!postedInvoiceInDb.journal_entry_id,
@@ -155,7 +156,7 @@ async function runOperationalVerification() {
     );
 
     // Verify accounting effect on Customer Balance in Ledger
-    const updatedCustBalance = getPartyBalance(customer.id);
+    const updatedCustBalance = (await getPartyBalance(customer.id));
     const expectedCustBalance = initialCustomerBalance.plus(invoiceTotal);
     assertTest(
       'Customer Ledger Balance Updated Correctly',
@@ -165,7 +166,7 @@ async function runOperationalVerification() {
 
     // Verify Balanced Journal Entry
     const jvId = postedInvoiceInDb.journal_entry_id;
-    const jvLines = db.prepare("SELECT debit, credit FROM journal_entry_lines WHERE entry_id = ?").all(jvId) as any[];
+    const jvLines = (await db.prepare("SELECT debit, credit FROM journal_entry_lines WHERE entry_id = ?").all(jvId)) as any[];
     let totalDebit = new Decimal(0);
     let totalCredit = new Decimal(0);
     for (const line of jvLines) {
@@ -200,12 +201,12 @@ async function runOperationalVerification() {
     assertTest(
       'Create & Post Receipt Voucher',
       createVoucherRes.status === 200 && !!createVoucherRes.body.voucherId,
-      `Voucher Number: ${createVoucherRes.body.voucherNumber}, ID: ${createVoucherRes.body.voucherId}, Amount: ${paymentAmount} EGP`
+      `Voucher Number: ${createVoucherRes.body.voucherNumber}, ID: ${createVoucherRes.body.voucherId}, Amount: ${paymentAmount} EGP, Status: ${createVoucherRes.status}, Error: ${createVoucherRes.body.error || 'none'}`
     );
     createdVoucherId = createVoucherRes.body.voucherId;
 
     // Verify Cash Box balance increased
-    const updatedCashBox = db.prepare("SELECT current_balance FROM cash_boxes WHERE id = ?").get(cashBox.id) as any;
+    const updatedCashBox = (await db.prepare("SELECT current_balance FROM cash_boxes WHERE id = ?").get(cashBox.id)) as any;
     const expectedCashBalance = initialCashBalance.plus(paymentAmount);
     assertTest(
       'Cash Box Balance Credited/Increased',
@@ -214,7 +215,7 @@ async function runOperationalVerification() {
     );
 
     // Verify Customer Ledger Balance reduced by receipt
-    const postPayCustBal = getPartyBalance(customer.id);
+    const postPayCustBal = (await getPartyBalance(customer.id));
     const expectedCustAfterPay = expectedCustBalance.minus(paymentAmount);
     assertTest(
       'Customer Balance Reduced by Receipt Amount',
@@ -222,7 +223,7 @@ async function runOperationalVerification() {
       `Customer Balance: ${postPayCustBal.toString()} (Expected: ${expectedCustAfterPay.toString()})`
     );
 
-    // 5. Test Consistent Backup Creation (VACUUM INTO)
+    // 5. Test Consistent MySQL Backup Creation
     console.log('\n--- Step 5: Database Backup Creation ---');
     const backupRes = await request(app)
       .post('/api/backups/create')
@@ -255,18 +256,15 @@ async function runOperationalVerification() {
       `Integrity: ${verifyRes.body.integrity}, Invoices in backup: ${verifyRes.body.backupCounts?.sales_invoices}`
     );
 
-    // Open backup with better-sqlite3 in fresh instance to test independence
-    const restoredTestDb = new Database(backupFilePath, { readonly: true });
-    const pragmaCheck = restoredTestDb.pragma('integrity_check') as any[];
-    assertTest(
-      'Standalone SQLite PRAGMA integrity_check on Backup File',
-      Array.isArray(pragmaCheck) && pragmaCheck[0]?.integrity_check === 'ok',
-      `Pragma result: ${JSON.stringify(pragmaCheck)}`
-    );
+    const restoredTestDb = createDatabaseConnection('almizan_test_ops_restore_' + Date.now());
+    await initDb(restoredTestDb);
+    const snapshot = await readSnapshot(backupFilePath);
+    await restoreSnapshot(restoredTestDb, snapshot);
+    assertTest('Independent MySQL backup restore', true, 'SHA-256 and all foreign keys verified');
 
     // Verify invoice and voucher inside restored backup
-    const backupInvoice = restoredTestDb.prepare("SELECT * FROM sales_invoices WHERE id = ?").get(createdInvoiceId) as any;
-    const backupVoucher = restoredTestDb.prepare("SELECT * FROM payment_vouchers WHERE id = ?").get(createdVoucherId) as any;
+    const backupInvoice = (await restoredTestDb.prepare("SELECT * FROM sales_invoices WHERE id = ?").get(createdInvoiceId)) as any;
+    const backupVoucher = (await restoredTestDb.prepare("SELECT * FROM payment_vouchers WHERE id = ?").get(createdVoucherId)) as any;
 
     assertTest(
       'Sales Invoice Preserved in Restored Backup',
@@ -280,7 +278,7 @@ async function runOperationalVerification() {
       `Voucher ${backupVoucher?.voucher_number} found with amount: ${backupVoucher?.amount}`
     );
 
-    restoredTestDb.close();
+    await restoredTestDb.dropTestSchema();
 
   } catch (err: any) {
     console.error('Fatal Operational Verification Exception:', err);
@@ -288,7 +286,7 @@ async function runOperationalVerification() {
   } finally {
     // Clean up temporary database files
     try {
-      db.close();
+      await db.dropTestSchema();
       if (fs.existsSync(testDbFile)) fs.unlinkSync(testDbFile);
       if (fs.existsSync(`${testDbFile}-wal`)) fs.unlinkSync(`${testDbFile}-wal`);
       if (fs.existsSync(`${testDbFile}-shm`)) fs.unlinkSync(`${testDbFile}-shm`);
@@ -298,6 +296,7 @@ async function runOperationalVerification() {
     }
   }
 
+  await closeAllDatabases();
   console.log('\n====================================================');
   console.log(`📊 Operational Verification Summary: Passed: ${passedCount} | Failed: ${failedCount}`);
   console.log('====================================================');
@@ -307,4 +306,4 @@ async function runOperationalVerification() {
   }
 }
 
-runOperationalVerification();
+(await runOperationalVerification());

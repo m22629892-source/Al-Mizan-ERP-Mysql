@@ -129,7 +129,7 @@ export const BackupRestoreView: React.FC<BackupRestoreViewProps> = ({ currentUse
           <div>
             <h1 className="text-xl font-bold text-slate-900">النسخ الاحتياطي المتسق والاستعادة</h1>
             <p className="text-xs text-slate-500 mt-1">
-              آلية النسخ الاحتياطي المتسقة (SQLite WAL Consistent Backup) مع فحص السلامة والاستعادة الآمنة بنسخة وقائية مسبقة.
+              نسخ احتياطي متسق لقاعدة MySQL مع فحص SHA-256 واستعادة آمنة بنسخة وقائية مسبقة.
             </p>
           </div>
         </div>
