@@ -1,4 +1,5 @@
-import { Router, Response } from 'express';
+import { Router } from '../mysql-router.js';
+import { Response } from 'express';
 import Decimal from 'decimal.js';
 import * as XLSX from 'xlsx';
 import { db } from '../db.js';
@@ -79,7 +80,7 @@ export interface RowError {
 /**
  * Preview and Validate Uploaded Import File
  */
-importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'), (req: AuthenticatedRequest, res: Response) => {
+importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'), async (req: AuthenticatedRequest, res: Response) => {
   const { importType, base64Data, jsonRows } = req.body;
 
   if (!importType) {
@@ -107,7 +108,7 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
       const rows = parsedSheets['دليل الحسابات'] || parsedSheets['default'] || Object.values(parsedSheets)[0] || [];
       const seenCodes = new Set<string>();
 
-      rows.forEach((row, idx) => {
+      (await Promise.all(rows.map(async (row, idx) => {
         const rowNo = idx + 2; // header is row 1
         const code = String(row['كود الحساب'] || row.code || '').trim();
         const nameAr = String(row['اسم الحساب بالعربي'] || row.name_ar || '').trim();
@@ -121,7 +122,7 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
           errors.push({ rowNumber: rowNo, column: 'كود الحساب', value: code, errorReason: 'كود الحساب مكرر داخل نفس الملف.' });
         } else {
           seenCodes.add(code);
-          const existing = db.prepare('SELECT id FROM accounts WHERE code = ?').get(code);
+          const existing = (await db.prepare('SELECT id FROM accounts WHERE code = ?').get(code));
           if (existing) {
             errors.push({ rowNumber: rowNo, column: 'كود الحساب', value: code, errorReason: 'كود الحساب موجود مسبقاً بدليل الحسابات في النظام.' });
           }
@@ -140,18 +141,18 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
         }
 
         if (parentCode) {
-          const parentExists = db.prepare('SELECT id FROM accounts WHERE code = ?').get(String(parentCode).trim());
+          const parentExists = (await db.prepare('SELECT id FROM accounts WHERE code = ?').get(String(parentCode).trim()));
           if (!parentExists && !seenCodes.has(String(parentCode).trim())) {
             errors.push({ rowNumber: rowNo, column: 'كود حساب الأب', value: parentCode, errorReason: 'حساب الأب غير موجود في دليل الحسابات ولا في الملف.' });
           }
         }
-      });
+      })));
       validRowsCount = rows.length - errors.length;
     } else if (importType === 'parties') {
       const rows = parsedSheets['العملاء والموردون'] || parsedSheets['default'] || Object.values(parsedSheets)[0] || [];
       const seenCodes = new Set<string>();
 
-      rows.forEach((row, idx) => {
+      (await Promise.all(rows.map(async (row, idx) => {
         const rowNo = idx + 2;
         const code = String(row['كود الطرف'] || row.code || '').trim();
         const type = String(row['النوع (customer/supplier)'] || row.type || '').trim().toLowerCase();
@@ -163,7 +164,7 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
           errors.push({ rowNumber: rowNo, column: 'كود الطرف', value: code, errorReason: 'كود الطرف مكرر بالملف.' });
         } else {
           seenCodes.add(code);
-          const existing = db.prepare('SELECT id FROM parties WHERE code = ?').get(code);
+          const existing = (await db.prepare('SELECT id FROM parties WHERE code = ?').get(code));
           if (existing) {
             errors.push({ rowNumber: rowNo, column: 'كود الطرف', value: code, errorReason: 'كود الطرف مسجل مسبقاً بالنظام.' });
           }
@@ -176,13 +177,13 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
         if (!nameAr) {
           errors.push({ rowNumber: rowNo, column: 'الاسم بالعربي', value: nameAr, errorReason: 'الاسم بالعربي إجباري.' });
         }
-      });
+      })));
       validRowsCount = rows.length - errors.length;
     } else if (importType === 'items') {
       const rows = parsedSheets['الأصناف والمخزون'] || parsedSheets['default'] || Object.values(parsedSheets)[0] || [];
       const seenCodes = new Set<string>();
 
-      rows.forEach((row, idx) => {
+      (await Promise.all(rows.map(async (row, idx) => {
         const rowNo = idx + 2;
         const code = String(row['كود الصنف'] || row.code || '').trim();
         const nameAr = String(row['اسم الصنف بالعربي'] || row.name_ar || '').trim();
@@ -196,7 +197,7 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
           errors.push({ rowNumber: rowNo, column: 'كود الصنف', value: code, errorReason: 'كود الصنف مكرر بالملف.' });
         } else {
           seenCodes.add(code);
-          const existing = db.prepare('SELECT id FROM items WHERE code = ?').get(code);
+          const existing = (await db.prepare('SELECT id FROM items WHERE code = ?').get(code));
           if (existing) {
             errors.push({ rowNumber: rowNo, column: 'كود الصنف', value: code, errorReason: 'كود الصنف مسجل مسبقاً بالنظام.' });
           }
@@ -216,7 +217,7 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
         if (salePrice < 0) {
           errors.push({ rowNumber: rowNo, column: 'سعر البيع', value: salePrice, errorReason: 'سعر البيع لا يمكن أن يكون سالباً.' });
         }
-      });
+      })));
       validRowsCount = rows.length - errors.length;
     } else if (importType === 'opening_balances') {
       const glRows = parsedSheets['الأستاذ العام'] || [];
@@ -228,7 +229,7 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
       let totalCredit = new Decimal(0);
 
       // Validate GL Accounts Rows
-      glRows.forEach((row, idx) => {
+      (await Promise.all(glRows.map(async (row, idx) => {
         const rowNo = idx + 2;
         const code = String(row['كود الحساب'] || '').trim();
         const d = new Decimal(row['رصيد مدين'] || 0);
@@ -237,7 +238,7 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
         if (!code) {
           errors.push({ sheetName: 'الأستاذ العام', rowNumber: rowNo, column: 'كود الحساب', value: code, errorReason: 'كود الحساب إجباري.' });
         } else {
-          const acc = db.prepare('SELECT id, is_group, is_active FROM accounts WHERE code = ?').get(code) as any;
+          const acc = (await db.prepare('SELECT id, is_group, is_active FROM accounts WHERE code = ?').get(code)) as any;
           if (!acc) {
             errors.push({ sheetName: 'الأستاذ العام', rowNumber: rowNo, column: 'كود الحساب', value: code, errorReason: 'الحساب غير موجود بدليل الحسابات.' });
           } else if (acc.is_group === 1) {
@@ -254,7 +255,7 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
 
         totalDebit = totalDebit.plus(d);
         totalCredit = totalCredit.plus(c);
-      });
+      })));
 
       // Strict Financial Invariant: Opening Entry Must Balance!
       const glDiff = totalDebit.minus(totalCredit).abs();
@@ -270,18 +271,18 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
 
       // Reconcile Customer Subledger Details with Customer Control Account (acc_1121)
       let custDetailsTotal = new Decimal(0);
-      custRows.forEach((row, idx) => {
+      (await Promise.all(custRows.map(async (row, idx) => {
         const rowNo = idx + 2;
         const code = String(row['كود العميل'] || '').trim();
         const d = new Decimal(row['رصيد مدين'] || 0);
         const c = new Decimal(row['رصيد دائن'] || 0);
 
-        const party = db.prepare('SELECT id FROM parties WHERE code = ? AND type IN ("customer", "both")').get(code);
+        const party = (await db.prepare('SELECT id FROM parties WHERE code = ? AND type IN ("customer", "both")').get(code));
         if (!party) {
           errors.push({ sheetName: 'تفاصيل العملاء', rowNumber: rowNo, column: 'كود العميل', value: code, errorReason: 'العميل غير مسجل في بطاقات العملاء.' });
         }
         custDetailsTotal = custDetailsTotal.plus(d).minus(c);
-      });
+      })));
 
       const custControlGlRow = glRows.find((r: any) => String(r['كود الحساب']).trim() === '1121');
       const custGlBalance = custControlGlRow ? new Decimal(custControlGlRow['رصيد مدين'] || 0).minus(custControlGlRow['رصيد دائن'] || 0) : new Decimal(0);
@@ -297,18 +298,18 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
 
       // Reconcile Supplier Subledger Details with Supplier Control Account (acc_2111)
       let suppDetailsTotal = new Decimal(0);
-      suppRows.forEach((row, idx) => {
+      (await Promise.all(suppRows.map(async (row, idx) => {
         const rowNo = idx + 2;
         const code = String(row['كود المورد'] || '').trim();
         const c = new Decimal(row['رصيد دائن'] || 0);
         const d = new Decimal(row['رصيد مدين'] || 0);
 
-        const party = db.prepare('SELECT id FROM parties WHERE code = ? AND type IN ("supplier", "both")').get(code);
+        const party = (await db.prepare('SELECT id FROM parties WHERE code = ? AND type IN ("supplier", "both")').get(code));
         if (!party) {
           errors.push({ sheetName: 'تفاصيل الموردين', rowNumber: rowNo, column: 'كود المورد', value: code, errorReason: 'المورد غير مسجل في بطاقات الموردين.' });
         }
         suppDetailsTotal = suppDetailsTotal.plus(c).minus(d);
-      });
+      })));
 
       const suppControlGlRow = glRows.find((r: any) => String(r['كود الحساب']).trim() === '2111');
       const suppGlBalance = suppControlGlRow ? new Decimal(suppControlGlRow['رصيد دائن'] || 0).minus(suppControlGlRow['رصيد مدين'] || 0) : new Decimal(0);
@@ -324,18 +325,18 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
 
       // Reconcile Inventory Details with Inventory GL Account (acc_1141)
       let stockDetailsTotal = new Decimal(0);
-      stockRows.forEach((row, idx) => {
+      (await Promise.all(stockRows.map(async (row, idx) => {
         const rowNo = idx + 2;
         const itmCode = String(row['كود الصنف'] || '').trim();
         const whCode = String(row['كود المخزن'] || 'WH-CAI-MAIN').trim();
         const qty = Number(row['الكمية'] || 0);
         const cost = Number(row['تكلفة الوحدة'] || 0);
 
-        const itm = db.prepare('SELECT id FROM items WHERE code = ?').get(itmCode);
+        const itm = (await db.prepare('SELECT id FROM items WHERE code = ?').get(itmCode));
         if (!itm) {
           errors.push({ sheetName: 'تفاصيل المخزون', rowNumber: rowNo, column: 'كود الصنف', value: itmCode, errorReason: 'الصنف غير مسجل في دليل الأصناف.' });
         }
-        const wh = db.prepare('SELECT id, branch_id FROM warehouses WHERE code = ?').get(whCode) as any;
+        const wh = (await db.prepare('SELECT id, branch_id FROM warehouses WHERE code = ?').get(whCode)) as any;
         if (!wh) {
           errors.push({ sheetName: 'تفاصيل المخزون', rowNumber: rowNo, column: 'كود المخزن', value: whCode, errorReason: 'المستودع المحدد غير موجود.' });
         } else {
@@ -348,7 +349,7 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
         }
 
         stockDetailsTotal = stockDetailsTotal.plus(new Decimal(qty).times(cost));
-      });
+      })));
 
       const invGlRow = glRows.find((r: any) => String(r['كود الحساب']).trim() === '1141');
       const invGlBalance = invGlRow ? new Decimal(invGlRow['رصيد مدين'] || 0) : new Decimal(0);
@@ -383,7 +384,7 @@ importExcelRouter.post('/preview', requireAuth, requirePermission('import.excel'
 /**
  * Commit Import Batch Atomically with Duplicate Check & Audit Trail
  */
-importExcelRouter.post('/commit', requireAuth, requirePermission('import.excel'), (req: AuthenticatedRequest, res: Response) => {
+importExcelRouter.post('/commit', requireAuth, requirePermission('import.excel'), async (req: AuthenticatedRequest, res: Response) => {
   const { importType, parsedSheets, filename, batchKey } = req.body;
 
   if (!importType || !parsedSheets) {
@@ -392,7 +393,7 @@ importExcelRouter.post('/commit', requireAuth, requirePermission('import.excel')
 
   // Idempotency / Duplicate Prevention Check
   const effectiveBatchKey = batchKey || `${importType}_${filename || 'import'}_${Date.now()}`;
-  const existingImport = db.prepare('SELECT id FROM excel_imports_log WHERE filename = ? AND status = "committed"').get(effectiveBatchKey);
+  const existingImport = (await db.prepare('SELECT id FROM excel_imports_log WHERE filename = ? AND status = "committed"').get(effectiveBatchKey));
   if (existingImport) {
     return res.status(400).json({ error: 'تم استيراد واعتماد هذه الدفعة مسبقاً لمنع ازدواج الأثر المالي أو تكرار السجلات.' });
   }
@@ -401,7 +402,7 @@ importExcelRouter.post('/commit', requireAuth, requirePermission('import.excel')
     let resultMessage = '';
     let committedCount = 0;
 
-    db.transaction(() => {
+    (await db.transaction(async () => {
       if (importType === 'chart_of_accounts') {
         const rows = parsedSheets['دليل الحسابات'] || parsedSheets['default'] || Object.values(parsedSheets)[0] || [];
         const insAcc = db.prepare(`
@@ -421,12 +422,12 @@ importExcelRouter.post('/commit', requireAuth, requirePermission('import.excel')
 
           let parentId = null;
           if (parentCode) {
-            const p = db.prepare('SELECT id FROM accounts WHERE code = ?').get(String(parentCode).trim()) as any;
+            const p = (await db.prepare('SELECT id FROM accounts WHERE code = ?').get(String(parentCode).trim())) as any;
             if (p) parentId = p.id;
           }
 
           const accId = `acc_${code}`;
-          insAcc.run(accId, code, nameAr, nameEn, parentId, accType, nature, isGroup, level);
+          (await insAcc.run(accId, code, nameAr, nameEn, parentId, accType, nature, isGroup, level));
           committedCount++;
         }
         resultMessage = `تم استيراد وإدراج (${committedCount}) حساباً بنجاح في دليل الحسابات.`;
@@ -450,7 +451,7 @@ importExcelRouter.post('/commit', requireAuth, requirePermission('import.excel')
           const terms = Number(row['فترة السداد بالأيام'] || row.payment_terms_days || 0);
 
           const partyId = `party_${code.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
-          insParty.run(partyId, code, type, nameAr, nameEn, taxId, cr, phone, address, creditLimit, terms);
+          (await insParty.run(partyId, code, type, nameAr, nameEn, taxId, cr, phone, address, creditLimit, terms));
           committedCount++;
         }
         resultMessage = `تم استيراد وإدراج (${committedCount}) طرفاً تجارياً (عملاء وموردين) بنجاح.`;
@@ -476,7 +477,7 @@ importExcelRouter.post('/commit', requireAuth, requirePermission('import.excel')
           const etaCode = row['كود الفاتورة الإلكترونية ETA'] || row.eta_item_code || null;
 
           const itemId = `itm_${code.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
-          insItem.run(itemId, code, barcode, nameAr, nameEn, itemType, category, unit, cost, sale, cost, taxRate, minStock, etaCode);
+          (await insItem.run(itemId, code, barcode, nameAr, nameEn, itemType, category, unit, cost, sale, cost, taxRate, minStock, etaCode));
           committedCount++;
         }
         resultMessage = `تم استيراد وإدراج (${committedCount}) صنفاً بنجاح في دليل الأصناف.`;
@@ -489,7 +490,7 @@ importExcelRouter.post('/commit', requireAuth, requirePermission('import.excel')
         // Validate branch & warehouse access for opening balances stock rows
         for (const s of stockRows) {
           const whCode = String(s['كود المخزن'] || 'WH-CAI-MAIN').trim();
-          const wh = db.prepare('SELECT id, branch_id FROM warehouses WHERE code = ?').get(whCode) as any;
+          const wh = (await db.prepare('SELECT id, branch_id FROM warehouses WHERE code = ?').get(whCode)) as any;
           if (wh) {
             if (!isWarehouseAllowed(req.user, wh.id)) {
               throw new Error(`المستودع (${whCode}) خارج نطاق صلاحياتك المخزنية.`);
@@ -501,14 +502,14 @@ importExcelRouter.post('/commit', requireAuth, requirePermission('import.excel')
         }
 
         // 1. Post Balanced Opening Journal Entry
-        const period = getFiscalPeriodForDate('2026-01-01');
+        const period = (await getFiscalPeriodForDate('2026-01-01'));
         const lines: any[] = [];
 
         for (const r of glRows) {
           const code = String(r['كود الحساب']).trim();
           const d = Number(r['رصيد مدين'] || 0);
           const c = Number(r['رصيد دائن'] || 0);
-          const acc = db.prepare('SELECT id FROM accounts WHERE code = ?').get(code) as any;
+          const acc = (await db.prepare('SELECT id FROM accounts WHERE code = ?').get(code)) as any;
           if (acc && (d > 0 || c > 0)) {
             lines.push({
               accountId: acc.id,
@@ -519,7 +520,7 @@ importExcelRouter.post('/commit', requireAuth, requirePermission('import.excel')
           }
         }
 
-        const jeResult = postJournalEntry({
+        const jeResult = (await postJournalEntry({
           docType: 'CLOSING', // Opening/Closing Balance Type
           docNumber: 'OP-2026-CAI-001',
           entryDate: '2026-01-01',
@@ -529,24 +530,24 @@ importExcelRouter.post('/commit', requireAuth, requirePermission('import.excel')
           description: 'القيد الافتتاحي العام للسنة المالية 2026 (مستورد من Excel)',
           createdBy: req.user!.id,
           lines
-        });
+        }));
 
         // 2. Link details for stock
         for (const s of stockRows) {
-          const itm = db.prepare('SELECT id FROM items WHERE code = ?').get(String(s['كود الصنف']).trim()) as any;
-          const wh = db.prepare('SELECT id FROM warehouses WHERE code = ?').get(String(s['كود المخزن'] || 'WH-CAI-MAIN').trim()) as any;
+          const itm = (await db.prepare('SELECT id FROM items WHERE code = ?').get(String(s['كود الصنف']).trim())) as any;
+          const wh = (await db.prepare('SELECT id FROM warehouses WHERE code = ?').get(String(s['كود المخزن'] || 'WH-CAI-MAIN').trim())) as any;
           const qty = Number(s['الكمية'] || 0);
           const cost = Number(s['تكلفة الوحدة'] || 0);
 
           if (itm && wh && qty > 0) {
-            db.prepare(`
+            (await db.prepare(`
               INSERT INTO warehouse_stock (warehouse_id, item_id, quantity)
               VALUES (?, ?, ?)
-              ON CONFLICT(warehouse_id, item_id) DO UPDATE SET quantity = quantity + ?
-            `).run(wh.id, itm.id, qty, qty);
+              ON DUPLICATE KEY UPDATE quantity = quantity + ?
+            `).run(wh.id, itm.id, qty, qty));
 
             // Update moving avg cost
-            db.prepare('UPDATE items SET cost_price = ?, moving_avg_cost = ? WHERE id = ?').run(cost, cost, itm.id);
+            (await db.prepare('UPDATE items SET cost_price = ?, moving_avg_cost = ? WHERE id = ?').run(cost, cost, itm.id));
           }
         }
 
@@ -556,7 +557,7 @@ importExcelRouter.post('/commit', requireAuth, requirePermission('import.excel')
 
       // Record in excel_imports_log
       const logId = `implog_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO excel_imports_log (id, import_type, filename, total_rows, valid_rows, error_rows, status, details_json, imported_by)
         VALUES (?, ?, ?, ?, ?, 0, 'committed', ?, ?)
       `).run(
@@ -567,10 +568,10 @@ importExcelRouter.post('/commit', requireAuth, requirePermission('import.excel')
         committedCount,
         JSON.stringify({ resultMessage, committedCount }),
         req.user!.id
-      );
+      ));
 
-      logAudit(req.user!.id, 'EXCEL_IMPORT_COMMIT', 'excel_imports_log', logId, resultMessage);
-    })();
+      (await logAudit(req.user!.id, 'EXCEL_IMPORT_COMMIT', 'excel_imports_log', logId, resultMessage));
+    })());
 
     res.json({
       success: true,
@@ -585,15 +586,15 @@ importExcelRouter.post('/commit', requireAuth, requirePermission('import.excel')
 /**
  * GET /history: Get past import batches
  */
-importExcelRouter.get('/history', requireAuth, requirePermission('import.excel', 'excel_import.view'), (req: AuthenticatedRequest, res: Response) => {
+importExcelRouter.get('/history', requireAuth, requirePermission('import.excel', 'excel_import.view'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const history = db.prepare(`
+    const history = (await db.prepare(`
       SELECT l.*, u.display_name as user_name
       FROM excel_imports_log l
       JOIN users u ON l.imported_by = u.id
       ORDER BY l.imported_at DESC
       LIMIT 25
-    `).all();
+    `).all());
 
     res.json({ success: true, history });
   } catch (err: any) {

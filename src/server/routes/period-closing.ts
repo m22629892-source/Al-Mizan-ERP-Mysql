@@ -1,4 +1,5 @@
-import { Router, Response } from 'express';
+import { Router } from '../mysql-router.js';
+import { Response } from 'express';
 import Decimal from 'decimal.js';
 import { db } from '../db.js';
 import { AuthenticatedRequest, requireAuth, requirePermission } from '../api.js';
@@ -10,13 +11,13 @@ export const periodClosingRouter = Router();
 /**
  * Diagnostic analysis function: runs full financial integrity and subledger reconciliation
  */
-export function runPeriodDiagnostics(periodId: string): PeriodClosingStatus {
-  const period = db.prepare(`
+export async function runPeriodDiagnostics(periodId: string): Promise<PeriodClosingStatus> {
+  const period = (await db.prepare(`
     SELECT fp.*, fy.code as year_code, fy.name_ar as year_name_ar, fy.is_closed as year_is_closed
     FROM fiscal_periods fp
     JOIN fiscal_years fy ON fp.fiscal_year_id = fy.id
     WHERE fp.id = ?
-  `).get(periodId) as any;
+  `).get(periodId)) as any;
 
   if (!period) {
     throw new Error('الفترة المالية المحددة غير موجودة في النظام.');
@@ -25,12 +26,12 @@ export function runPeriodDiagnostics(periodId: string): PeriodClosingStatus {
   const diagnostics: PeriodClosingDiagnostic[] = [];
 
   // 1. Unbalanced Journal Entries Check (Blocking)
-  const unbalancedEntries = db.prepare(`
+  const unbalancedEntries = (await db.prepare(`
     SELECT id, entry_number, entry_date, total_debit, total_credit,
            ABS(total_debit - total_credit) as diff
     FROM journal_entries
     WHERE fiscal_period_id = ? AND status = 'posted' AND ABS(total_debit - total_credit) > 0.001
-  `).all(periodId) as any[];
+  `).all(periodId)) as any[];
 
   diagnostics.push({
     key: 'unbalanced_je',
@@ -56,39 +57,39 @@ export function runPeriodDiagnostics(periodId: string): PeriodClosingStatus {
 
   // 2. Unposted Draft Documents Check (Blocking)
   // Draft Sales Invoices
-  const draftSales = db.prepare(`
+  const draftSales = (await db.prepare(`
     SELECT id, invoice_number, invoice_date, total_amount
     FROM sales_invoices
     WHERE status = 'draft' AND invoice_date BETWEEN ? AND ?
-  `).all(period.start_date, period.end_date) as any[];
+  `).all(period.start_date, period.end_date)) as any[];
 
   // Draft Purchase Invoices
-  const draftPurchases = db.prepare(`
+  const draftPurchases = (await db.prepare(`
     SELECT id, invoice_number, invoice_date, total_amount
     FROM purchase_invoices
     WHERE status = 'draft' AND invoice_date BETWEEN ? AND ?
-  `).all(period.start_date, period.end_date) as any[];
+  `).all(period.start_date, period.end_date)) as any[];
 
   // Draft Sales Returns
-  const draftSalesReturns = db.prepare(`
+  const draftSalesReturns = (await db.prepare(`
     SELECT id, return_number, return_date, total_amount
     FROM sales_returns
     WHERE status = 'draft' AND return_date BETWEEN ? AND ?
-  `).all(period.start_date, period.end_date) as any[];
+  `).all(period.start_date, period.end_date)) as any[];
 
   // Draft Purchase Returns
-  const draftPurReturns = db.prepare(`
+  const draftPurReturns = (await db.prepare(`
     SELECT id, return_number, return_date, total_amount
     FROM purchase_returns
     WHERE status = 'draft' AND return_date BETWEEN ? AND ?
-  `).all(period.start_date, period.end_date) as any[];
+  `).all(period.start_date, period.end_date)) as any[];
 
   // Draft Journal Entries
-  const draftJournals = db.prepare(`
+  const draftJournals = (await db.prepare(`
     SELECT id, entry_number, entry_date, total_debit as total_amount
     FROM journal_entries
     WHERE status = 'draft' AND fiscal_period_id = ?
-  `).all(periodId) as any[];
+  `).all(periodId)) as any[];
 
   const allDrafts = [
     ...draftSales.map(d => ({ id: d.id, number: d.invoice_number, date: d.invoice_date, amount: d.total_amount, type: 'فاتورة مبيعات مسودة' })),
@@ -115,7 +116,7 @@ export function runPeriodDiagnostics(periodId: string): PeriodClosingStatus {
   });
 
   // 3. Customer Control Account Reconciliation (acc_1121) (Blocking)
-  const custSubledgerRow = db.prepare(`
+  const custSubledgerRow = (await db.prepare(`
     SELECT COALESCE(ROUND(SUM(jel.debit - jel.credit), 2), 0) as subledger_total
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
@@ -123,16 +124,16 @@ export function runPeriodDiagnostics(periodId: string): PeriodClosingStatus {
       AND jel.account_id = 'acc_1121'
       AND je.status = 'posted'
       AND je.posting_date <= ?
-  `).get(period.end_date) as { subledger_total: number };
+  `).get(period.end_date)) as { subledger_total: number };
 
-  const custControlRow = db.prepare(`
+  const custControlRow = (await db.prepare(`
     SELECT COALESCE(ROUND(SUM(jel.debit - jel.credit), 2), 0) as control_total
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
     WHERE jel.account_id = 'acc_1121'
       AND je.status = 'posted'
       AND je.posting_date <= ?
-  `).get(period.end_date) as { control_total: number };
+  `).get(period.end_date)) as { control_total: number };
 
   const custSub = new Decimal(custSubledgerRow.subledger_total || 0);
   const custCtrl = new Decimal(custControlRow.control_total || 0);
@@ -154,7 +155,7 @@ export function runPeriodDiagnostics(periodId: string): PeriodClosingStatus {
   });
 
   // 4. Supplier Control Account Reconciliation (acc_2111) (Blocking)
-  const suppSubledgerRow = db.prepare(`
+  const suppSubledgerRow = (await db.prepare(`
     SELECT COALESCE(ROUND(SUM(jel.credit - jel.debit), 2), 0) as subledger_total
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
@@ -162,16 +163,16 @@ export function runPeriodDiagnostics(periodId: string): PeriodClosingStatus {
       AND jel.account_id = 'acc_2111'
       AND je.status = 'posted'
       AND je.posting_date <= ?
-  `).get(period.end_date) as { subledger_total: number };
+  `).get(period.end_date)) as { subledger_total: number };
 
-  const suppControlRow = db.prepare(`
+  const suppControlRow = (await db.prepare(`
     SELECT COALESCE(ROUND(SUM(jel.credit - jel.debit), 2), 0) as control_total
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
     WHERE jel.account_id = 'acc_2111'
       AND je.status = 'posted'
       AND je.posting_date <= ?
-  `).get(period.end_date) as { control_total: number };
+  `).get(period.end_date)) as { control_total: number };
 
   const suppSub = new Decimal(suppSubledgerRow.subledger_total || 0);
   const suppCtrl = new Decimal(suppControlRow.control_total || 0);
@@ -193,21 +194,21 @@ export function runPeriodDiagnostics(periodId: string): PeriodClosingStatus {
   });
 
   // 5. Inventory Valuation Reconciliation (acc_1141 + acc_1142)
-  const stockValuationRow = db.prepare(`
+  const stockValuationRow = (await db.prepare(`
     SELECT COALESCE(ROUND(SUM(ws.quantity * i.moving_avg_cost), 2), 0) as valuation
     FROM warehouse_stock ws
     JOIN items i ON ws.item_id = i.id
     WHERE i.item_type = 'stock'
-  `).get() as { valuation: number };
+  `).get()) as { valuation: number };
 
-  const invLedgerRow = db.prepare(`
+  const invLedgerRow = (await db.prepare(`
     SELECT COALESCE(ROUND(SUM(jel.debit - jel.credit), 2), 0) as ledger_total
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
     WHERE jel.account_id IN ('acc_1141', 'acc_1142')
       AND je.status = 'posted'
       AND je.posting_date <= ?
-  `).get(period.end_date) as { ledger_total: number };
+  `).get(period.end_date)) as { ledger_total: number };
 
   const stockVal = new Decimal(stockValuationRow.valuation || 0);
   const stockLedg = new Decimal(invLedgerRow.ledger_total || 0);
@@ -229,21 +230,21 @@ export function runPeriodDiagnostics(periodId: string): PeriodClosingStatus {
   });
 
   // 6. Cash & Bank Subledger vs General Ledger
-  const cashboxesTotal = db.prepare('SELECT COALESCE(ROUND(SUM(current_balance), 2), 0) as tot FROM cash_boxes').get() as { tot: number };
-  const cashLedger = db.prepare(`
+  const cashboxesTotal = (await db.prepare('SELECT COALESCE(ROUND(SUM(current_balance), 2), 0) as tot FROM cash_boxes').get()) as { tot: number };
+  const cashLedger = (await db.prepare(`
     SELECT COALESCE(ROUND(SUM(jel.debit - jel.credit), 2), 0) as tot
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
     WHERE jel.account_id IN ('acc_1111', 'acc_1112') AND je.status = 'posted' AND je.posting_date <= ?
-  `).get(period.end_date) as { tot: number };
+  `).get(period.end_date)) as { tot: number };
 
-  const bankAccountsTotal = db.prepare('SELECT COALESCE(ROUND(SUM(current_balance), 2), 0) as tot FROM bank_accounts').get() as { tot: number };
-  const bankLedger = db.prepare(`
+  const bankAccountsTotal = (await db.prepare('SELECT COALESCE(ROUND(SUM(current_balance), 2), 0) as tot FROM bank_accounts').get()) as { tot: number };
+  const bankLedger = (await db.prepare(`
     SELECT COALESCE(ROUND(SUM(jel.debit - jel.credit), 2), 0) as tot
     FROM journal_entry_lines jel
     JOIN journal_entries je ON jel.entry_id = je.id
     WHERE jel.account_id IN ('acc_1113', 'acc_1114') AND je.status = 'posted' AND je.posting_date <= ?
-  `).get(period.end_date) as { tot: number };
+  `).get(period.end_date)) as { tot: number };
 
   diagnostics.push({
     key: 'treasury_reconciliation',
@@ -259,12 +260,12 @@ export function runPeriodDiagnostics(periodId: string): PeriodClosingStatus {
   });
 
   // 7. Unallocated Payment Vouchers (Warning)
-  const unallocatedVouchers = db.prepare(`
+  const unallocatedVouchers = (await db.prepare(`
     SELECT pv.id, pv.voucher_number, pv.voucher_date, pv.unallocated_amount, pv.voucher_type, p.name_ar as party_name
     FROM payment_vouchers pv
     LEFT JOIN parties p ON pv.party_id = p.id
     WHERE pv.unallocated_amount > 0 AND pv.voucher_date BETWEEN ? AND ?
-  `).all(period.start_date, period.end_date) as any[];
+  `).all(period.start_date, period.end_date)) as any[];
 
   diagnostics.push({
     key: 'unallocated_vouchers',
@@ -289,14 +290,14 @@ export function runPeriodDiagnostics(periodId: string): PeriodClosingStatus {
   });
 
   // 8. Bank Reconciliation Variance Check (Warning)
-  const unreconciledBanks = db.prepare(`
+  const unreconciledBanks = (await db.prepare(`
     SELECT b.bank_name, b.account_number,
            COALESCE(SUM(CASE WHEN bsl.is_matched = 0 THEN 1 ELSE 0 END), 0) as unmatched_count
     FROM bank_accounts b
     LEFT JOIN bank_statement_lines bsl ON b.id = bsl.bank_account_id
     GROUP BY b.id
     HAVING unmatched_count > 0
-  `).all() as any[];
+  `).all()) as any[];
 
   diagnostics.push({
     key: 'bank_reconciliation_variance',
@@ -360,17 +361,17 @@ export function runPeriodDiagnostics(periodId: string): PeriodClosingStatus {
 /**
  * GET /status: Detailed Diagnostic status of a financial period
  */
-periodClosingRouter.get('/status', requireAuth, requirePermission('period.view', 'period.review', 'month_close.view'), (req: AuthenticatedRequest, res: Response) => {
+periodClosingRouter.get('/status', requireAuth, requirePermission('period.view', 'period.review', 'month_close.view'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const periodId = req.query.periodId as string || 'fp_2026_03';
-    const status = runPeriodDiagnostics(periodId);
+    const status = (await runPeriodDiagnostics(periodId));
 
     // Also get all periods for selector
-    const periods = db.prepare(`
+    const periods = (await db.prepare(`
       SELECT id, period_number, name_ar, start_date, end_date, is_closed, closed_at, closed_by
       FROM fiscal_periods
       ORDER BY period_number ASC
-    `).all();
+    `).all());
 
     res.json({
       success: true,
@@ -385,7 +386,7 @@ periodClosingRouter.get('/status', requireAuth, requirePermission('period.view',
 /**
  * POST /close: Executes month-end closing atomically with concurrency protection
  */
-periodClosingRouter.post('/close', requireAuth, requirePermission('period.close'), (req: AuthenticatedRequest, res: Response) => {
+periodClosingRouter.post('/close', requireAuth, requirePermission('period.close'), async (req: AuthenticatedRequest, res: Response) => {
   const { periodId, notes } = req.body;
 
   if (!periodId) {
@@ -395,9 +396,9 @@ periodClosingRouter.post('/close', requireAuth, requirePermission('period.close'
   try {
     let resultSummary: any = null;
 
-    db.transaction(() => {
+    (await db.transaction(async () => {
       // 1. Re-run diagnostics under active database transaction
-      const diagnostics = runPeriodDiagnostics(periodId);
+      const diagnostics = (await runPeriodDiagnostics(periodId));
 
       if (diagnostics.period.is_closed === 1) {
         throw new Error('هذه الفترة المالية مقفلة بالفعل مسبقاً.');
@@ -413,15 +414,15 @@ periodClosingRouter.post('/close', requireAuth, requirePermission('period.close'
 
       // 2. Mark fiscal period as closed
       const now = new Date().toISOString();
-      db.prepare(`
+      (await db.prepare(`
         UPDATE fiscal_periods
         SET is_closed = 1, closed_at = ?, closed_by = ?
         WHERE id = ?
-      `).run(now, req.user!.id, periodId);
+      `).run(now, req.user!.id, periodId));
 
       // 3. Save snapshot in period_closings table
       const closingId = `close_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO period_closings (id, period_id, closed_by, closed_at, notes, summary_json)
         VALUES (?, ?, ?, ?, ?, ?)
       `).run(
@@ -431,9 +432,9 @@ periodClosingRouter.post('/close', requireAuth, requirePermission('period.close'
         now,
         notes || 'تم إقفال الفترة المالية بنجاح بعد استيفاء جميع شروط ومطابقات الرقابة.',
         JSON.stringify(diagnostics)
-      );
+      ));
 
-      logAudit(
+      (await logAudit(
         req.user!.id,
         'CLOSE_PERIOD',
         'fiscal_periods',
@@ -441,10 +442,10 @@ periodClosingRouter.post('/close', requireAuth, requirePermission('period.close'
         `إقفال الفترة المالية (${diagnostics.period.name_ar}) بنجاح بمطابقة تامة لحسابات الرقابة.`,
         { is_closed: 0 },
         { is_closed: 1, closed_at: now, closed_by: req.user!.id }
-      );
+      ));
 
       resultSummary = diagnostics;
-    })();
+    })());
 
     res.json({
       success: true,
@@ -459,7 +460,7 @@ periodClosingRouter.post('/close', requireAuth, requirePermission('period.close'
 /**
  * POST /reopen: Re-opens a closed fiscal period with mandatory documented reason and audit trail
  */
-periodClosingRouter.post('/reopen', requireAuth, requirePermission('period.reopen', 'reopen_period'), (req: AuthenticatedRequest, res: Response) => {
+periodClosingRouter.post('/reopen', requireAuth, requirePermission('period.reopen', 'reopen_period'), async (req: AuthenticatedRequest, res: Response) => {
   const { periodId, reason } = req.body;
 
   if (!periodId) {
@@ -471,26 +472,26 @@ periodClosingRouter.post('/reopen', requireAuth, requirePermission('period.reope
   }
 
   try {
-    const period = db.prepare('SELECT * FROM fiscal_periods WHERE id = ?').get(periodId) as any;
+    const period = (await db.prepare('SELECT * FROM fiscal_periods WHERE id = ?').get(periodId)) as any;
     if (!period) return res.status(404).json({ error: 'الفترة المالية غير موجودة.' });
     if (period.is_closed === 0) return res.status(400).json({ error: 'الفترة المالية مفتوحة بالفعل.' });
 
-    db.transaction(() => {
+    (await db.transaction(async () => {
       // 1. Reopen period
-      db.prepare(`
+      (await db.prepare(`
         UPDATE fiscal_periods
         SET is_closed = 0, closed_at = NULL, closed_by = NULL
         WHERE id = ?
-      `).run(periodId);
+      `).run(periodId));
 
       // 2. Record in period_reopen_logs
       const logId = `reopen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO period_reopen_logs (id, period_id, reopened_by, reopened_at, reason, previous_status)
         VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, 'closed')
-      `).run(logId, periodId, req.user!.id, reason.trim());
+      `).run(logId, periodId, req.user!.id, reason.trim()));
 
-      logAudit(
+      (await logAudit(
         req.user!.id,
         'REOPEN_PERIOD',
         'fiscal_periods',
@@ -498,8 +499,8 @@ periodClosingRouter.post('/reopen', requireAuth, requirePermission('period.reope
         `إعادة فتح الفترة المالية (${period.name_ar}). السبب الرسمي: ${reason.trim()}`,
         { is_closed: 1, closed_at: period.closed_at, closed_by: period.closed_by },
         { is_closed: 0, reason: reason.trim() }
-      );
-    })();
+      ));
+    })());
 
     res.json({
       success: true,
@@ -513,25 +514,25 @@ periodClosingRouter.post('/reopen', requireAuth, requirePermission('period.reope
 /**
  * GET /history: Retrieve audit history of period closings and reopenings
  */
-periodClosingRouter.get('/history', requireAuth, requirePermission('period.view', 'period.review', 'month_close.view'), (req: AuthenticatedRequest, res: Response) => {
+periodClosingRouter.get('/history', requireAuth, requirePermission('period.view', 'period.review', 'month_close.view'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const closings = db.prepare(`
+    const closings = (await db.prepare(`
       SELECT pc.*, u.display_name as closed_by_name, fp.name_ar as period_name
       FROM period_closings pc
       JOIN users u ON pc.closed_by = u.id
       JOIN fiscal_periods fp ON pc.period_id = fp.id
       ORDER BY pc.closed_at DESC
       LIMIT 20
-    `).all();
+    `).all());
 
-    const reopenings = db.prepare(`
+    const reopenings = (await db.prepare(`
       SELECT prl.*, u.display_name as reopened_by_name, fp.name_ar as period_name
       FROM period_reopen_logs prl
       JOIN users u ON prl.reopened_by = u.id
       JOIN fiscal_periods fp ON prl.period_id = fp.id
       ORDER BY prl.reopened_at DESC
       LIMIT 20
-    `).all();
+    `).all());
 
     res.json({
       success: true,

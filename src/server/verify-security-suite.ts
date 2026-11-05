@@ -12,15 +12,15 @@ async function runSecurityAudit() {
   const prodDbInitialMtime = fs.existsSync(prodDbFile) ? fs.statSync(prodDbFile).mtimeMs : 0;
 
   const testDbFile = path.resolve(process.cwd(), `almizan_audit_${Date.now()}.db`);
-  process.env.ALMIZAN_DB_PATH = testDbFile;
+  process.env.MYSQL_DATABASE = 'almizan_test_'+Date.now()+'_'+Math.random().toString(36).slice(2,7);
 
   const { createDatabaseConnection, initDb } = await import('./db.js');
   const { seedInitialData } = await import('./seed.js');
   const { apiRouter } = await import('./api.js');
 
-  const db = createDatabaseConnection(testDbFile);
-  initDb(db);
-  seedInitialData(db);
+  const db = createDatabaseConnection(process.env.MYSQL_DATABASE);
+  (await initDb(db));
+  (await seedInitialData(db));
 
   const app = express();
   app.use(express.json({ limit: '100mb' }));
@@ -162,19 +162,19 @@ async function runSecurityAudit() {
     );
 
     // 4.b Create a restricted user who has ONLY dashboard.view (to verify redaction of profit/cost/treasury)
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO users (id, username, password_hash, display_name, role, is_active, allowed_branch_ids, allowed_warehouse_ids, allowed_cashbox_ids)
       VALUES ('user_viewer', 'viewer', '$2b$10$wE9mHlXG948F8ZqE/h1Z9.z2VwJ3L3vXkX7hX9mHlXG948F8ZqE/h', 'مشاهد فقط', 'accountant', 1, '*', '*', '*')
-    `).run();
-    db.prepare(`
+    `).run());
+    (await db.prepare(`
       INSERT INTO individual_permissions (user_id, permission_keys)
       VALUES ('user_viewer', '["dashboard.view"]')
-    `).run();
+    `).run());
     const viewerToken = 'session_token_viewer_test';
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO user_sessions (token, user_id, expires_at)
-      VALUES (?, 'user_viewer', datetime('now', '+1 day'))
-    `).run(viewerToken);
+      VALUES (?, 'user_viewer', DATE_ADD(UTC_TIMESTAMP(), INTERVAL 1 DAY))
+    `).run(viewerToken));
 
     const viewerDashboard = await request(app)
       .get('/api/dashboard/stats')
@@ -346,13 +346,8 @@ async function runSecurityAudit() {
       `Delete posted status: ${deletePostedRes.status} - Message: ${deletePostedRes.body?.error}`
     );
 
-    // 9. Verify audit ran in isolated temporary SQLite file and did not touch production database
-    const prodDbFinalMtime = fs.existsSync(prodDbFile) ? fs.statSync(prodDbFile).mtimeMs : 0;
-    record(
-      'Audit runs on isolated temporary SQLite database and does NOT touch production database',
-      prodDbInitialMtime === prodDbFinalMtime,
-      `Isolated temporary DB: ${path.basename(testDbFile)}, Production DB unchanged (mtime: ${prodDbFinalMtime})`
-    );
+    const [{ name: actualSchema }] = await db.query('SELECT DATABASE() AS name');
+    record('Security audit uses an isolated MySQL schema', actualSchema === process.env.MYSQL_DATABASE && actualSchema.startsWith('almizan_test_'), `Schema: ${actualSchema}`);
 
     console.log('====================================================');
     const total = results.length;
@@ -365,7 +360,7 @@ async function runSecurityAudit() {
     }
   } finally {
     try {
-      db.close();
+      await db.dropTestSchema();
       if (fs.existsSync(testDbFile)) fs.unlinkSync(testDbFile);
       const wal = `${testDbFile}-wal`;
       if (fs.existsSync(wal)) fs.unlinkSync(wal);
@@ -373,7 +368,7 @@ async function runSecurityAudit() {
       if (fs.existsSync(shm)) fs.unlinkSync(shm);
     } catch (e) {}
   }
-  process.exit(0);
+  process.exit(results.some(result => result.status === 'FAILED') ? 1 : 0);
 }
 
 runSecurityAudit().catch(err => {

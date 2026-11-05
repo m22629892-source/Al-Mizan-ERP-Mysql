@@ -1,741 +1,871 @@
--- Al-Mizan ERP Relational Database Schema (SQLite 3.x with Strict Types & Foreign Keys)
+-- Al-Mizan ERP — MySQL 8.0.28+ / InnoDB / utf8mb4
+CREATE TABLE IF NOT EXISTS `companies` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `name_ar` VARCHAR(255) NOT NULL,
+  `name_en` VARCHAR(255) NOT NULL,
+  `legal_name` LONGTEXT NOT NULL,
+  `commercial_registry` LONGTEXT NOT NULL,
+  `tax_id` VARCHAR(191) NOT NULL,
+  `vat_number` LONGTEXT,
+  `activity_code` LONGTEXT,
+  `address_ar` LONGTEXT NOT NULL,
+  `address_en` LONGTEXT,
+  `city` LONGTEXT NOT NULL,
+  `country` VARCHAR(255) NOT NULL DEFAULT 'مصر',
+  `postal_code` LONGTEXT,
+  `phone` LONGTEXT,
+  `email` LONGTEXT,
+  `website` LONGTEXT,
+  `logo_url` LONGTEXT,
+  `currency_code` VARCHAR(191) NOT NULL DEFAULT 'EGP',
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 1. Company Information
-CREATE TABLE IF NOT EXISTS companies (
-    id TEXT PRIMARY KEY,
-    name_ar TEXT NOT NULL,
-    name_en TEXT NOT NULL,
-    legal_name TEXT NOT NULL,
-    commercial_registry TEXT NOT NULL,
-    tax_id TEXT NOT NULL, -- 9 digits Egyptian Tax Registration
-    vat_number TEXT,
-    activity_code TEXT,
-    address_ar TEXT NOT NULL,
-    address_en TEXT,
-    city TEXT NOT NULL,
-    country TEXT NOT NULL DEFAULT 'مصر',
-    postal_code TEXT,
-    phone TEXT,
-    email TEXT,
-    website TEXT,
-    logo_url TEXT,
-    currency_code TEXT NOT NULL DEFAULT 'EGP',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `branches` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `company_id` VARCHAR(191) NOT NULL,
+  `code` VARCHAR(191) NOT NULL UNIQUE,
+  `name_ar` VARCHAR(255) NOT NULL,
+  `name_en` VARCHAR(255) NOT NULL,
+  `address` LONGTEXT,
+  `phone` LONGTEXT,
+  `is_active` INTEGER NOT NULL DEFAULT 1,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_branches_company_id FOREIGN KEY (`company_id`) REFERENCES `companies` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 2. Branches
-CREATE TABLE IF NOT EXISTS branches (
-    id TEXT PRIMARY KEY,
-    company_id TEXT NOT NULL REFERENCES companies(id),
-    code TEXT NOT NULL UNIQUE,
-    name_ar TEXT NOT NULL,
-    name_en TEXT NOT NULL,
-    address TEXT,
-    phone TEXT,
-    is_active INTEGER NOT NULL DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `fiscal_years` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `code` VARCHAR(191) NOT NULL UNIQUE,
+  `name_ar` VARCHAR(255) NOT NULL,
+  `name_en` VARCHAR(255) NOT NULL,
+  `start_date` DATE NOT NULL,
+  `end_date` DATE NOT NULL,
+  `is_closed` INTEGER NOT NULL DEFAULT 0,
+  `closed_at` DATETIME,
+  `closed_by` LONGTEXT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 3. Fiscal Years & Periods
-CREATE TABLE IF NOT EXISTS fiscal_years (
-    id TEXT PRIMARY KEY,
-    code TEXT NOT NULL UNIQUE,
-    name_ar TEXT NOT NULL,
-    name_en TEXT NOT NULL,
-    start_date DATE NOT NULL,
-    end_date DATE NOT NULL,
-    is_closed INTEGER NOT NULL DEFAULT 0,
-    closed_at DATETIME,
-    closed_by TEXT
-);
+CREATE TABLE IF NOT EXISTS `fiscal_periods` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `fiscal_year_id` VARCHAR(191) NOT NULL,
+  `period_number` INTEGER NOT NULL,
+  `name_ar` VARCHAR(255) NOT NULL,
+  `name_en` VARCHAR(255) NOT NULL,
+  `start_date` DATE NOT NULL,
+  `end_date` DATE NOT NULL,
+  `is_closed` INTEGER NOT NULL DEFAULT 0,
+  `closed_at` DATETIME,
+  `closed_by` LONGTEXT,
+  UNIQUE(fiscal_year_id, period_number),
+  CONSTRAINT fk_fiscal_periods_fiscal_year_id FOREIGN KEY (`fiscal_year_id`) REFERENCES `fiscal_years` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS fiscal_periods (
-    id TEXT PRIMARY KEY,
-    fiscal_year_id TEXT NOT NULL REFERENCES fiscal_years(id),
-    period_number INTEGER NOT NULL,
-    name_ar TEXT NOT NULL,
-    name_en TEXT NOT NULL,
-    start_date DATE NOT NULL,
-    end_date DATE NOT NULL,
-    is_closed INTEGER NOT NULL DEFAULT 0,
-    closed_at DATETIME,
-    closed_by TEXT,
-    UNIQUE(fiscal_year_id, period_number)
-);
+CREATE TABLE IF NOT EXISTS `currencies` (
+  `code` VARCHAR(191) PRIMARY KEY,
+  `name_ar` VARCHAR(255) NOT NULL,
+  `name_en` VARCHAR(255) NOT NULL,
+  `symbol` LONGTEXT NOT NULL,
+  `decimal_places` INTEGER NOT NULL DEFAULT 2,
+  `is_base` INTEGER NOT NULL DEFAULT 0
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 4. Currencies & Exchange Rates
-CREATE TABLE IF NOT EXISTS currencies (
-    code TEXT PRIMARY KEY, -- EGP, USD, EUR, SAR
-    name_ar TEXT NOT NULL,
-    name_en TEXT NOT NULL,
-    symbol TEXT NOT NULL,
-    decimal_places INTEGER NOT NULL DEFAULT 2,
-    is_base INTEGER NOT NULL DEFAULT 0
-);
+CREATE TABLE IF NOT EXISTS `exchange_rates` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `currency_code` VARCHAR(191) NOT NULL,
+  `rate` DECIMAL(24,8) NOT NULL,
+  `rate_date` DATE NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(currency_code, rate_date),
+  CONSTRAINT fk_exchange_rates_currency_code FOREIGN KEY (`currency_code`) REFERENCES `currencies` (`code`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS exchange_rates (
-    id TEXT PRIMARY KEY,
-    currency_code TEXT NOT NULL REFERENCES currencies(code),
-    rate NUMERIC NOT NULL,
-    rate_date DATE NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(currency_code, rate_date)
-);
+CREATE TABLE IF NOT EXISTS `cost_centers` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `code` VARCHAR(191) NOT NULL UNIQUE,
+  `name_ar` VARCHAR(255) NOT NULL,
+  `name_en` VARCHAR(255) NOT NULL,
+  `parent_id` VARCHAR(191),
+  `is_active` INTEGER NOT NULL DEFAULT 1,
+  CONSTRAINT fk_cost_centers_parent_id FOREIGN KEY (`parent_id`) REFERENCES `cost_centers` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 5. Cost Centers & Projects
-CREATE TABLE IF NOT EXISTS cost_centers (
-    id TEXT PRIMARY KEY,
-    code TEXT NOT NULL UNIQUE,
-    name_ar TEXT NOT NULL,
-    name_en TEXT NOT NULL,
-    parent_id TEXT REFERENCES cost_centers(id),
-    is_active INTEGER NOT NULL DEFAULT 1
-);
+CREATE TABLE IF NOT EXISTS `accounts` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `code` VARCHAR(191) NOT NULL UNIQUE,
+  `name_ar` VARCHAR(255) NOT NULL,
+  `name_en` VARCHAR(255) NOT NULL,
+  `parent_id` VARCHAR(191),
+  `account_type` VARCHAR(255) NOT NULL,
+  `nature` VARCHAR(255) NOT NULL,
+  `is_group` INTEGER NOT NULL DEFAULT 0,
+  `level` INTEGER NOT NULL DEFAULT 1,
+  `currency_code` VARCHAR(191),
+  `is_reconciliation` INTEGER NOT NULL DEFAULT 0,
+  `is_active` INTEGER NOT NULL DEFAULT 1,
+  `notes` LONGTEXT,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  INDEX `idx_accounts_parent` (parent_id),
+  INDEX `idx_accounts_code` (code),
+  CONSTRAINT fk_accounts_parent_id FOREIGN KEY (`parent_id`) REFERENCES `accounts` (`id`),
+  CONSTRAINT fk_accounts_currency_code FOREIGN KEY (`currency_code`) REFERENCES `currencies` (`code`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 6. Chart of Accounts (دليل الحسابات الهرمي)
-CREATE TABLE IF NOT EXISTS accounts (
-    id TEXT PRIMARY KEY,
-    code TEXT NOT NULL UNIQUE,
-    name_ar TEXT NOT NULL,
-    name_en TEXT NOT NULL,
-    parent_id TEXT REFERENCES accounts(id),
-    account_type TEXT NOT NULL, -- asset, liability, equity, revenue, expense, cogs
-    nature TEXT NOT NULL, -- debit, credit
-    is_group INTEGER NOT NULL DEFAULT 0, -- 1: parent category (cannot post to), 0: posting account
-    level INTEGER NOT NULL DEFAULT 1,
-    currency_code TEXT REFERENCES currencies(code),
-    is_reconciliation INTEGER NOT NULL DEFAULT 0, -- Is Control Account for Customers/Suppliers
-    is_active INTEGER NOT NULL DEFAULT 1,
-    notes TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `document_sequences` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `doc_type` VARCHAR(255) NOT NULL,
+  `branch_id` VARCHAR(191) NOT NULL,
+  `fiscal_year_id` VARCHAR(191) NOT NULL,
+  `prefix` VARCHAR(255) NOT NULL,
+  `next_number` INTEGER NOT NULL DEFAULT 1,
+  UNIQUE(doc_type, branch_id, fiscal_year_id),
+  CONSTRAINT fk_document_sequences_branch_id FOREIGN KEY (`branch_id`) REFERENCES `branches` (`id`),
+  CONSTRAINT fk_document_sequences_fiscal_year_id FOREIGN KEY (`fiscal_year_id`) REFERENCES `fiscal_years` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE INDEX IF NOT EXISTS idx_accounts_parent ON accounts(parent_id);
-CREATE INDEX IF NOT EXISTS idx_accounts_code ON accounts(code);
+CREATE TABLE IF NOT EXISTS `parties` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `code` VARCHAR(191) NOT NULL UNIQUE,
+  `type` VARCHAR(191) NOT NULL,
+  `name_ar` VARCHAR(255) NOT NULL,
+  `name_en` VARCHAR(255) NOT NULL,
+  `tax_id` VARCHAR(191),
+  `commercial_registry` LONGTEXT,
+  `national_id` VARCHAR(191),
+  `is_company` INTEGER NOT NULL DEFAULT 1,
+  `phone` LONGTEXT,
+  `mobile` LONGTEXT,
+  `email` LONGTEXT,
+  `address` LONGTEXT,
+  `city` LONGTEXT,
+  `governorate` LONGTEXT,
+  `credit_limit` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `payment_terms_days` INTEGER NOT NULL DEFAULT 0,
+  `currency_code` VARCHAR(191) NOT NULL DEFAULT 'EGP',
+  `account_id` VARCHAR(191),
+  `is_active` INTEGER NOT NULL DEFAULT 1,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_parties_currency_code FOREIGN KEY (`currency_code`) REFERENCES `currencies` (`code`),
+  CONSTRAINT fk_parties_account_id FOREIGN KEY (`account_id`) REFERENCES `accounts` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 7. Document Sequences (Per branch, document type, and year)
-CREATE TABLE IF NOT EXISTS document_sequences (
-    id TEXT PRIMARY KEY,
-    doc_type TEXT NOT NULL, -- JV, SI, PI, SR, PR, CR, CP, ST, FA
-    branch_id TEXT NOT NULL REFERENCES branches(id),
-    fiscal_year_id TEXT NOT NULL REFERENCES fiscal_years(id),
-    prefix TEXT NOT NULL,
-    next_number INTEGER NOT NULL DEFAULT 1,
-    UNIQUE(doc_type, branch_id, fiscal_year_id)
-);
+CREATE TABLE IF NOT EXISTS `party_contacts` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `party_id` VARCHAR(191) NOT NULL,
+  `contact_name` LONGTEXT NOT NULL,
+  `job_title` LONGTEXT,
+  `phone` LONGTEXT,
+  `email` LONGTEXT,
+  CONSTRAINT fk_party_contacts_party_id FOREIGN KEY (`party_id`) REFERENCES `parties` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 8. Parties (Customers & Suppliers / أطراف المعاملات)
-CREATE TABLE IF NOT EXISTS parties (
-    id TEXT PRIMARY KEY,
-    code TEXT NOT NULL UNIQUE,
-    type TEXT NOT NULL, -- customer, supplier, both
-    name_ar TEXT NOT NULL,
-    name_en TEXT NOT NULL,
-    tax_id TEXT, -- الرقم الضريبي المصري
-    commercial_registry TEXT, -- السجل التجاري
-    national_id TEXT, -- الرقم القومي إن وجد
-    is_company INTEGER NOT NULL DEFAULT 1,
-    phone TEXT,
-    mobile TEXT,
-    email TEXT,
-    address TEXT,
-    city TEXT,
-    governorate TEXT,
-    credit_limit NUMERIC NOT NULL DEFAULT 0,
-    payment_terms_days INTEGER NOT NULL DEFAULT 0,
-    currency_code TEXT NOT NULL DEFAULT 'EGP' REFERENCES currencies(code),
-    account_id TEXT REFERENCES accounts(id), -- Linked specific account if any, otherwise uses control account
-    is_active INTEGER NOT NULL DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `warehouses` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `branch_id` VARCHAR(191) NOT NULL,
+  `code` VARCHAR(191) NOT NULL UNIQUE,
+  `name_ar` VARCHAR(255) NOT NULL,
+  `name_en` VARCHAR(255) NOT NULL,
+  `address` LONGTEXT,
+  `is_damaged_stock` INTEGER NOT NULL DEFAULT 0,
+  `is_active` INTEGER NOT NULL DEFAULT 1,
+  CONSTRAINT fk_warehouses_branch_id FOREIGN KEY (`branch_id`) REFERENCES `branches` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS party_contacts (
-    id TEXT PRIMARY KEY,
-    party_id TEXT NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
-    contact_name TEXT NOT NULL,
-    job_title TEXT,
-    phone TEXT,
-    email TEXT
-);
+CREATE TABLE IF NOT EXISTS `journal_entries` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `entry_number` VARCHAR(255) NOT NULL UNIQUE,
+  `doc_type` VARCHAR(255) NOT NULL,
+  `doc_id` VARCHAR(191),
+  `doc_number` LONGTEXT,
+  `entry_date` DATE NOT NULL,
+  `posting_date` DATE NOT NULL,
+  `fiscal_period_id` VARCHAR(191) NOT NULL,
+  `branch_id` VARCHAR(191) NOT NULL,
+  `status` VARCHAR(255) NOT NULL DEFAULT 'posted',
+  `description` LONGTEXT NOT NULL,
+  `total_debit` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `total_credit` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `currency_code` VARCHAR(191) NOT NULL DEFAULT 'EGP',
+  `exchange_rate` DECIMAL(24,8) NOT NULL DEFAULT 1.0,
+  `reversed_entry_id` VARCHAR(191),
+  `is_system_generated` INTEGER NOT NULL DEFAULT 0,
+  `created_by` LONGTEXT NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  `posted_by` LONGTEXT,
+  `posted_at` DATETIME,
+  INDEX `idx_je_date` (entry_date),
+  INDEX `idx_je_status` (status),
+  INDEX `idx_je_doc` (doc_type, doc_id),
+  CONSTRAINT fk_journal_entries_fiscal_period_id FOREIGN KEY (`fiscal_period_id`) REFERENCES `fiscal_periods` (`id`),
+  CONSTRAINT fk_journal_entries_branch_id FOREIGN KEY (`branch_id`) REFERENCES `branches` (`id`),
+  CONSTRAINT fk_journal_entries_currency_code FOREIGN KEY (`currency_code`) REFERENCES `currencies` (`code`),
+  CONSTRAINT fk_journal_entries_reversed_entry_id FOREIGN KEY (`reversed_entry_id`) REFERENCES `journal_entries` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 9. Warehouses & Storage Locations
-CREATE TABLE IF NOT EXISTS warehouses (
-    id TEXT PRIMARY KEY,
-    branch_id TEXT NOT NULL REFERENCES branches(id),
-    code TEXT NOT NULL UNIQUE,
-    name_ar TEXT NOT NULL,
-    name_en TEXT NOT NULL,
-    address TEXT,
-    is_damaged_stock INTEGER NOT NULL DEFAULT 0,
-    is_active INTEGER NOT NULL DEFAULT 1
-);
+CREATE TABLE IF NOT EXISTS `journal_entry_lines` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `entry_id` VARCHAR(191) NOT NULL,
+  `line_number` INTEGER NOT NULL,
+  `account_id` VARCHAR(191) NOT NULL,
+  `party_id` VARCHAR(191),
+  `cost_center_id` VARCHAR(191),
+  `debit` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `credit` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `description` LONGTEXT,
+  `currency_code` VARCHAR(191) NOT NULL DEFAULT 'EGP',
+  `exchange_rate` DECIMAL(24,8) NOT NULL DEFAULT 1.0,
+  `amount_currency` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  INDEX `idx_jel_account` (account_id),
+  INDEX `idx_jel_party` (party_id),
+  INDEX `idx_jel_entry` (entry_id),
+  CONSTRAINT fk_journal_entry_lines_entry_id FOREIGN KEY (`entry_id`) REFERENCES `journal_entries` (`id`) ON DELETE CASCADE,
+  CONSTRAINT fk_journal_entry_lines_account_id FOREIGN KEY (`account_id`) REFERENCES `accounts` (`id`),
+  CONSTRAINT fk_journal_entry_lines_party_id FOREIGN KEY (`party_id`) REFERENCES `parties` (`id`),
+  CONSTRAINT fk_journal_entry_lines_cost_center_id FOREIGN KEY (`cost_center_id`) REFERENCES `cost_centers` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 10. Items, Units & Stock (الأصناف والمخزون)
-CREATE TABLE IF NOT EXISTS items (
-    id TEXT PRIMARY KEY,
-    code TEXT NOT NULL UNIQUE,
-    barcode TEXT,
-    name_ar TEXT NOT NULL,
-    name_en TEXT NOT NULL,
-    item_type TEXT NOT NULL, -- stock, service
-    category TEXT NOT NULL DEFAULT 'عام',
-    base_unit TEXT NOT NULL DEFAULT 'قطعة',
-    cost_price NUMERIC NOT NULL DEFAULT 0,
-    sale_price NUMERIC NOT NULL DEFAULT 0,
-    min_stock_level NUMERIC NOT NULL DEFAULT 0,
-    moving_avg_cost NUMERIC NOT NULL DEFAULT 0,
-    tax_rate NUMERIC NOT NULL DEFAULT 14.0, -- Standard Egyptian VAT is 14%
-    eta_item_code TEXT, -- GS1 / EGS code for Egyptian Tax Authority
-    eta_code_type TEXT DEFAULT 'EGS',
-    is_active INTEGER NOT NULL DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `sales_invoices` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `invoice_number` VARCHAR(255) NOT NULL UNIQUE,
+  `branch_id` VARCHAR(191) NOT NULL,
+  `warehouse_id` VARCHAR(191) NOT NULL,
+  `customer_id` VARCHAR(191) NOT NULL,
+  `invoice_date` DATE NOT NULL,
+  `due_date` DATE NOT NULL,
+  `payment_type` VARCHAR(255) NOT NULL,
+  `currency_code` VARCHAR(191) NOT NULL DEFAULT 'EGP',
+  `exchange_rate` DECIMAL(24,8) NOT NULL DEFAULT 1.0,
+  `subtotal` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `discount_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `taxable_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `tax_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `withholding_tax_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `total_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `paid_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `remaining_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `cogs_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `status` VARCHAR(255) NOT NULL DEFAULT 'posted',
+  `notes` LONGTEXT,
+  `journal_entry_id` VARCHAR(191),
+  `eta_uuid` LONGTEXT,
+  `eta_submission_id` VARCHAR(191),
+  `eta_status` VARCHAR(255) DEFAULT 'NotSubmitted',
+  `created_by` LONGTEXT NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_sales_invoices_branch_id FOREIGN KEY (`branch_id`) REFERENCES `branches` (`id`),
+  CONSTRAINT fk_sales_invoices_warehouse_id FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses` (`id`),
+  CONSTRAINT fk_sales_invoices_customer_id FOREIGN KEY (`customer_id`) REFERENCES `parties` (`id`),
+  CONSTRAINT fk_sales_invoices_currency_code FOREIGN KEY (`currency_code`) REFERENCES `currencies` (`code`),
+  CONSTRAINT fk_sales_invoices_journal_entry_id FOREIGN KEY (`journal_entry_id`) REFERENCES `journal_entries` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS item_units (
-    id TEXT PRIMARY KEY,
-    item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-    unit_name TEXT NOT NULL,
-    conversion_factor NUMERIC NOT NULL DEFAULT 1.0, -- Relative to base unit
-    sale_price NUMERIC NOT NULL DEFAULT 0,
-    barcode TEXT,
-    is_base INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(item_id, unit_name)
-);
+CREATE TABLE IF NOT EXISTS `sales_returns` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `return_number` VARCHAR(255) NOT NULL UNIQUE,
+  `original_invoice_id` VARCHAR(191),
+  `branch_id` VARCHAR(191) NOT NULL,
+  `warehouse_id` VARCHAR(191) NOT NULL,
+  `customer_id` VARCHAR(191) NOT NULL,
+  `return_date` DATE NOT NULL,
+  `refund_type` VARCHAR(255) NOT NULL,
+  `subtotal` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `tax_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `withholding_tax_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `total_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `refunded_cash_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `cogs_reversed_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `journal_entry_id` VARCHAR(191),
+  `status` VARCHAR(255) NOT NULL DEFAULT 'posted',
+  `notes` LONGTEXT,
+  `created_by` LONGTEXT NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_sales_returns_original_invoice_id FOREIGN KEY (`original_invoice_id`) REFERENCES `sales_invoices` (`id`),
+  CONSTRAINT fk_sales_returns_branch_id FOREIGN KEY (`branch_id`) REFERENCES `branches` (`id`),
+  CONSTRAINT fk_sales_returns_warehouse_id FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses` (`id`),
+  CONSTRAINT fk_sales_returns_customer_id FOREIGN KEY (`customer_id`) REFERENCES `parties` (`id`),
+  CONSTRAINT fk_sales_returns_journal_entry_id FOREIGN KEY (`journal_entry_id`) REFERENCES `journal_entries` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS warehouse_stock (
-    warehouse_id TEXT NOT NULL REFERENCES warehouses(id),
-    item_id TEXT NOT NULL REFERENCES items(id),
-    quantity NUMERIC NOT NULL DEFAULT 0,
-    reserved_qty NUMERIC NOT NULL DEFAULT 0,
-    PRIMARY KEY(warehouse_id, item_id)
-);
+CREATE TABLE IF NOT EXISTS `purchase_invoices` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `invoice_number` VARCHAR(255) NOT NULL UNIQUE,
+  `supplier_invoice_number` LONGTEXT,
+  `branch_id` VARCHAR(191) NOT NULL,
+  `warehouse_id` VARCHAR(191) NOT NULL,
+  `supplier_id` VARCHAR(191) NOT NULL,
+  `invoice_date` DATE NOT NULL,
+  `due_date` DATE NOT NULL,
+  `payment_type` VARCHAR(255) NOT NULL,
+  `currency_code` VARCHAR(191) NOT NULL DEFAULT 'EGP',
+  `exchange_rate` DECIMAL(24,8) NOT NULL DEFAULT 1.0,
+  `subtotal` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `discount_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `taxable_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `tax_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `withholding_tax_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `additional_expenses` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `total_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `paid_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `remaining_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `status` VARCHAR(255) NOT NULL DEFAULT 'posted',
+  `notes` LONGTEXT,
+  `journal_entry_id` VARCHAR(191),
+  `created_by` LONGTEXT NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_purchase_invoices_branch_id FOREIGN KEY (`branch_id`) REFERENCES `branches` (`id`),
+  CONSTRAINT fk_purchase_invoices_warehouse_id FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses` (`id`),
+  CONSTRAINT fk_purchase_invoices_supplier_id FOREIGN KEY (`supplier_id`) REFERENCES `parties` (`id`),
+  CONSTRAINT fk_purchase_invoices_currency_code FOREIGN KEY (`currency_code`) REFERENCES `currencies` (`code`),
+  CONSTRAINT fk_purchase_invoices_journal_entry_id FOREIGN KEY (`journal_entry_id`) REFERENCES `journal_entries` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 11. Journal Entries (قيود اليومية العامة)
-CREATE TABLE IF NOT EXISTS journal_entries (
-    id TEXT PRIMARY KEY,
-    entry_number TEXT NOT NULL UNIQUE,
-    doc_type TEXT NOT NULL, -- MANUAL, SALES_INV, PUR_INV, SALES_RET, PUR_RET, RCPT, PYMT, STK_ADJ, ASSET_DEP, CLOSING, REVERSAL
-    doc_id TEXT,
-    doc_number TEXT,
-    entry_date DATE NOT NULL,
-    posting_date DATE NOT NULL,
-    fiscal_period_id TEXT NOT NULL REFERENCES fiscal_periods(id),
-    branch_id TEXT NOT NULL REFERENCES branches(id),
-    status TEXT NOT NULL DEFAULT 'posted', -- draft, pending_approval, approved, posted, reversed
-    description TEXT NOT NULL,
-    total_debit NUMERIC NOT NULL DEFAULT 0,
-    total_credit NUMERIC NOT NULL DEFAULT 0,
-    currency_code TEXT NOT NULL DEFAULT 'EGP' REFERENCES currencies(code),
-    exchange_rate NUMERIC NOT NULL DEFAULT 1.0,
-    reversed_entry_id TEXT REFERENCES journal_entries(id),
-    is_system_generated INTEGER NOT NULL DEFAULT 0,
-    created_by TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    posted_by TEXT,
-    posted_at DATETIME
-);
+CREATE TABLE IF NOT EXISTS `purchase_returns` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `return_number` VARCHAR(255) NOT NULL UNIQUE,
+  `original_invoice_id` VARCHAR(191),
+  `branch_id` VARCHAR(191) NOT NULL,
+  `warehouse_id` VARCHAR(191) NOT NULL,
+  `supplier_id` VARCHAR(191) NOT NULL,
+  `return_date` DATE NOT NULL,
+  `subtotal` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `tax_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `withholding_tax_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `total_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `journal_entry_id` VARCHAR(191),
+  `status` VARCHAR(255) NOT NULL DEFAULT 'posted',
+  `notes` LONGTEXT,
+  `created_by` LONGTEXT NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_purchase_returns_original_invoice_id FOREIGN KEY (`original_invoice_id`) REFERENCES `purchase_invoices` (`id`),
+  CONSTRAINT fk_purchase_returns_branch_id FOREIGN KEY (`branch_id`) REFERENCES `branches` (`id`),
+  CONSTRAINT fk_purchase_returns_warehouse_id FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses` (`id`),
+  CONSTRAINT fk_purchase_returns_supplier_id FOREIGN KEY (`supplier_id`) REFERENCES `parties` (`id`),
+  CONSTRAINT fk_purchase_returns_journal_entry_id FOREIGN KEY (`journal_entry_id`) REFERENCES `journal_entries` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE INDEX IF NOT EXISTS idx_je_date ON journal_entries(entry_date);
-CREATE INDEX IF NOT EXISTS idx_je_status ON journal_entries(status);
-CREATE INDEX IF NOT EXISTS idx_je_doc ON journal_entries(doc_type, doc_id);
+CREATE TABLE IF NOT EXISTS `cash_boxes` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `branch_id` VARCHAR(191) NOT NULL,
+  `code` VARCHAR(191) NOT NULL UNIQUE,
+  `name_ar` VARCHAR(255) NOT NULL,
+  `name_en` VARCHAR(255) NOT NULL,
+  `account_id` VARCHAR(191) NOT NULL,
+  `currency_code` VARCHAR(191) NOT NULL DEFAULT 'EGP',
+  `current_balance` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `is_active` INTEGER NOT NULL DEFAULT 1,
+  CONSTRAINT fk_cash_boxes_branch_id FOREIGN KEY (`branch_id`) REFERENCES `branches` (`id`),
+  CONSTRAINT fk_cash_boxes_account_id FOREIGN KEY (`account_id`) REFERENCES `accounts` (`id`),
+  CONSTRAINT fk_cash_boxes_currency_code FOREIGN KEY (`currency_code`) REFERENCES `currencies` (`code`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS journal_entry_lines (
-    id TEXT PRIMARY KEY,
-    entry_id TEXT NOT NULL REFERENCES journal_entries(id) ON DELETE CASCADE,
-    line_number INTEGER NOT NULL,
-    account_id TEXT NOT NULL REFERENCES accounts(id),
-    party_id TEXT REFERENCES parties(id),
-    cost_center_id TEXT REFERENCES cost_centers(id),
-    debit NUMERIC NOT NULL DEFAULT 0,
-    credit NUMERIC NOT NULL DEFAULT 0,
-    description TEXT,
-    currency_code TEXT NOT NULL DEFAULT 'EGP',
-    exchange_rate NUMERIC NOT NULL DEFAULT 1.0,
-    amount_currency NUMERIC NOT NULL DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `bank_accounts` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `bank_name` LONGTEXT NOT NULL,
+  `account_number` LONGTEXT NOT NULL,
+  `iban` LONGTEXT,
+  `swift_code` LONGTEXT,
+  `branch_name` LONGTEXT,
+  `account_id` VARCHAR(191) NOT NULL,
+  `currency_code` VARCHAR(191) NOT NULL DEFAULT 'EGP',
+  `current_balance` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `is_active` INTEGER NOT NULL DEFAULT 1,
+  CONSTRAINT fk_bank_accounts_account_id FOREIGN KEY (`account_id`) REFERENCES `accounts` (`id`),
+  CONSTRAINT fk_bank_accounts_currency_code FOREIGN KEY (`currency_code`) REFERENCES `currencies` (`code`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE INDEX IF NOT EXISTS idx_jel_account ON journal_entry_lines(account_id);
-CREATE INDEX IF NOT EXISTS idx_jel_party ON journal_entry_lines(party_id);
-CREATE INDEX IF NOT EXISTS idx_jel_entry ON journal_entry_lines(entry_id);
+CREATE TABLE IF NOT EXISTS `payment_vouchers` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `voucher_number` VARCHAR(255) NOT NULL UNIQUE,
+  `voucher_type` VARCHAR(255) NOT NULL,
+  `branch_id` VARCHAR(191) NOT NULL,
+  `payment_method` LONGTEXT NOT NULL,
+  `cash_box_id` VARCHAR(191),
+  `bank_account_id` VARCHAR(191),
+  `party_id` VARCHAR(191),
+  `direct_account_id` VARCHAR(191),
+  `cost_center_id` VARCHAR(191),
+  `voucher_date` DATE NOT NULL,
+  `amount` DECIMAL(24,8) NOT NULL,
+  `currency_code` VARCHAR(191) NOT NULL DEFAULT 'EGP',
+  `exchange_rate` DECIMAL(24,8) NOT NULL DEFAULT 1.0,
+  `allocated_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `unallocated_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `notes` LONGTEXT,
+  `description` LONGTEXT NOT NULL,
+  `journal_entry_id` VARCHAR(191),
+  `status` VARCHAR(255) NOT NULL DEFAULT 'posted',
+  `created_by` LONGTEXT NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_payment_vouchers_branch_id FOREIGN KEY (`branch_id`) REFERENCES `branches` (`id`),
+  CONSTRAINT fk_payment_vouchers_cash_box_id FOREIGN KEY (`cash_box_id`) REFERENCES `cash_boxes` (`id`),
+  CONSTRAINT fk_payment_vouchers_bank_account_id FOREIGN KEY (`bank_account_id`) REFERENCES `bank_accounts` (`id`),
+  CONSTRAINT fk_payment_vouchers_party_id FOREIGN KEY (`party_id`) REFERENCES `parties` (`id`),
+  CONSTRAINT fk_payment_vouchers_direct_account_id FOREIGN KEY (`direct_account_id`) REFERENCES `accounts` (`id`),
+  CONSTRAINT fk_payment_vouchers_cost_center_id FOREIGN KEY (`cost_center_id`) REFERENCES `cost_centers` (`id`),
+  CONSTRAINT fk_payment_vouchers_currency_code FOREIGN KEY (`currency_code`) REFERENCES `currencies` (`code`),
+  CONSTRAINT fk_payment_vouchers_journal_entry_id FOREIGN KEY (`journal_entry_id`) REFERENCES `journal_entries` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 12. Sales Invoices & Items (فواتير المبيعات)
-CREATE TABLE IF NOT EXISTS sales_invoices (
-    id TEXT PRIMARY KEY,
-    invoice_number TEXT NOT NULL UNIQUE,
-    branch_id TEXT NOT NULL REFERENCES branches(id),
-    warehouse_id TEXT NOT NULL REFERENCES warehouses(id),
-    customer_id TEXT NOT NULL REFERENCES parties(id),
-    invoice_date DATE NOT NULL,
-    due_date DATE NOT NULL,
-    payment_type TEXT NOT NULL, -- cash, credit, mixed
-    currency_code TEXT NOT NULL DEFAULT 'EGP' REFERENCES currencies(code),
-    exchange_rate NUMERIC NOT NULL DEFAULT 1.0,
-    subtotal NUMERIC NOT NULL DEFAULT 0,
-    discount_amount NUMERIC NOT NULL DEFAULT 0,
-    taxable_amount NUMERIC NOT NULL DEFAULT 0,
-    tax_amount NUMERIC NOT NULL DEFAULT 0, -- 14% VAT
-    withholding_tax_amount NUMERIC NOT NULL DEFAULT 0, -- خصم وتحصيل تحت حساب الضريبة (1%)
-    total_amount NUMERIC NOT NULL DEFAULT 0,
-    paid_amount NUMERIC NOT NULL DEFAULT 0,
-    remaining_amount NUMERIC NOT NULL DEFAULT 0,
-    cogs_amount NUMERIC NOT NULL DEFAULT 0, -- Total COGS recorded
-    status TEXT NOT NULL DEFAULT 'posted', -- draft, posted, partially_paid, paid, cancelled, reversed
-    notes TEXT,
-    journal_entry_id TEXT REFERENCES journal_entries(id),
-    eta_uuid TEXT,
-    eta_submission_id TEXT,
-    eta_status TEXT DEFAULT 'NotSubmitted', -- NotSubmitted, Submitted, Valid, Invalid, Cancelled
-    created_by TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `voucher_allocations` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `voucher_id` VARCHAR(191) NOT NULL,
+  `invoice_type` LONGTEXT NOT NULL,
+  `invoice_id` VARCHAR(191) NOT NULL,
+  `allocated_amount` DECIMAL(24,8) NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_voucher_allocations_voucher_id FOREIGN KEY (`voucher_id`) REFERENCES `payment_vouchers` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS sales_invoice_items (
-    id TEXT PRIMARY KEY,
-    invoice_id TEXT NOT NULL REFERENCES sales_invoices(id) ON DELETE CASCADE,
-    item_id TEXT NOT NULL REFERENCES items(id),
-    unit_name TEXT NOT NULL,
-    unit_factor NUMERIC NOT NULL DEFAULT 1.0,
-    quantity NUMERIC NOT NULL,
-    returned_quantity NUMERIC NOT NULL DEFAULT 0,
-    unit_price NUMERIC NOT NULL,
-    cost_price NUMERIC NOT NULL DEFAULT 0, -- Historical unit cost at time of sale
-    discount_percent NUMERIC NOT NULL DEFAULT 0,
-    discount_amount NUMERIC NOT NULL DEFAULT 0,
-    tax_rate NUMERIC NOT NULL DEFAULT 14.0,
-    tax_amount NUMERIC NOT NULL DEFAULT 0,
-    total_amount NUMERIC NOT NULL
-);
+CREATE TABLE IF NOT EXISTS `cheques` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `cheque_number` LONGTEXT NOT NULL,
+  `cheque_type` VARCHAR(255) NOT NULL,
+  `bank_name` LONGTEXT NOT NULL,
+  `branch_id` VARCHAR(191) NOT NULL,
+  `party_id` VARCHAR(191) NOT NULL,
+  `amount` DECIMAL(24,8) NOT NULL,
+  `due_date` DATE NOT NULL,
+  `status` VARCHAR(255) NOT NULL DEFAULT 'in_portfolio',
+  `deposit_bank_id` VARCHAR(191),
+  `collection_date` DATE,
+  `bounce_date` DATE,
+  `bounce_reason` LONGTEXT,
+  `journal_entry_id` VARCHAR(191),
+  `notes` LONGTEXT,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_cheques_branch_id FOREIGN KEY (`branch_id`) REFERENCES `branches` (`id`),
+  CONSTRAINT fk_cheques_party_id FOREIGN KEY (`party_id`) REFERENCES `parties` (`id`),
+  CONSTRAINT fk_cheques_deposit_bank_id FOREIGN KEY (`deposit_bank_id`) REFERENCES `bank_accounts` (`id`),
+  CONSTRAINT fk_cheques_journal_entry_id FOREIGN KEY (`journal_entry_id`) REFERENCES `journal_entries` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 13. Sales Returns (مردودات المبيعات)
-CREATE TABLE IF NOT EXISTS sales_returns (
-    id TEXT PRIMARY KEY,
-    return_number TEXT NOT NULL UNIQUE,
-    original_invoice_id TEXT REFERENCES sales_invoices(id),
-    branch_id TEXT NOT NULL REFERENCES branches(id),
-    warehouse_id TEXT NOT NULL REFERENCES warehouses(id),
-    customer_id TEXT NOT NULL REFERENCES parties(id),
-    return_date DATE NOT NULL,
-    refund_type TEXT NOT NULL, -- credit_note, cash
-    subtotal NUMERIC NOT NULL DEFAULT 0,
-    tax_amount NUMERIC NOT NULL DEFAULT 0,
-    withholding_tax_amount NUMERIC NOT NULL DEFAULT 0,
-    total_amount NUMERIC NOT NULL DEFAULT 0,
-    refunded_cash_amount NUMERIC NOT NULL DEFAULT 0,
-    cogs_reversed_amount NUMERIC NOT NULL DEFAULT 0,
-    journal_entry_id TEXT REFERENCES journal_entries(id),
-    status TEXT NOT NULL DEFAULT 'posted',
-    notes TEXT,
-    created_by TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `stock_transactions` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `trans_number` VARCHAR(255) NOT NULL UNIQUE,
+  `trans_type` VARCHAR(255) NOT NULL,
+  `branch_id` VARCHAR(191) NOT NULL,
+  `from_warehouse_id` VARCHAR(191),
+  `to_warehouse_id` VARCHAR(191),
+  `trans_date` DATE NOT NULL,
+  `notes` LONGTEXT,
+  `journal_entry_id` VARCHAR(191),
+  `status` VARCHAR(255) NOT NULL DEFAULT 'posted',
+  `created_by` LONGTEXT NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_stock_transactions_branch_id FOREIGN KEY (`branch_id`) REFERENCES `branches` (`id`),
+  CONSTRAINT fk_stock_transactions_from_warehouse_id FOREIGN KEY (`from_warehouse_id`) REFERENCES `warehouses` (`id`),
+  CONSTRAINT fk_stock_transactions_to_warehouse_id FOREIGN KEY (`to_warehouse_id`) REFERENCES `warehouses` (`id`),
+  CONSTRAINT fk_stock_transactions_journal_entry_id FOREIGN KEY (`journal_entry_id`) REFERENCES `journal_entries` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS sales_return_items (
-    id TEXT PRIMARY KEY,
-    return_id TEXT NOT NULL REFERENCES sales_returns(id) ON DELETE CASCADE,
-    original_invoice_item_id TEXT REFERENCES sales_invoice_items(id),
-    item_id TEXT NOT NULL REFERENCES items(id),
-    unit_name TEXT NOT NULL,
-    unit_factor NUMERIC NOT NULL DEFAULT 1.0,
-    quantity NUMERIC NOT NULL,
-    unit_price NUMERIC NOT NULL,
-    unit_cost NUMERIC NOT NULL,
-    tax_rate NUMERIC NOT NULL DEFAULT 14.0,
-    tax_amount NUMERIC NOT NULL DEFAULT 0,
-    total_amount NUMERIC NOT NULL
-);
+CREATE TABLE IF NOT EXISTS `fixed_assets` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `code` VARCHAR(191) NOT NULL UNIQUE,
+  `name_ar` VARCHAR(255) NOT NULL,
+  `name_en` VARCHAR(255) NOT NULL,
+  `branch_id` VARCHAR(191) NOT NULL,
+  `cost_center_id` VARCHAR(191),
+  `purchase_date` DATE NOT NULL,
+  `operation_date` DATE NOT NULL,
+  `purchase_cost` DECIMAL(24,8) NOT NULL,
+  `scrap_value` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `useful_life_years` DECIMAL(24,8) NOT NULL,
+  `depreciation_method` VARCHAR(255) NOT NULL DEFAULT 'straight_line',
+  `annual_depreciation_rate` DECIMAL(24,8) NOT NULL,
+  `accumulated_depreciation` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `book_value` DECIMAL(24,8) NOT NULL,
+  `asset_account_id` VARCHAR(191) NOT NULL,
+  `depreciation_expense_account_id` VARCHAR(191) NOT NULL,
+  `accumulated_depreciation_account_id` VARCHAR(191) NOT NULL,
+  `status` VARCHAR(255) NOT NULL DEFAULT 'active',
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_fixed_assets_branch_id FOREIGN KEY (`branch_id`) REFERENCES `branches` (`id`),
+  CONSTRAINT fk_fixed_assets_cost_center_id FOREIGN KEY (`cost_center_id`) REFERENCES `cost_centers` (`id`),
+  CONSTRAINT fk_fixed_assets_asset_account_id FOREIGN KEY (`asset_account_id`) REFERENCES `accounts` (`id`),
+  CONSTRAINT fk_fixed_assets_depreciation_expense_acco FOREIGN KEY (`depreciation_expense_account_id`) REFERENCES `accounts` (`id`),
+  CONSTRAINT fk_fixed_assets_accumulated_depreciation_ FOREIGN KEY (`accumulated_depreciation_account_id`) REFERENCES `accounts` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 14. Purchase Invoices & Items (فواتير المشتريات)
-CREATE TABLE IF NOT EXISTS purchase_invoices (
-    id TEXT PRIMARY KEY,
-    invoice_number TEXT NOT NULL UNIQUE,
-    supplier_invoice_number TEXT,
-    branch_id TEXT NOT NULL REFERENCES branches(id),
-    warehouse_id TEXT NOT NULL REFERENCES warehouses(id),
-    supplier_id TEXT NOT NULL REFERENCES parties(id),
-    invoice_date DATE NOT NULL,
-    due_date DATE NOT NULL,
-    payment_type TEXT NOT NULL, -- cash, credit
-    currency_code TEXT NOT NULL DEFAULT 'EGP' REFERENCES currencies(code),
-    exchange_rate NUMERIC NOT NULL DEFAULT 1.0,
-    subtotal NUMERIC NOT NULL DEFAULT 0,
-    discount_amount NUMERIC NOT NULL DEFAULT 0,
-    taxable_amount NUMERIC NOT NULL DEFAULT 0,
-    tax_amount NUMERIC NOT NULL DEFAULT 0,
-    withholding_tax_amount NUMERIC NOT NULL DEFAULT 0,
-    additional_expenses NUMERIC NOT NULL DEFAULT 0,
-    total_amount NUMERIC NOT NULL DEFAULT 0,
-    paid_amount NUMERIC NOT NULL DEFAULT 0,
-    remaining_amount NUMERIC NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'posted',
-    notes TEXT,
-    journal_entry_id TEXT REFERENCES journal_entries(id),
-    created_by TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `fixed_asset_depreciations` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `asset_id` VARCHAR(191) NOT NULL,
+  `depreciation_date` DATE NOT NULL,
+  `amount` DECIMAL(24,8) NOT NULL,
+  `journal_entry_id` VARCHAR(191),
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(asset_id, depreciation_date),
+  CONSTRAINT fk_fixed_asset_depreciations_asset_id FOREIGN KEY (`asset_id`) REFERENCES `fixed_assets` (`id`),
+  CONSTRAINT fk_fixed_asset_depreciations_journal_entry_id FOREIGN KEY (`journal_entry_id`) REFERENCES `journal_entries` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS purchase_invoice_items (
-    id TEXT PRIMARY KEY,
-    invoice_id TEXT NOT NULL REFERENCES purchase_invoices(id) ON DELETE CASCADE,
-    item_id TEXT NOT NULL REFERENCES items(id),
-    unit_name TEXT NOT NULL,
-    unit_factor NUMERIC NOT NULL DEFAULT 1.0,
-    quantity NUMERIC NOT NULL,
-    returned_quantity NUMERIC NOT NULL DEFAULT 0,
-    unit_price NUMERIC NOT NULL,
-    discount_percent NUMERIC NOT NULL DEFAULT 0,
-    discount_amount NUMERIC NOT NULL DEFAULT 0,
-    tax_rate NUMERIC NOT NULL DEFAULT 14.0,
-    tax_amount NUMERIC NOT NULL DEFAULT 0,
-    total_amount NUMERIC NOT NULL
-);
+CREATE TABLE IF NOT EXISTS `users` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `username` VARCHAR(255) NOT NULL UNIQUE,
+  `password_hash` LONGTEXT NOT NULL,
+  `display_name` LONGTEXT NOT NULL,
+  `role` VARCHAR(255) NOT NULL,
+  `is_active` INTEGER NOT NULL DEFAULT 1,
+  `force_change_password` INTEGER NOT NULL DEFAULT 0,
+  `allowed_branch_ids` LONGTEXT,
+  `allowed_warehouse_ids` LONGTEXT,
+  `allowed_cashbox_ids` LONGTEXT,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 15. Purchase Returns (مردودات المشتريات)
-CREATE TABLE IF NOT EXISTS purchase_returns (
-    id TEXT PRIMARY KEY,
-    return_number TEXT NOT NULL UNIQUE,
-    original_invoice_id TEXT REFERENCES purchase_invoices(id),
-    branch_id TEXT NOT NULL REFERENCES branches(id),
-    warehouse_id TEXT NOT NULL REFERENCES warehouses(id),
-    supplier_id TEXT NOT NULL REFERENCES parties(id),
-    return_date DATE NOT NULL,
-    subtotal NUMERIC NOT NULL DEFAULT 0,
-    tax_amount NUMERIC NOT NULL DEFAULT 0,
-    withholding_tax_amount NUMERIC NOT NULL DEFAULT 0,
-    total_amount NUMERIC NOT NULL DEFAULT 0,
-    journal_entry_id TEXT REFERENCES journal_entries(id),
-    status TEXT NOT NULL DEFAULT 'posted',
-    notes TEXT,
-    created_by TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `user_permissions` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `role` VARCHAR(255) NOT NULL,
+  `permission_key` VARCHAR(255) NOT NULL,
+  UNIQUE(role, permission_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS purchase_return_items (
-    id TEXT PRIMARY KEY,
-    return_id TEXT NOT NULL REFERENCES purchase_returns(id) ON DELETE CASCADE,
-    item_id TEXT NOT NULL REFERENCES items(id),
-    quantity NUMERIC NOT NULL,
-    unit_price NUMERIC NOT NULL,
-    tax_rate NUMERIC NOT NULL DEFAULT 14.0,
-    tax_amount NUMERIC NOT NULL DEFAULT 0,
-    total_amount NUMERIC NOT NULL
-);
+CREATE TABLE IF NOT EXISTS `audit_logs` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `user_id` VARCHAR(191) NOT NULL,
+  `action` VARCHAR(255) NOT NULL,
+  `entity_type` VARCHAR(255) NOT NULL,
+  `entity_id` VARCHAR(191) NOT NULL,
+  `details` LONGTEXT,
+  `old_values` LONGTEXT,
+  `new_values` LONGTEXT,
+  `ip_address` LONGTEXT,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  INDEX `idx_audit_time` (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 16. Treasury & Banks (الخزائن والبنوك)
-CREATE TABLE IF NOT EXISTS cash_boxes (
-    id TEXT PRIMARY KEY,
-    branch_id TEXT NOT NULL REFERENCES branches(id),
-    code TEXT NOT NULL UNIQUE,
-    name_ar TEXT NOT NULL,
-    name_en TEXT NOT NULL,
-    account_id TEXT NOT NULL REFERENCES accounts(id),
-    currency_code TEXT NOT NULL DEFAULT 'EGP' REFERENCES currencies(code),
-    current_balance NUMERIC NOT NULL DEFAULT 0,
-    is_active INTEGER NOT NULL DEFAULT 1
-);
+CREATE TABLE IF NOT EXISTS `eta_submissions` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `invoice_id` VARCHAR(191) NOT NULL,
+  `submission_uuid` VARCHAR(255) NOT NULL UNIQUE,
+  `eta_document_id` VARCHAR(191),
+  `submission_date` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  `status` VARCHAR(255) NOT NULL,
+  `eta_code` LONGTEXT,
+  `error_details` LONGTEXT,
+  `hash_signature` LONGTEXT,
+  `json_payload` LONGTEXT,
+  CONSTRAINT fk_eta_submissions_invoice_id FOREIGN KEY (`invoice_id`) REFERENCES `sales_invoices` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS bank_accounts (
-    id TEXT PRIMARY KEY,
-    bank_name TEXT NOT NULL,
-    account_number TEXT NOT NULL,
-    iban TEXT,
-    swift_code TEXT,
-    branch_name TEXT,
-    account_id TEXT NOT NULL REFERENCES accounts(id),
-    currency_code TEXT NOT NULL DEFAULT 'EGP' REFERENCES currencies(code),
-    current_balance NUMERIC NOT NULL DEFAULT 0,
-    is_active INTEGER NOT NULL DEFAULT 1
-);
+CREATE TABLE IF NOT EXISTS `period_closings` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `period_id` VARCHAR(191) NOT NULL,
+  `closed_by` LONGTEXT NOT NULL,
+  `closed_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  `notes` LONGTEXT,
+  `summary_json` LONGTEXT NOT NULL,
+  CONSTRAINT fk_period_closings_period_id FOREIGN KEY (`period_id`) REFERENCES `fiscal_periods` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 17. Payment Vouchers & Allocations (سندات القبض والصرف)
-CREATE TABLE IF NOT EXISTS payment_vouchers (
-    id TEXT PRIMARY KEY,
-    voucher_number TEXT NOT NULL UNIQUE,
-    voucher_type TEXT NOT NULL, -- receipt (قبض), payment (صرف)
-    branch_id TEXT NOT NULL REFERENCES branches(id),
-    payment_method TEXT NOT NULL, -- cash, bank_transfer, cheque
-    cash_box_id TEXT REFERENCES cash_boxes(id),
-    bank_account_id TEXT REFERENCES bank_accounts(id),
-    party_id TEXT REFERENCES parties(id),
-    direct_account_id TEXT REFERENCES accounts(id), -- For direct expense/revenue vouchers
-    cost_center_id TEXT REFERENCES cost_centers(id),
-    voucher_date DATE NOT NULL,
-    amount NUMERIC NOT NULL,
-    currency_code TEXT NOT NULL DEFAULT 'EGP' REFERENCES currencies(code),
-    exchange_rate NUMERIC NOT NULL DEFAULT 1.0,
-    allocated_amount NUMERIC NOT NULL DEFAULT 0,
-    unallocated_amount NUMERIC NOT NULL DEFAULT 0,
-    description TEXT NOT NULL,
-    journal_entry_id TEXT REFERENCES journal_entries(id),
-    status TEXT NOT NULL DEFAULT 'posted',
-    created_by TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `period_reopen_logs` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `period_id` VARCHAR(191) NOT NULL,
+  `reopened_by` LONGTEXT NOT NULL,
+  `reopened_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  `reason` LONGTEXT NOT NULL,
+  `previous_status` VARCHAR(255) NOT NULL DEFAULT 'closed',
+  CONSTRAINT fk_period_reopen_logs_period_id FOREIGN KEY (`period_id`) REFERENCES `fiscal_periods` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS voucher_allocations (
-    id TEXT PRIMARY KEY,
-    voucher_id TEXT NOT NULL REFERENCES payment_vouchers(id) ON DELETE CASCADE,
-    invoice_type TEXT NOT NULL, -- sales_invoice, purchase_invoice
-    invoice_id TEXT NOT NULL,
-    allocated_amount NUMERIC NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `bank_statements` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `bank_account_id` VARCHAR(191) NOT NULL,
+  `statement_date` DATE NOT NULL,
+  `opening_balance` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `closing_balance` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `filename` LONGTEXT,
+  `imported_by` LONGTEXT NOT NULL,
+  `imported_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_bank_statements_bank_account_id FOREIGN KEY (`bank_account_id`) REFERENCES `bank_accounts` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 18. Cheques Management (دورة الشيكات)
-CREATE TABLE IF NOT EXISTS cheques (
-    id TEXT PRIMARY KEY,
-    cheque_number TEXT NOT NULL,
-    cheque_type TEXT NOT NULL, -- received (شيك قبض), issued (شيك دفع)
-    bank_name TEXT NOT NULL,
-    branch_id TEXT NOT NULL REFERENCES branches(id),
-    party_id TEXT NOT NULL REFERENCES parties(id),
-    amount NUMERIC NOT NULL,
-    due_date DATE NOT NULL,
-    status TEXT NOT NULL DEFAULT 'in_portfolio', -- in_portfolio, under_collection, collected, bounced, cancelled
-    deposit_bank_id TEXT REFERENCES bank_accounts(id),
-    collection_date DATE,
-    bounce_date DATE,
-    bounce_reason TEXT,
-    journal_entry_id TEXT REFERENCES journal_entries(id),
-    notes TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `bank_statement_lines` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `statement_id` VARCHAR(191) NOT NULL,
+  `bank_account_id` VARCHAR(191) NOT NULL,
+  `line_date` DATE NOT NULL,
+  `reference` LONGTEXT,
+  `description` LONGTEXT NOT NULL,
+  `debit` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `credit` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `is_matched` INTEGER NOT NULL DEFAULT 0,
+  `matched_voucher_id` VARCHAR(191),
+  `matched_journal_line_id` VARCHAR(191),
+  `matched_at` DATETIME,
+  `matched_by` LONGTEXT,
+  CONSTRAINT fk_bank_statement_lines_statement_id FOREIGN KEY (`statement_id`) REFERENCES `bank_statements` (`id`) ON DELETE CASCADE,
+  CONSTRAINT fk_bank_statement_lines_bank_account_id FOREIGN KEY (`bank_account_id`) REFERENCES `bank_accounts` (`id`),
+  CONSTRAINT fk_bank_statement_lines_matched_voucher_id FOREIGN KEY (`matched_voucher_id`) REFERENCES `payment_vouchers` (`id`),
+  CONSTRAINT fk_bank_statement_lines_matched_journal_line_id FOREIGN KEY (`matched_journal_line_id`) REFERENCES `journal_entry_lines` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 19. Stock Transactions & Inventory Counting (حركات المخزون والجرد)
-CREATE TABLE IF NOT EXISTS stock_transactions (
-    id TEXT PRIMARY KEY,
-    trans_number TEXT NOT NULL UNIQUE,
-    trans_type TEXT NOT NULL, -- receipt, issue, transfer, physical_count, adjustment
-    branch_id TEXT NOT NULL REFERENCES branches(id),
-    from_warehouse_id TEXT REFERENCES warehouses(id),
-    to_warehouse_id TEXT REFERENCES warehouses(id),
-    trans_date DATE NOT NULL,
-    notes TEXT,
-    journal_entry_id TEXT REFERENCES journal_entries(id),
-    status TEXT NOT NULL DEFAULT 'posted',
-    created_by TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `bank_reconciliations` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `bank_account_id` VARCHAR(191) NOT NULL,
+  `period_id` VARCHAR(191) NOT NULL,
+  `reconciliation_date` DATE NOT NULL,
+  `statement_balance` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `book_balance` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `adjusted_bank_balance` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `adjusted_book_balance` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `variance` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `status` VARCHAR(255) NOT NULL DEFAULT 'draft',
+  `approved_by` LONGTEXT,
+  `approved_at` DATETIME,
+  `notes` LONGTEXT,
+  `created_by` LONGTEXT NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_bank_reconciliations_bank_account_id FOREIGN KEY (`bank_account_id`) REFERENCES `bank_accounts` (`id`),
+  CONSTRAINT fk_bank_reconciliations_period_id FOREIGN KEY (`period_id`) REFERENCES `fiscal_periods` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS stock_transaction_items (
-    id TEXT PRIMARY KEY,
-    transaction_id TEXT NOT NULL REFERENCES stock_transactions(id) ON DELETE CASCADE,
-    item_id TEXT NOT NULL REFERENCES items(id),
-    quantity NUMERIC NOT NULL,
-    unit_cost NUMERIC NOT NULL,
-    total_cost NUMERIC NOT NULL,
-    batch_number TEXT,
-    expiry_date DATE
-);
+CREATE TABLE IF NOT EXISTS `inventory_counts` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `count_number` VARCHAR(255) NOT NULL UNIQUE,
+  `branch_id` VARCHAR(191) NOT NULL,
+  `warehouse_id` VARCHAR(191) NOT NULL,
+  `count_date` DATE NOT NULL,
+  `status` VARCHAR(255) NOT NULL DEFAULT 'draft',
+  `notes` LONGTEXT,
+  `journal_entry_id` VARCHAR(191),
+  `stock_transaction_id` VARCHAR(191),
+  `total_shortage_cost` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `total_surplus_cost` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `net_variance_cost` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `created_by` LONGTEXT NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  `posted_by` LONGTEXT,
+  `posted_at` DATETIME,
+  CONSTRAINT fk_inventory_counts_branch_id FOREIGN KEY (`branch_id`) REFERENCES `branches` (`id`),
+  CONSTRAINT fk_inventory_counts_warehouse_id FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses` (`id`),
+  CONSTRAINT fk_inventory_counts_journal_entry_id FOREIGN KEY (`journal_entry_id`) REFERENCES `journal_entries` (`id`),
+  CONSTRAINT fk_inventory_counts_stock_transaction_id FOREIGN KEY (`stock_transaction_id`) REFERENCES `stock_transactions` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 20. Fixed Assets & Depreciation (الأصول الثابتة والإهلاك)
-CREATE TABLE IF NOT EXISTS fixed_assets (
-    id TEXT PRIMARY KEY,
-    code TEXT NOT NULL UNIQUE,
-    name_ar TEXT NOT NULL,
-    name_en TEXT NOT NULL,
-    branch_id TEXT NOT NULL REFERENCES branches(id),
-    cost_center_id TEXT REFERENCES cost_centers(id),
-    purchase_date DATE NOT NULL,
-    operation_date DATE NOT NULL,
-    purchase_cost NUMERIC NOT NULL,
-    scrap_value NUMERIC NOT NULL DEFAULT 0,
-    useful_life_years NUMERIC NOT NULL,
-    depreciation_method TEXT NOT NULL DEFAULT 'straight_line', -- straight_line (القسط الثابت)
-    annual_depreciation_rate NUMERIC NOT NULL,
-    accumulated_depreciation NUMERIC NOT NULL DEFAULT 0,
-    book_value NUMERIC NOT NULL,
-    asset_account_id TEXT NOT NULL REFERENCES accounts(id),
-    depreciation_expense_account_id TEXT NOT NULL REFERENCES accounts(id),
-    accumulated_depreciation_account_id TEXT NOT NULL REFERENCES accounts(id),
-    status TEXT NOT NULL DEFAULT 'active', -- active, disposed, sold
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `excel_imports_log` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `import_type` VARCHAR(255) NOT NULL,
+  `filename` LONGTEXT NOT NULL,
+  `total_rows` INTEGER NOT NULL DEFAULT 0,
+  `valid_rows` INTEGER NOT NULL DEFAULT 0,
+  `error_rows` INTEGER NOT NULL DEFAULT 0,
+  `status` VARCHAR(255) NOT NULL,
+  `details_json` LONGTEXT,
+  `imported_by` LONGTEXT NOT NULL,
+  `imported_at` DATETIME DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS fixed_asset_depreciations (
-    id TEXT PRIMARY KEY,
-    asset_id TEXT NOT NULL REFERENCES fixed_assets(id),
-    depreciation_date DATE NOT NULL,
-    amount NUMERIC NOT NULL,
-    journal_entry_id TEXT REFERENCES journal_entries(id),
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(asset_id, depreciation_date)
-);
+CREATE TABLE IF NOT EXISTS `system_backups` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `filename` LONGTEXT NOT NULL,
+  `file_path` LONGTEXT NOT NULL,
+  `file_size` BIGINT NOT NULL DEFAULT 0,
+  `schema_version` VARCHAR(255) NOT NULL DEFAULT '1.0',
+  `integrity_status` VARCHAR(255) NOT NULL DEFAULT 'OK',
+  `record_counts_json` LONGTEXT NOT NULL,
+  `created_by` LONGTEXT NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 21. Users, Roles & Granular Permissions
-CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    username TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    display_name TEXT NOT NULL,
-    role TEXT NOT NULL, -- owner, admin, finance_manager, accountant, sales_officer, purchase_officer, storekeeper, cashier, auditor_readonly
-    is_active INTEGER NOT NULL DEFAULT 1,
-    force_change_password INTEGER NOT NULL DEFAULT 0,
-    allowed_branch_ids TEXT, -- JSON array of branch IDs, or '*' for all
-    allowed_warehouse_ids TEXT, -- JSON array
-    allowed_cashbox_ids TEXT, -- JSON array
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `individual_permissions` (
+  `user_id` VARCHAR(191) PRIMARY KEY,
+  `permission_keys` LONGTEXT NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_individual_permissions_user_id FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS user_permissions (
-    id TEXT PRIMARY KEY,
-    role TEXT NOT NULL,
-    permission_key TEXT NOT NULL, -- view, add, edit_draft, approve, post, reverse, print, export, view_cost, view_profit, change_price, override_discount, override_credit, manage_settings, reopen_period
-    UNIQUE(role, permission_key)
-);
+CREATE TABLE IF NOT EXISTS `user_sessions` (
+  `token` VARCHAR(191) PRIMARY KEY,
+  `user_id` VARCHAR(191) NOT NULL,
+  `expires_at` DATETIME NOT NULL,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_user_sessions_user_id FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 22. Immutable Audit Log (سجل التدقيق غير القابل للتعديل)
-CREATE TABLE IF NOT EXISTS audit_logs (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    action TEXT NOT NULL, -- LOGIN, POST_JOURNAL, REVERSE_ENTRY, CREATE_INVOICE, APPROVE_PAYMENT, REOPEN_PERIOD, etc.
-    entity_type TEXT NOT NULL,
-    entity_id TEXT NOT NULL,
-    details TEXT,
-    old_values TEXT, -- JSON
-    new_values TEXT, -- JSON
-    ip_address TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `idempotency_keys` (
+  `key` VARCHAR(191) PRIMARY KEY,
+  `user_id` VARCHAR(191) NOT NULL,
+  `endpoint` LONGTEXT NOT NULL,
+  `request_hash` LONGTEXT,
+  `response_code` INTEGER,
+  `response_body` LONGTEXT,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_logs(created_at);
+CREATE TABLE IF NOT EXISTS `login_attempts` (
+  `ip_or_user` VARCHAR(191) PRIMARY KEY,
+  `attempts` INTEGER DEFAULT 0,
+  `last_attempt` DATETIME,
+  `locked_until` DATETIME
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 23. ETA Egyptian Tax Authority E-Invoicing Submissions
-CREATE TABLE IF NOT EXISTS eta_submissions (
-    id TEXT PRIMARY KEY,
-    invoice_id TEXT NOT NULL REFERENCES sales_invoices(id),
-    submission_uuid TEXT NOT NULL UNIQUE,
-    eta_document_id TEXT,
-    submission_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-    status TEXT NOT NULL, -- Submitted, Valid, Invalid, Rejected
-    eta_code TEXT,
-    error_details TEXT,
-    hash_signature TEXT,
-    json_payload TEXT
-);
+CREATE TABLE IF NOT EXISTS `system_settings` (
+  `setting_key` VARCHAR(191) PRIMARY KEY,
+  `setting_value` LONGTEXT NOT NULL,
+  `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 24. Period Closings & Re-open Audit Logs (إقفال ومراجعة الفترات المالية)
-CREATE TABLE IF NOT EXISTS period_closings (
-    id TEXT PRIMARY KEY,
-    period_id TEXT NOT NULL REFERENCES fiscal_periods(id),
-    closed_by TEXT NOT NULL,
-    closed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    notes TEXT,
-    summary_json TEXT NOT NULL -- Detailed snapshot of trial balance, control accounts, drafts, and reconciliation
-);
+CREATE TABLE IF NOT EXISTS `item_categories` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `code` VARCHAR(191) NOT NULL UNIQUE,
+  `name_ar` VARCHAR(255) NOT NULL,
+  `name_en` VARCHAR(255),
+  `parent_id` VARCHAR(191),
+  `is_active` INTEGER NOT NULL DEFAULT 1,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_item_categories_parent_id FOREIGN KEY (`parent_id`) REFERENCES `item_categories` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS period_reopen_logs (
-    id TEXT PRIMARY KEY,
-    period_id TEXT NOT NULL REFERENCES fiscal_periods(id),
-    reopened_by TEXT NOT NULL,
-    reopened_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    reason TEXT NOT NULL,
-    previous_status TEXT NOT NULL DEFAULT 'closed'
-);
+CREATE TABLE IF NOT EXISTS `party_sequences` (
+  `type` VARCHAR(191) PRIMARY KEY,
+  `last_number` INTEGER NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 25. Bank Reconciliation & Statements (تسوية كشف الحساب البنكي)
-CREATE TABLE IF NOT EXISTS bank_statements (
-    id TEXT PRIMARY KEY,
-    bank_account_id TEXT NOT NULL REFERENCES bank_accounts(id),
-    statement_date DATE NOT NULL,
-    opening_balance NUMERIC NOT NULL DEFAULT 0,
-    closing_balance NUMERIC NOT NULL DEFAULT 0,
-    filename TEXT,
-    imported_by TEXT NOT NULL,
-    imported_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `account_sequences` (
+  `sequence_key` VARCHAR(191) PRIMARY KEY,
+  `last_number` INTEGER NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS bank_statement_lines (
-    id TEXT PRIMARY KEY,
-    statement_id TEXT NOT NULL REFERENCES bank_statements(id) ON DELETE CASCADE,
-    bank_account_id TEXT NOT NULL REFERENCES bank_accounts(id),
-    line_date DATE NOT NULL,
-    reference TEXT,
-    description TEXT NOT NULL,
-    debit NUMERIC NOT NULL DEFAULT 0,
-    credit NUMERIC NOT NULL DEFAULT 0,
-    is_matched INTEGER NOT NULL DEFAULT 0,
-    matched_voucher_id TEXT REFERENCES payment_vouchers(id),
-    matched_journal_line_id TEXT REFERENCES journal_entry_lines(id),
-    matched_at DATETIME,
-    matched_by TEXT
-);
+CREATE TABLE IF NOT EXISTS `items` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `code` VARCHAR(191) NOT NULL UNIQUE,
+  `barcode` LONGTEXT,
+  `name_ar` VARCHAR(255) NOT NULL,
+  `name_en` VARCHAR(255) NOT NULL,
+  `item_type` VARCHAR(255) NOT NULL,
+  `category` VARCHAR(255) NOT NULL DEFAULT 'عام',
+  `base_unit` VARCHAR(255) NOT NULL DEFAULT 'قطعة',
+  `cost_price` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `sale_price` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `min_stock_level` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `moving_avg_cost` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `tax_rate` DECIMAL(24,8) NOT NULL DEFAULT 14.0,
+  `eta_item_code` LONGTEXT,
+  `eta_code_type` VARCHAR(255) DEFAULT 'EGS',
+  `is_active` INTEGER NOT NULL DEFAULT 1,
+  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  `category_id` VARCHAR(191),
+  CONSTRAINT fk_items_category_id FOREIGN KEY (`category_id`) REFERENCES `item_categories` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS bank_reconciliations (
-    id TEXT PRIMARY KEY,
-    bank_account_id TEXT NOT NULL REFERENCES bank_accounts(id),
-    period_id TEXT NOT NULL REFERENCES fiscal_periods(id),
-    reconciliation_date DATE NOT NULL,
-    statement_balance NUMERIC NOT NULL DEFAULT 0,
-    book_balance NUMERIC NOT NULL DEFAULT 0,
-    adjusted_bank_balance NUMERIC NOT NULL DEFAULT 0,
-    adjusted_book_balance NUMERIC NOT NULL DEFAULT 0,
-    variance NUMERIC NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'draft', -- draft, approved
-    approved_by TEXT,
-    approved_at DATETIME,
-    notes TEXT,
-    created_by TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `item_units` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `item_id` VARCHAR(191) NOT NULL,
+  `unit_name` VARCHAR(255) NOT NULL,
+  `conversion_factor` DECIMAL(24,8) NOT NULL DEFAULT 1.0,
+  `sale_price` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `barcode` LONGTEXT,
+  `is_base` INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(item_id, unit_name),
+  CONSTRAINT fk_item_units_item_id FOREIGN KEY (`item_id`) REFERENCES `items` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 26. Physical Inventory Count & Stock Adjustments (جرد المخزون ومحاضر التسوية)
-CREATE TABLE IF NOT EXISTS inventory_counts (
-    id TEXT PRIMARY KEY,
-    count_number TEXT NOT NULL UNIQUE,
-    branch_id TEXT NOT NULL REFERENCES branches(id),
-    warehouse_id TEXT NOT NULL REFERENCES warehouses(id),
-    count_date DATE NOT NULL,
-    status TEXT NOT NULL DEFAULT 'draft', -- draft, posted, cancelled
-    notes TEXT,
-    journal_entry_id TEXT REFERENCES journal_entries(id),
-    stock_transaction_id TEXT REFERENCES stock_transactions(id),
-    total_shortage_cost NUMERIC NOT NULL DEFAULT 0,
-    total_surplus_cost NUMERIC NOT NULL DEFAULT 0,
-    net_variance_cost NUMERIC NOT NULL DEFAULT 0,
-    created_by TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    posted_by TEXT,
-    posted_at DATETIME
-);
+CREATE TABLE IF NOT EXISTS `warehouse_stock` (
+  `warehouse_id` VARCHAR(191) NOT NULL,
+  `item_id` VARCHAR(191) NOT NULL,
+  `quantity` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `reserved_qty` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  PRIMARY KEY(warehouse_id, item_id),
+  CONSTRAINT fk_warehouse_stock_warehouse_id FOREIGN KEY (`warehouse_id`) REFERENCES `warehouses` (`id`),
+  CONSTRAINT fk_warehouse_stock_item_id FOREIGN KEY (`item_id`) REFERENCES `items` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE IF NOT EXISTS inventory_count_items (
-    id TEXT PRIMARY KEY,
-    count_id TEXT NOT NULL REFERENCES inventory_counts(id) ON DELETE CASCADE,
-    item_id TEXT NOT NULL REFERENCES items(id),
-    system_quantity NUMERIC NOT NULL DEFAULT 0,
-    counted_quantity NUMERIC NOT NULL DEFAULT 0,
-    diff_quantity NUMERIC NOT NULL DEFAULT 0,
-    unit_cost NUMERIC NOT NULL DEFAULT 0,
-    total_diff_cost NUMERIC NOT NULL DEFAULT 0,
-    notes TEXT
-);
+CREATE TABLE IF NOT EXISTS `sales_invoice_items` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `invoice_id` VARCHAR(191) NOT NULL,
+  `item_id` VARCHAR(191) NOT NULL,
+  `unit_name` VARCHAR(255) NOT NULL,
+  `unit_factor` DECIMAL(24,8) NOT NULL DEFAULT 1.0,
+  `quantity` DECIMAL(24,8) NOT NULL,
+  `returned_quantity` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `unit_price` DECIMAL(24,8) NOT NULL,
+  `cost_price` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `discount_percent` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `discount_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `tax_rate` DECIMAL(24,8) NOT NULL DEFAULT 14.0,
+  `tax_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `total_amount` DECIMAL(24,8) NOT NULL,
+  CONSTRAINT fk_sales_invoice_items_invoice_id FOREIGN KEY (`invoice_id`) REFERENCES `sales_invoices` (`id`) ON DELETE CASCADE,
+  CONSTRAINT fk_sales_invoice_items_item_id FOREIGN KEY (`item_id`) REFERENCES `items` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 27. Excel Import Logs & Tracking (سجلات استيراد البيانات والأرصدة)
-CREATE TABLE IF NOT EXISTS excel_imports_log (
-    id TEXT PRIMARY KEY,
-    import_type TEXT NOT NULL, -- chart_of_accounts, parties, items, opening_balances
-    filename TEXT NOT NULL,
-    total_rows INTEGER NOT NULL DEFAULT 0,
-    valid_rows INTEGER NOT NULL DEFAULT 0,
-    error_rows INTEGER NOT NULL DEFAULT 0,
-    status TEXT NOT NULL, -- previewed, committed, failed
-    details_json TEXT,
-    imported_by TEXT NOT NULL,
-    imported_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `sales_return_items` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `return_id` VARCHAR(191) NOT NULL,
+  `original_invoice_item_id` VARCHAR(191),
+  `item_id` VARCHAR(191) NOT NULL,
+  `unit_name` VARCHAR(255) NOT NULL,
+  `unit_factor` DECIMAL(24,8) NOT NULL DEFAULT 1.0,
+  `quantity` DECIMAL(24,8) NOT NULL,
+  `unit_price` DECIMAL(24,8) NOT NULL,
+  `unit_cost` DECIMAL(24,8) NOT NULL,
+  `tax_rate` DECIMAL(24,8) NOT NULL DEFAULT 14.0,
+  `tax_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `total_amount` DECIMAL(24,8) NOT NULL,
+  CONSTRAINT fk_sales_return_items_return_id FOREIGN KEY (`return_id`) REFERENCES `sales_returns` (`id`) ON DELETE CASCADE,
+  CONSTRAINT fk_sales_return_items_original_invoice_item_id FOREIGN KEY (`original_invoice_item_id`) REFERENCES `sales_invoice_items` (`id`),
+  CONSTRAINT fk_sales_return_items_item_id FOREIGN KEY (`item_id`) REFERENCES `items` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- 28. System Backups Registry (سجل النسخ الاحتياطية المتسقة)
-CREATE TABLE IF NOT EXISTS system_backups (
-    id TEXT PRIMARY KEY,
-    filename TEXT NOT NULL,
-    file_path TEXT NOT NULL,
-    file_size INTEGER NOT NULL DEFAULT 0,
-    schema_version TEXT NOT NULL DEFAULT '1.0',
-    integrity_status TEXT NOT NULL DEFAULT 'OK',
-    record_counts_json TEXT NOT NULL,
-    created_by TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS `purchase_invoice_items` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `invoice_id` VARCHAR(191) NOT NULL,
+  `item_id` VARCHAR(191) NOT NULL,
+  `unit_name` VARCHAR(255) NOT NULL,
+  `unit_factor` DECIMAL(24,8) NOT NULL DEFAULT 1.0,
+  `quantity` DECIMAL(24,8) NOT NULL,
+  `returned_quantity` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `unit_price` DECIMAL(24,8) NOT NULL,
+  `discount_percent` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `discount_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `tax_rate` DECIMAL(24,8) NOT NULL DEFAULT 14.0,
+  `tax_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `total_amount` DECIMAL(24,8) NOT NULL,
+  CONSTRAINT fk_purchase_invoice_items_invoice_id FOREIGN KEY (`invoice_id`) REFERENCES `purchase_invoices` (`id`) ON DELETE CASCADE,
+  CONSTRAINT fk_purchase_invoice_items_item_id FOREIGN KEY (`item_id`) REFERENCES `items` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
+CREATE TABLE IF NOT EXISTS `purchase_return_items` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `return_id` VARCHAR(191) NOT NULL,
+  `item_id` VARCHAR(191) NOT NULL,
+  `quantity` DECIMAL(24,8) NOT NULL,
+  `unit_price` DECIMAL(24,8) NOT NULL,
+  `tax_rate` DECIMAL(24,8) NOT NULL DEFAULT 14.0,
+  `tax_amount` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `total_amount` DECIMAL(24,8) NOT NULL,
+  `original_invoice_item_id` VARCHAR(191),
+  CONSTRAINT fk_purchase_return_items_return_id FOREIGN KEY (`return_id`) REFERENCES `purchase_returns` (`id`) ON DELETE CASCADE,
+  CONSTRAINT fk_purchase_return_items_item_id FOREIGN KEY (`item_id`) REFERENCES `items` (`id`),
+  CONSTRAINT fk_purchase_return_items_original_invoice_item_id FOREIGN KEY (`original_invoice_item_id`) REFERENCES `purchase_invoice_items` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS `stock_transaction_items` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `transaction_id` VARCHAR(191) NOT NULL,
+  `item_id` VARCHAR(191) NOT NULL,
+  `quantity` DECIMAL(24,8) NOT NULL,
+  `unit_cost` DECIMAL(24,8) NOT NULL,
+  `total_cost` DECIMAL(24,8) NOT NULL,
+  `batch_number` LONGTEXT,
+  `expiry_date` DATE,
+  CONSTRAINT fk_stock_transaction_items_transaction_id FOREIGN KEY (`transaction_id`) REFERENCES `stock_transactions` (`id`) ON DELETE CASCADE,
+  CONSTRAINT fk_stock_transaction_items_item_id FOREIGN KEY (`item_id`) REFERENCES `items` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS `inventory_count_items` (
+  `id` VARCHAR(191) PRIMARY KEY,
+  `count_id` VARCHAR(191) NOT NULL,
+  `item_id` VARCHAR(191) NOT NULL,
+  `system_quantity` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `counted_quantity` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `diff_quantity` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `unit_cost` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `total_diff_cost` DECIMAL(24,8) NOT NULL DEFAULT 0,
+  `notes` LONGTEXT,
+  CONSTRAINT fk_inventory_count_items_count_id FOREIGN KEY (`count_id`) REFERENCES `inventory_counts` (`id`) ON DELETE CASCADE,
+  CONSTRAINT fk_inventory_count_items_item_id FOREIGN KEY (`item_id`) REFERENCES `items` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

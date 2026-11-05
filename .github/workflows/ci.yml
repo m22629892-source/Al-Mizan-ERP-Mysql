@@ -1,92 +1,50 @@
-name: CI Multi-Platform Verification
-
+name: MySQL and Windows Verification
 on:
   push:
-    branches: [ "**" ]
   pull_request:
-    branches: [ "**" ]
   workflow_dispatch:
-
 jobs:
-  verify:
-    name: Build & Test on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-2022]
-        node-version: ['26.13.0']
-
+  mysql:
+    name: Node 26.13.0 / MySQL 8.0.28 integration
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0.28
+        env:
+          MYSQL_ROOT_PASSWORD: ci-only-test-password
+          MYSQL_ROOT_HOST: '%'
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pci-only-test-password"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
     env:
-      npm_config_msvs_version: '2022'
-      GYP_MSVS_VERSION: '2022'
-
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ci-only-test-password
+      MYSQL_DATABASE: almizan_test_ci
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
-
-      - name: Ensure native build tools (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          if ! command -v make &> /dev/null; then
-            sudo apt-get update && sudo apt-get install -y build-essential python3
-          fi
-
-      - name: Set up Python for node-gyp (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/setup-python@v5
+          node-version: '26.13.0'
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - run: npm run test:all
+  windows:
+    name: Windows clean install and build / Node 26.13.0
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          python-version: '3.12'
-
-      - name: Verify Visual Studio 2022 C++ Tools (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Write-Host "Verifying Visual Studio 2022 C++ toolchain..."
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (Test-Path $vswhere) {
-            $vsPath = & $vswhere -version "[17.0,18.0)" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-            if (-not $vsPath) {
-              throw "Required Visual Studio 2022 C++ desktop tools not found on runner!"
-            }
-            Write-Host "Detected Visual Studio 2022 C++ installation at: $vsPath"
-          } else {
-            Write-Warning "vswhere.exe not found at standard path."
-          }
-          "npm_config_msvs_version=2022" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "GYP_MSVS_VERSION=2022" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Exported npm_config_msvs_version=2022 and GYP_MSVS_VERSION=2022 to GITHUB_ENV"
-
-      - name: Initialize MSVC Developer Environment (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          vsversion: "2022"
-
-      - name: Log environment details
-        shell: bash
-        run: |
-          echo "================ Environment Details ================"
-          echo "Operating System: ${{ matrix.os }}"
-          echo "Node.js version:  $(node -v)"
-          echo "npm version:      $(npm -v)"
-          echo "Git commit:       $(git rev-parse HEAD)"
-          echo "====================================================="
-
-      - name: 1. Clean Install (npm ci)
-        run: npm ci
-
-      - name: 2. Lint & TypeScript Check (npm run lint)
-        run: npm run lint
-
-      - name: 3. Production Build (npm run build)
-        run: npm run build
-
-      - name: 4. Comprehensive Tests (npm run test:all)
-        run: npm run test:all
+          node-version: '26.13.0'
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build

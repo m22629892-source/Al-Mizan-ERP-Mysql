@@ -1,3 +1,4 @@
+import { createSnapshot, readSnapshot, restoreSnapshot } from './backup-service.js';
 import Decimal from 'decimal.js';
 import path from 'path';
 import fs from 'fs';
@@ -56,7 +57,7 @@ export interface TestResult {
  * Execute all 18 critical acceptance and financial invariant tests against an isolated,
  * ephemeral test database. The production database is NEVER touched or modified.
  */
-export function runAllFinancialTests(): { summary: { total: number; passed: number; failed: number }; results: TestResult[] } {
+export async function runAllFinancialTests(): Promise<{ summary: { total: number; passed: number; failed: number }; results: TestResult[] }> {
   const results: TestResult[] = [];
   const testDbPath = path.resolve(__dirname, `../../almizan_test_${Date.now()}_${Math.random().toString(36).substring(2, 6)}.db`);
 
@@ -65,9 +66,9 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
 
   try {
     // 1. Initialize schema and migrations on test database
-    initDb(testDb);
+    (await initDb(testDb));
     // 2. Seed initial baseline records
-    seedInitialData(testDb);
+    (await seedInitialData(testDb));
 
     // ----------------------------------------------------
     // Suite 1: شراء آجل ثم سداد جزئي ثم مردود مشتريات
@@ -78,7 +79,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const suppId = 'party_supp_001';
         const whId = 'wh_main';
         const brId = 'br_cairo';
-        const period = getFiscalPeriodForDate('2026-03-01', testDb);
+        const period = (await getFiscalPeriodForDate('2026-03-01', testDb));
 
         // 1. Record credit purchase invoice
         const pInvNum = 'TEST-PINV-001';
@@ -90,7 +91,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const wht = subtotal * 0.01; // 100
         const total = subtotal + vat - wht; // 11,300
 
-        const je = postJournalEntry({
+        const je = (await postJournalEntry({
           docType: 'PUR_INV',
           docId: pInvId,
           docNumber: pInvNum,
@@ -106,19 +107,19 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_2111', partyId: suppId, debit: 0, credit: total, description: 'استحقاق المورد' },
             { accountId: 'acc_2132', debit: 0, credit: wht, description: 'أمانات خصم وتحصيل' }
           ]
-        }, testDb);
+        }, testDb));
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO purchase_invoices (
             id, invoice_number, branch_id, warehouse_id, supplier_id, invoice_date, due_date,
             payment_type, subtotal, discount_amount, taxable_amount, tax_amount, withholding_tax_amount,
             total_amount, paid_amount, remaining_amount, status, journal_entry_id, created_by
           ) VALUES (?, ?, ?, ?, ?, '2026-03-01', '2026-03-31', 'credit', ?, 0, ?, ?, ?, ?, 0, ?, 'posted', ?, 'usr_admin')
-        `).run(pInvId, pInvNum, brId, whId, suppId, subtotal, subtotal, vat, wht, total, total, je.entryId);
+        `).run(pInvId, pInvNum, brId, whId, suppId, subtotal, subtotal, vat, wht, total, total, je.entryId));
 
         // 2. Partial payment (4,000 EGP)
         const payAmount = 4000;
-        const payJe = postJournalEntry({
+        const payJe = (await postJournalEntry({
           docType: 'PAY',
           docId: 'test_pay_001',
           docNumber: 'TEST-PV-001',
@@ -132,13 +133,13 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_2111', partyId: suppId, debit: payAmount, credit: 0, description: 'سداد للمورد' },
             { accountId: 'acc_1111', debit: 0, credit: payAmount, description: 'صرف من الخزينة' }
           ]
-        }, testDb);
+        }, testDb));
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           UPDATE purchase_invoices 
           SET paid_amount = paid_amount + ?, remaining_amount = remaining_amount - ?
           WHERE id = ?
-        `).run(payAmount, payAmount, pInvId);
+        `).run(payAmount, payAmount, pInvId));
 
         // 3. Purchase return (1 unit @ 2,000 EGP)
         const retQty = 1;
@@ -147,7 +148,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const retWht = retSub * 0.01; // 20
         const retTotal = retSub + retVat - retWht; // 2,260
 
-        const retJe = postJournalEntry({
+        const retJe = (await postJournalEntry({
           docType: 'PUR_RET',
           docId: 'test_pret_001',
           docNumber: 'TEST-PR-001',
@@ -163,14 +164,14 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_1141', debit: 0, credit: retSub, description: 'تخفيض المخزون' },
             { accountId: 'acc_1151', debit: 0, credit: retVat, description: 'عكس ضريبة مدخلات' }
           ]
-        }, testDb);
+        }, testDb));
 
         // Verify supplier subledger balance: 11,300 (credit) - 4,000 (debit) - 2,260 (debit) = 5,040 net credit
-        const suppBal = testDb.prepare(`
+        const suppBal = (await testDb.prepare(`
           SELECT ROUND(SUM(credit - debit), 2) as net_bal
           FROM journal_entry_lines
           WHERE party_id = ? AND account_id = 'acc_2111' AND entry_id IN (?, ?, ?)
-        `).get(suppId, je.entryId, payJe.entryId, retJe.entryId) as { net_bal: number };
+        `).get(suppId, je.entryId, payJe.entryId, retJe.entryId)) as { net_bal: number };
 
         if (suppBal.net_bal !== 5040) {
           throw new Error(`رصيد المورد بعد الشراء والسداد والمردود غير متطابق: المتوقع 5040، الفعلي ${suppBal.net_bal}`);
@@ -202,7 +203,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
       try {
         const custId = 'party_cust_001';
         const brId = 'br_cairo';
-        const period = getFiscalPeriodForDate('2026-03-01', testDb);
+        const period = (await getFiscalPeriodForDate('2026-03-01', testDb));
 
         // 1. Credit Sales Invoice
         const saleSubtotal = 10000;
@@ -211,7 +212,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const saleTotal = 11300;
         const saleCost = 7000;
 
-        const saleJe = postJournalEntry({
+        const saleJe = (await postJournalEntry({
           docType: 'SALES_INV',
           docId: 'test_sinv_002',
           docNumber: 'TEST-SINV-002',
@@ -229,10 +230,10 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_5111', debit: saleCost, credit: 0, description: 'تكلفة مبيعات' },
             { accountId: 'acc_1141', debit: 0, credit: saleCost, description: 'صرف مخزون' }
           ]
-        }, testDb);
+        }, testDb));
 
         // 2. Partial collection (5,000 EGP)
-        const rcptJe = postJournalEntry({
+        const rcptJe = (await postJournalEntry({
           docType: 'RCPT',
           docId: 'test_rcpt_002',
           docNumber: 'TEST-RV-002',
@@ -246,7 +247,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_1111', debit: 5000, credit: 0, description: 'تحصيل بالخزينة' },
             { accountId: 'acc_1121', partyId: custId, debit: 0, credit: 5000, description: 'سداد من العميل' }
           ]
-        }, testDb);
+        }, testDb));
 
         // 3. Sales return with cash refund (Total 2,260 EGP refund from cashbox)
         const retSub = 2000;
@@ -255,7 +256,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const retRefund = 2260;
         const retCost = 1400;
 
-        const retJe = postJournalEntry({
+        const retJe = (await postJournalEntry({
           docType: 'SALES_RET',
           docId: 'test_sret_002',
           docNumber: 'TEST-SR-002',
@@ -273,14 +274,14 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_1141', debit: retCost, credit: 0, description: 'استرجاع مخزون' },
             { accountId: 'acc_5111', debit: 0, credit: retCost, description: 'عكس تكلفة مبيعات' }
           ]
-        }, testDb);
+        }, testDb));
 
         // Verify Customer balance remains: 11,300 debit - 5,000 credit = 6,300 debit (since refund was in cash)
-        const custBal = testDb.prepare(`
+        const custBal = (await testDb.prepare(`
           SELECT ROUND(SUM(debit - credit), 2) as net_bal
           FROM journal_entry_lines
           WHERE party_id = ? AND account_id = 'acc_1121' AND entry_id IN (?, ?, ?)
-        `).get(custId, saleJe.entryId, rcptJe.entryId, retJe.entryId) as { net_bal: number };
+        `).get(custId, saleJe.entryId, rcptJe.entryId, retJe.entryId)) as { net_bal: number };
 
         if (custBal.net_bal !== 6300) {
           throw new Error(`رصيد العميل غير متطابق: المتوقع 6300، الفعلي ${custBal.net_bal}`);
@@ -324,8 +325,8 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
           throw new Error('فشل توازن الحسبة الضريبية والخصم');
         }
 
-        const period = getFiscalPeriodForDate('2026-03-15', testDb);
-        const je = postJournalEntry({
+        const period = (await getFiscalPeriodForDate('2026-03-15', testDb));
+        const je = (await postJournalEntry({
           docType: 'SALES_INV',
           docId: 'test_tax_calc_003',
           docNumber: 'TEST-TAX-003',
@@ -341,7 +342,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_4111', debit: 0, credit: netTaxable.toNumber(), description: 'صافي الإيراد' },
             { accountId: 'acc_2131', debit: 0, credit: vat.toNumber(), description: 'ضريبة القيمة المضافة 14%' }
           ]
-        }, testDb);
+        }, testDb));
 
         results.push({
           suiteNumber: 3,
@@ -372,16 +373,16 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const toWh = 'wh_alex';
 
         // Check baseline stock
-        const sFromBefore = testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(fromWh, itemId) as { quantity: number };
-        const sToBefore = testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(toWh, itemId) as { quantity: number };
+        const sFromBefore = (await testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(fromWh, itemId)) as { quantity: number };
+        const sToBefore = (await testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(toWh, itemId)) as { quantity: number };
 
         const transferQty = 3;
         // Perform transfer
-        testDb.prepare('UPDATE warehouse_stock SET quantity = quantity - ? WHERE warehouse_id = ? AND item_id = ?').run(transferQty, fromWh, itemId);
-        testDb.prepare('UPDATE warehouse_stock SET quantity = quantity + ? WHERE warehouse_id = ? AND item_id = ?').run(transferQty, toWh, itemId);
+        (await testDb.prepare('UPDATE warehouse_stock SET quantity = quantity - ? WHERE warehouse_id = ? AND item_id = ?').run(transferQty, fromWh, itemId));
+        (await testDb.prepare('UPDATE warehouse_stock SET quantity = quantity + ? WHERE warehouse_id = ? AND item_id = ?').run(transferQty, toWh, itemId));
 
-        const sFromAfter = testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(fromWh, itemId) as { quantity: number };
-        const sToAfter = testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(toWh, itemId) as { quantity: number };
+        const sFromAfter = (await testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(fromWh, itemId)) as { quantity: number };
+        const sToAfter = (await testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(toWh, itemId)) as { quantity: number };
 
         if (sFromAfter.quantity !== sFromBefore.quantity - transferQty || sToAfter.quantity !== sToBefore.quantity + transferQty) {
           throw new Error('فشل تحديث كميات التحويل المخزني بين المستودعين');
@@ -390,10 +391,10 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         // Shrinkage adjustment (1 unit deficit in Cairo)
         const shrinkageQty = 1;
         const shrinkageCost = 18500;
-        testDb.prepare('UPDATE warehouse_stock SET quantity = quantity - ? WHERE warehouse_id = ? AND item_id = ?').run(shrinkageQty, fromWh, itemId);
+        (await testDb.prepare('UPDATE warehouse_stock SET quantity = quantity - ? WHERE warehouse_id = ? AND item_id = ?').run(shrinkageQty, fromWh, itemId));
 
-        const period = getFiscalPeriodForDate('2026-03-20', testDb);
-        const adjJe = postJournalEntry({
+        const period = (await getFiscalPeriodForDate('2026-03-20', testDb));
+        const adjJe = (await postJournalEntry({
           docType: 'STOCK_ADJ',
           docId: 'test_adj_004',
           docNumber: 'TEST-ADJ-004',
@@ -407,7 +408,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_5211', debit: shrinkageCost, credit: 0, description: 'خسائر عجز مخزون' },
             { accountId: 'acc_1141', debit: 0, credit: shrinkageCost, description: 'تخفيض مخزون القاهرة' }
           ]
-        }, testDb);
+        }, testDb));
 
         results.push({
           suiteNumber: 4,
@@ -433,12 +434,12 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     {
       const start = Date.now();
       try {
-        const period = getFiscalPeriodForDate('2026-02-15', testDb);
+        const period = (await getFiscalPeriodForDate('2026-02-15', testDb));
         let rejectedUnbalanced = false;
 
         // Try unbalanced
         try {
-          postJournalEntry({
+          (await postJournalEntry({
             docType: 'MANUAL',
             entryDate: '2026-02-15',
             postingDate: '2026-02-15',
@@ -449,7 +450,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
               { accountId: 'acc_1111', debit: 1000, credit: 0 },
               { accountId: 'acc_4111', debit: 0, credit: 900 }
             ]
-          }, testDb);
+          }, testDb));
         } catch (err: any) {
           if (err.message.includes('القيد غير متوازن')) {
             rejectedUnbalanced = true;
@@ -461,7 +462,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         }
 
         // Post balanced
-        const balanced = postJournalEntry({
+        const balanced = (await postJournalEntry({
           docType: 'MANUAL',
           entryDate: '2026-02-15',
           postingDate: '2026-02-15',
@@ -472,7 +473,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_1111', debit: 500, credit: 0, description: 'تسوية' },
             { accountId: 'acc_4511', debit: 0, credit: 500, description: 'إيرادات أخرى' }
           ]
-        }, testDb);
+        }, testDb));
 
         results.push({
           suiteNumber: 5,
@@ -498,9 +499,9 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     {
       const start = Date.now();
       try {
-        const period = getFiscalPeriodForDate('2026-02-20', testDb);
+        const period = (await getFiscalPeriodForDate('2026-02-20', testDb));
         // Post a dedicated test entry specifically for this test
-        const origEntry = postJournalEntry({
+        const origEntry = (await postJournalEntry({
           docType: 'MANUAL',
           entryDate: '2026-02-20',
           postingDate: '2026-02-20',
@@ -512,19 +513,19 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_1111', debit: 1200, credit: 0, description: 'عهدة' },
             { accountId: 'acc_2111', partyId: 'party_supp_001', debit: 0, credit: 1200, description: 'استحقاق' }
           ]
-        }, testDb);
+        }, testDb));
 
         // Reverse the newly created entry
-        const rev = reverseJournalEntry(origEntry.entryId, 'عكس تجريبي للقيد', 'usr_admin', testDb);
+        const rev = (await reverseJournalEntry(origEntry.entryId, 'عكس تجريبي للقيد', 'usr_admin', testDb));
 
         // Verify status and link
-        const checkOrig = testDb.prepare('SELECT status, reversed_entry_id FROM journal_entries WHERE id = ?').get(origEntry.entryId) as any;
+        const checkOrig = (await testDb.prepare('SELECT status, reversed_entry_id FROM journal_entries WHERE id = ?').get(origEntry.entryId)) as any;
         if (checkOrig.status !== 'reversed' || checkOrig.reversed_entry_id !== rev.reverseEntryId) {
           throw new Error('فشل ربط القيد الأصلي بالقيد العكسي');
         }
 
         // Verify reverse lines have swapped debit and credit
-        const revLines = testDb.prepare('SELECT account_id, debit, credit FROM journal_entry_lines WHERE entry_id = ?').all(rev.reverseEntryId) as any[];
+        const revLines = (await testDb.prepare('SELECT account_id, debit, credit FROM journal_entry_lines WHERE entry_id = ?').all(rev.reverseEntryId)) as any[];
         const cashLine = revLines.find(l => l.account_id === 'acc_1111');
         if (!cashLine || cashLine.credit !== 1200 || cashLine.debit !== 0) {
           throw new Error('القيد العكسي لم يعكس المدين والدائن بدقة');
@@ -556,12 +557,12 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
       try {
         const whId = 'wh_main';
         const itemId = 'item_001';
-        const curStock = testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(whId, itemId) as { quantity: number };
+        const curStock = (await testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(whId, itemId)) as { quantity: number };
 
         // Test 7a: Single line oversell
         let oversellCaught = false;
         try {
-          validateAndDeductStock(whId, [{ itemId, quantity: curStock.quantity + 10 }], testDb);
+          (await validateAndDeductStock(whId, [{ itemId, quantity: curStock.quantity + 10 }], testDb));
         } catch (err: any) {
           if (err.message.includes('غير متوفرة') || err.message.includes('المتاح')) {
             oversellCaught = true;
@@ -574,10 +575,10 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const half = Math.floor(curStock.quantity / 2);
         const halfPlusOne = half + 1; // halfPlusOne * 2 > curStock.quantity
         try {
-          validateAndDeductStock(whId, [
+          (await validateAndDeductStock(whId, [
             { itemId, quantity: halfPlusOne },
             { itemId, quantity: halfPlusOne }
-          ], testDb);
+          ], testDb));
         } catch (err: any) {
           if (err.message.includes('غير متوفرة') || err.message.includes('المتاح')) {
             multiLineCaught = true;
@@ -609,12 +610,12 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     {
       const start = Date.now();
       try {
-        const year = testDb.prepare('SELECT id FROM fiscal_years LIMIT 1').get() as { id: string };
+        const year = (await testDb.prepare('SELECT id FROM fiscal_years LIMIT 1').get()) as { id: string };
         const numbers = new Set<string>();
 
         // Generate 10 consecutive numbers atomically
         for (let i = 0; i < 10; i++) {
-          const num = getNextDocumentNumber('TEST_DOC', 'br_cairo', year.id, testDb);
+          const num = (await getNextDocumentNumber('TEST_DOC', 'br_cairo', year.id, testDb));
           if (numbers.has(num)) {
             throw new Error(`تكرر رقم المستند: ${num}`);
           }
@@ -645,14 +646,14 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     {
       const start = Date.now();
       try {
-        const storekeeperPerms = testDb.prepare("SELECT permission_key FROM user_permissions WHERE role = 'storekeeper'").all() as { permission_key: string }[];
+        const storekeeperPerms = (await testDb.prepare("SELECT permission_key FROM user_permissions WHERE role = 'storekeeper'").all()) as { permission_key: string }[];
         const keys = storekeeperPerms.map(p => p.permission_key);
 
         if (keys.includes('view_cost') || keys.includes('view_profit')) {
           throw new Error('أمين المخزن يملك صلاحية عرض التكلفة أو الأرباح بالمخالفة لضوابط الرقابة!');
         }
 
-        const cashierPerms = testDb.prepare("SELECT permission_key FROM user_permissions WHERE role = 'cashier'").all() as { permission_key: string }[];
+        const cashierPerms = (await testDb.prepare("SELECT permission_key FROM user_permissions WHERE role = 'cashier'").all()) as { permission_key: string }[];
         const cKeys = cashierPerms.map(p => p.permission_key);
         if (cKeys.includes('post_journal_entry') || cKeys.includes('manage_settings')) {
           throw new Error('الكاشير يملك صلاحيات محاسبية ورقابية غير مصرح بها!');
@@ -682,14 +683,14 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     {
       const start = Date.now();
       try {
-        const asset = testDb.prepare('SELECT * FROM fixed_assets LIMIT 1').get() as any;
+        const asset = (await testDb.prepare('SELECT * FROM fixed_assets LIMIT 1').get()) as any;
         if (!asset) throw new Error('لا توجد أصول مسجلة');
 
         const annualDep = (asset.purchase_cost - asset.scrap_value) / asset.useful_life_years;
         const monthlyDep = Math.round((annualDep / 12) * 100) / 100;
 
-        const period = getFiscalPeriodForDate('2026-03-31', testDb);
-        const depJe = postJournalEntry({
+        const period = (await getFiscalPeriodForDate('2026-03-31', testDb));
+        const depJe = (await postJournalEntry({
           docType: 'DEP_RUN',
           docId: `dep_${asset.id}`,
           docNumber: 'TEST-DEP-001',
@@ -703,7 +704,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_6311', debit: monthlyDep, credit: 0, description: 'مصروف إهلاك' },
             { accountId: 'acc_1221', debit: 0, credit: monthlyDep, description: 'مجمع إهلاك الأصول' }
           ]
-        }, testDb);
+        }, testDb));
 
         results.push({
           suiteNumber: 10,
@@ -730,12 +731,12 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
       const start = Date.now();
       try {
         const auditId = `audit_test_${Date.now()}`;
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO audit_logs (id, user_id, action, entity_type, entity_id, details)
           VALUES (?, ?, ?, ?, ?, ?)
-        `).run(auditId, 'usr_admin', 'SECURITY_TEST', 'system', 'sys_01', 'اختبار سجل التدقيق المالي غير القابل للتعديل');
+        `).run(auditId, 'usr_admin', 'SECURITY_TEST', 'system', 'sys_01', 'اختبار سجل التدقيق المالي غير القابل للتعديل'));
 
-        const lastAudit = testDb.prepare('SELECT * FROM audit_logs WHERE id = ?').get(auditId) as any;
+        const lastAudit = (await testDb.prepare('SELECT * FROM audit_logs WHERE id = ?').get(auditId)) as any;
         if (!lastAudit || lastAudit.user_id !== 'usr_admin') {
           throw new Error('لم يتم حفظ حركة التدقيق بالبيانات الصحيحة');
         }
@@ -764,14 +765,14 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     {
       const start = Date.now();
       try {
-        const totals = testDb.prepare(`
+        const totals = (await testDb.prepare(`
           SELECT 
             ROUND(SUM(debit), 2) as total_debit, 
             ROUND(SUM(credit), 2) as total_credit 
           FROM journal_entry_lines jel
           JOIN journal_entries je ON jel.entry_id = je.id
           WHERE je.status = 'posted'
-        `).get() as { total_debit: number; total_credit: number };
+        `).get()) as { total_debit: number; total_credit: number };
 
         const diff = Math.abs(totals.total_debit - totals.total_credit);
         if (diff > 0.01) {
@@ -803,11 +804,11 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
       const start = Date.now();
       try {
         // Mark January 2026 period as closed
-        testDb.prepare("UPDATE fiscal_periods SET is_closed = 1 WHERE id = 'fp_2026_01'").run();
+        (await testDb.prepare("UPDATE fiscal_periods SET is_closed = 1 WHERE id = 'fp_2026_01'").run());
 
         let postingBlocked = false;
         try {
-          getFiscalPeriodForDate('2026-01-15', testDb);
+          (await getFiscalPeriodForDate('2026-01-15', testDb));
         } catch (err: any) {
           if (err.message.includes('مغلقة')) {
             postingBlocked = true;
@@ -819,7 +820,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         }
 
         // Restore period
-        testDb.prepare("UPDATE fiscal_periods SET is_closed = 0 WHERE id = 'fp_2026_01'").run();
+        (await testDb.prepare("UPDATE fiscal_periods SET is_closed = 0 WHERE id = 'fp_2026_01'").run());
 
         results.push({
           suiteNumber: 13,
@@ -845,14 +846,14 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     {
       const start = Date.now();
       try {
-        const period = getFiscalPeriodForDate('2026-03-25', testDb);
+        const period = (await getFiscalPeriodForDate('2026-03-25', testDb));
         // Customer invoice in USD: $1,000 at exchange rate 50.00 = 50,000 EGP
         const originalRate = 50.0;
         const settledRate = 51.5; // Gain of 1.50 per USD -> 1,500 EGP gain
         const usdAmount = 1000;
         const egpDiff = (settledRate - originalRate) * usdAmount; // 1,500
 
-        const fxJe = postJournalEntry({
+        const fxJe = (await postJournalEntry({
           docType: 'MANUAL',
           entryDate: '2026-03-25',
           postingDate: '2026-03-25',
@@ -867,7 +868,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_1121', partyId: 'party_cust_001', debit: 0, credit: usdAmount * originalRate, description: 'تسوية مديونية العميل بالدولار' },
             { accountId: 'acc_4511', debit: 0, credit: egpDiff, description: 'أرباح فروق أسعار صرف محققة' }
           ]
-        }, testDb);
+        }, testDb));
 
         results.push({
           suiteNumber: 14,
@@ -893,7 +894,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     {
       const start = Date.now();
       try {
-        const cashInvoices = testDb.prepare("SELECT * FROM sales_invoices WHERE payment_type = 'cash'").all() as any[];
+        const cashInvoices = (await testDb.prepare("SELECT * FROM sales_invoices WHERE payment_type = 'cash'").all()) as any[];
         if (cashInvoices.length === 0) {
           throw new Error('لا توجد فواتير نقدية في البيانات لفحصها');
         }
@@ -903,7 +904,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             throw new Error(`الفاتورة النقدية ${inv.invoice_number} غير مسددة بالكامل! المدفوع: ${inv.paid_amount}، المتبقي: ${inv.remaining_amount}`);
           }
           // Check corresponding receipt voucher
-          const rv = testDb.prepare("SELECT * FROM payment_vouchers WHERE voucher_type = 'receipt' AND description LIKE ?").get(`%${inv.invoice_number}%`);
+          const rv = (await testDb.prepare("SELECT * FROM payment_vouchers WHERE voucher_type = 'receipt' AND description LIKE ?").get(`%${inv.invoice_number}%`));
           if (!rv) {
             throw new Error(`الفاتورة النقدية ${inv.invoice_number} ليس لها سند قبض تلقائي مسجل`);
           }
@@ -933,7 +934,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     {
       const start = Date.now();
       try {
-        const invItem = testDb.prepare('SELECT invoice_id, item_id, quantity, returned_quantity FROM sales_invoice_items LIMIT 1').get() as any;
+        const invItem = (await testDb.prepare('SELECT invoice_id, item_id, quantity, returned_quantity FROM sales_invoice_items LIMIT 1').get()) as any;
         const availableToReturn = invItem.quantity - invItem.returned_quantity;
 
         // Attempting to return more than available
@@ -967,7 +968,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     {
       const start = Date.now();
       try {
-        const pItem = testDb.prepare('SELECT invoice_id, item_id, quantity, returned_quantity FROM purchase_invoice_items LIMIT 1').get() as any;
+        const pItem = (await testDb.prepare('SELECT invoice_id, item_id, quantity, returned_quantity FROM purchase_invoice_items LIMIT 1').get()) as any;
         const availableToReturn = pItem.quantity - (pItem.returned_quantity || 0);
 
         const attemptedExcessReturn = availableToReturn + 10;
@@ -1047,34 +1048,34 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         // 1. Create supplier from modal (even if active tab was customer)
         const type = 'supplier';
         const prefix = 'SUPP';
-        let seqRow = testDb.prepare('SELECT last_number FROM party_sequences WHERE type = ?').get(type) as { last_number: number } | undefined;
+        let seqRow = (await testDb.prepare('SELECT last_number FROM party_sequences WHERE type = ?').get(type)) as { last_number: number } | undefined;
         let currentMax = seqRow && seqRow.last_number > 0 ? seqRow.last_number : 15;
         let nextNum = currentMax + 1;
-        testDb.prepare('INSERT INTO party_sequences (type, last_number) VALUES (?, ?) ON CONFLICT(type) DO UPDATE SET last_number = ?').run(type, nextNum, nextNum);
+        (await testDb.prepare('INSERT INTO party_sequences (type, last_number) VALUES (?, ?) ON DUPLICATE KEY UPDATE last_number = ?').run(type, nextNum, nextNum));
         const code1 = `${prefix}-${nextNum.toString().padStart(4, '0')}`;
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO parties (id, code, type, name_ar, name_en, city, credit_limit, payment_terms_days, is_active)
           VALUES ('party_test_seq1', ?, 'supplier', 'شركة النيل للكيماويات', 'Nile Chem', 'الجيزة', 50000, 30, 1)
-        `).run(code1);
+        `).run(code1));
 
         // 2. Delete the created party
-        testDb.prepare('DELETE FROM parties WHERE id = ?').run('party_test_seq1');
+        (await testDb.prepare('DELETE FROM parties WHERE id = ?').run('party_test_seq1'));
 
         // 3. Create another party of same type - verify it does NOT reuse code1 (monotonic safe sequencing)
-        seqRow = testDb.prepare('SELECT last_number FROM party_sequences WHERE type = ?').get(type) as { last_number: number };
+        seqRow = (await testDb.prepare('SELECT last_number FROM party_sequences WHERE type = ?').get(type)) as { last_number: number };
         const nextNum2 = seqRow.last_number + 1;
-        testDb.prepare('UPDATE party_sequences SET last_number = ? WHERE type = ?').run(nextNum2, type);
+        (await testDb.prepare('UPDATE party_sequences SET last_number = ? WHERE type = ?').run(nextNum2, type));
         const code2 = `${prefix}-${nextNum2.toString().padStart(4, '0')}`;
 
         if (code1 === code2) {
           throw new Error(`خطأ: تم إعادة استخدام نفس الكود المحذوف (${code1})!`);
         }
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO parties (id, code, type, name_ar, name_en, city, credit_limit, payment_terms_days, is_active)
           VALUES ('party_test_seq2', ?, 'supplier', 'شركة الأهرام للتوزيع', 'Ahram Dist', 'القاهرة', 80000, 45, 1)
-        `).run(code2);
+        `).run(code2));
 
         results.push({
           suiteNumber: 19,
@@ -1101,38 +1102,38 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
       const start = Date.now();
       try {
         const parentId = 'acc_114';
-        const parent = testDb.prepare('SELECT code, level FROM accounts WHERE id = ?').get(parentId) as any;
+        const parent = (await testDb.prepare('SELECT code, level FROM accounts WHERE id = ?').get(parentId)) as any;
         const seqKey = `parent_${parentId}`;
 
         // Create first child account automatically
-        let seqRow = testDb.prepare('SELECT last_number FROM account_sequences WHERE sequence_key = ?').get(seqKey) as { last_number: number } | undefined;
+        let seqRow = (await testDb.prepare('SELECT last_number FROM account_sequences WHERE sequence_key = ?').get(seqKey)) as { last_number: number } | undefined;
         let currentMax = seqRow && seqRow.last_number > 0 ? seqRow.last_number : 3;
         let nextNum = currentMax + 1;
-        testDb.prepare('INSERT INTO account_sequences (sequence_key, last_number) VALUES (?, ?) ON CONFLICT(sequence_key) DO UPDATE SET last_number = ?').run(seqKey, nextNum, nextNum);
+        (await testDb.prepare('INSERT INTO account_sequences (sequence_key, last_number) VALUES (?, ?) ON DUPLICATE KEY UPDATE last_number = ?').run(seqKey, nextNum, nextNum));
         const childCode1 = `${parent.code}${nextNum.toString().padStart(1, '0')}`;
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO accounts (id, code, name_ar, name_en, parent_id, account_type, nature, is_group, level, is_active)
           VALUES ('acc_test_auto_1', ?, 'مخزون بضائع أمانة', 'Consignment Stock', ?, 'asset', 'debit', 0, 3, 1)
-        `).run(childCode1, parentId);
+        `).run(childCode1, parentId));
 
         // Delete the account
-        testDb.prepare('DELETE FROM accounts WHERE id = ?').run('acc_test_auto_1');
+        (await testDb.prepare('DELETE FROM accounts WHERE id = ?').run('acc_test_auto_1'));
 
         // Create second child account - must not reuse deleted childCode1
-        seqRow = testDb.prepare('SELECT last_number FROM account_sequences WHERE sequence_key = ?').get(seqKey) as { last_number: number };
+        seqRow = (await testDb.prepare('SELECT last_number FROM account_sequences WHERE sequence_key = ?').get(seqKey)) as { last_number: number };
         const nextNum2 = seqRow.last_number + 1;
-        testDb.prepare('UPDATE account_sequences SET last_number = ? WHERE sequence_key = ?').run(nextNum2, seqKey);
+        (await testDb.prepare('UPDATE account_sequences SET last_number = ? WHERE sequence_key = ?').run(nextNum2, seqKey));
         const childCode2 = `${parent.code}${nextNum2.toString().padStart(1, '0')}`;
 
         if (childCode1 === childCode2) {
           throw new Error(`خطأ: تم إعادة استخدام نفس كود الحساب المحذوف (${childCode1})!`);
         }
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO accounts (id, code, name_ar, name_en, parent_id, account_type, nature, is_group, level, is_active)
           VALUES ('acc_test_auto_2', ?, 'مخزون قطع غيار إضافي', 'Spare Parts Stock', ?, 'asset', 'debit', 0, 3, 1)
-        `).run(childCode2, parentId);
+        `).run(childCode2, parentId));
 
         results.push({
           suiteNumber: 20,
@@ -1159,7 +1160,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
       const start = Date.now();
       try {
         const suppWithInvoices = 'party_supp_001';
-        const pCount = testDb.prepare('SELECT COUNT(*) as cnt FROM purchase_invoices WHERE supplier_id = ?').get(suppWithInvoices) as { cnt: number };
+        const pCount = (await testDb.prepare('SELECT COUNT(*) as cnt FROM purchase_invoices WHERE supplier_id = ?').get(suppWithInvoices)) as { cnt: number };
 
         let deletionBlockedProperly = false;
         if (pCount.cnt > 0) {
@@ -1168,12 +1169,12 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         }
 
         // Test deleting unused party
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO parties (id, code, type, name_ar, name_en, city, credit_limit, payment_terms_days, is_active)
           VALUES ('party_unused_999', 'SUPP-9999', 'supplier', 'طرف تجاري مؤقت للاختبار', 'Temp Supplier', 'القاهرة', 0, 0, 1)
-        `).run();
+        `).run());
 
-        const delRes = testDb.prepare('DELETE FROM parties WHERE id = ?').run('party_unused_999');
+        const delRes = (await testDb.prepare('DELETE FROM parties WHERE id = ?').run('party_unused_999'));
         const unusedDeleted = delRes.changes === 1;
 
         results.push({
@@ -1200,29 +1201,29 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     {
       const start = Date.now();
       try {
-        const initialGlLinesCount = (testDb.prepare('SELECT COUNT(*) as cnt FROM journal_entry_lines').get() as any).cnt;
-        const initialStockRow = testDb.prepare("SELECT quantity FROM warehouse_stock WHERE warehouse_id = 'wh_main' AND item_id = 'item_001'").get() as any;
+        const initialGlLinesCount = ((await testDb.prepare('SELECT COUNT(*) as cnt FROM journal_entry_lines').get()) as any).cnt;
+        const initialStockRow = (await testDb.prepare("SELECT quantity FROM warehouse_stock WHERE warehouse_id = 'wh_main' AND item_id = 'item_001'").get()) as any;
         const initialStock = initialStockRow ? initialStockRow.quantity : 0;
 
         // 1. Create draft journal entry
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO journal_entries (
             id, entry_number, doc_type, entry_date, posting_date, fiscal_period_id, branch_id, status, description, total_debit, total_credit, created_by
           ) VALUES ('je_dft_test', 'JV-DFT-999', 'MANUAL', '2026-03-10', '2026-03-10', 'fp_2026_03', 'br_cairo', 'draft', 'مسودة قيد للاختبار', 5000, 5000, 'usr_admin')
-        `).run();
+        `).run());
 
         // 2. Create draft sales invoice
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO sales_invoices (
             id, invoice_number, branch_id, warehouse_id, customer_id, invoice_date, due_date, payment_type,
             subtotal, discount_amount, taxable_amount, tax_amount, withholding_tax_amount, total_amount, paid_amount, remaining_amount, cogs_amount, status, created_by
           ) VALUES ('si_dft_test', 'INV-DFT-999', 'br_cairo', 'wh_main', 'party_cust_001', '2026-03-10', '2026-03-10', 'credit', 10000, 0, 10000, 1400, 100, 11300, 0, 11300, 7000, 'draft', 'usr_admin')
-        `).run();
+        `).run());
 
         // Check that GL and stock did not change
-        const currentStockRow = testDb.prepare("SELECT quantity FROM warehouse_stock WHERE warehouse_id = 'wh_main' AND item_id = 'item_001'").get() as any;
+        const currentStockRow = (await testDb.prepare("SELECT quantity FROM warehouse_stock WHERE warehouse_id = 'wh_main' AND item_id = 'item_001'").get()) as any;
         const currentStock = currentStockRow ? currentStockRow.quantity : 0;
-        const currentGlCount = (testDb.prepare('SELECT COUNT(*) as cnt FROM journal_entry_lines').get() as any).cnt;
+        const currentGlCount = ((await testDb.prepare('SELECT COUNT(*) as cnt FROM journal_entry_lines').get()) as any).cnt;
 
         if (currentStock !== initialStock) {
           throw new Error('خطأ: تغير رصيد المخزن بسبب مسودة فاتورة!');
@@ -1232,8 +1233,8 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         }
 
         // Clean up test drafts
-        testDb.prepare("DELETE FROM sales_invoices WHERE id = 'si_dft_test'").run();
-        testDb.prepare("DELETE FROM journal_entries WHERE id = 'je_dft_test'").run();
+        (await testDb.prepare("DELETE FROM sales_invoices WHERE id = 'si_dft_test'").run());
+        (await testDb.prepare("DELETE FROM journal_entries WHERE id = 'je_dft_test'").run());
 
         results.push({
           suiteNumber: 22,
@@ -1259,33 +1260,33 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     {
       const start = Date.now();
       try {
-        const origInvItem = testDb.prepare('SELECT id, invoice_id, item_id, quantity, returned_quantity FROM sales_invoice_items LIMIT 1').get() as any;
+        const origInvItem = (await testDb.prepare('SELECT id, invoice_id, item_id, quantity, returned_quantity FROM sales_invoice_items LIMIT 1').get()) as any;
         if (!origInvItem) throw new Error('لا يوجد بند فاتورة مبيعات للاختبار');
 
         // Create draft sales return linked by original_invoice_item_id
         const draftRetId = 'ret_dft_test_99';
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO sales_returns (
             id, return_number, original_invoice_id, branch_id, warehouse_id, customer_id, return_date, refund_type,
             subtotal, tax_amount, withholding_tax_amount, total_amount, refunded_cash_amount, cogs_reversed_amount, status, created_by
           ) VALUES (?, 'SR-DFT-999', ?, 'br_cairo', 'wh_main', 'party_cust_001', '2026-03-12', 'credit_note', 2000, 280, 20, 2260, 0, 1400, 'draft', 'usr_admin')
-        `).run(draftRetId, origInvItem.invoice_id);
+        `).run(draftRetId, origInvItem.invoice_id));
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO sales_return_items (
             id, return_id, original_invoice_item_id, item_id, unit_name, unit_factor, quantity, unit_price, unit_cost, tax_rate, tax_amount, total_amount
           ) VALUES ('sri_dft_99', ?, ?, ?, 'قطعة', 1.0, 1, 2000, 1400, 14, 280, 2280)
-        `).run(draftRetId, origInvItem.id, origInvItem.item_id);
+        `).run(draftRetId, origInvItem.id, origInvItem.item_id));
 
         // Verify draft does not alter original line's returned_quantity
-        const refreshedLine = testDb.prepare('SELECT returned_quantity FROM sales_invoice_items WHERE id = ?').get(origInvItem.id) as any;
+        const refreshedLine = (await testDb.prepare('SELECT returned_quantity FROM sales_invoice_items WHERE id = ?').get(origInvItem.id)) as any;
         if (refreshedLine.returned_quantity !== origInvItem.returned_quantity) {
           throw new Error('خطأ: تم تعديل الكمية المرجعة في الفاتورة الأصلية بمجرد إنشاء المسودة!');
         }
 
         // Delete draft sales return
-        testDb.prepare('DELETE FROM sales_return_items WHERE return_id = ?').run(draftRetId);
-        testDb.prepare('DELETE FROM sales_returns WHERE id = ?').run(draftRetId);
+        (await testDb.prepare('DELETE FROM sales_return_items WHERE return_id = ?').run(draftRetId));
+        (await testDb.prepare('DELETE FROM sales_returns WHERE id = ?').run(draftRetId));
 
         results.push({
           suiteNumber: 23,
@@ -1311,9 +1312,9 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     {
       const start = Date.now();
       try {
-        const postedJe = testDb.prepare("SELECT id, status FROM journal_entries WHERE status = 'posted' LIMIT 1").get() as any;
-        const postedSi = testDb.prepare("SELECT id, status FROM sales_invoices WHERE status = 'posted' OR status = 'paid' LIMIT 1").get() as any;
-        const postedPi = testDb.prepare("SELECT id, status FROM purchase_invoices WHERE status = 'posted' LIMIT 1").get() as any;
+        const postedJe = (await testDb.prepare("SELECT id, status FROM journal_entries WHERE status = 'posted' LIMIT 1").get()) as any;
+        const postedSi = (await testDb.prepare("SELECT id, status FROM sales_invoices WHERE status = 'posted' OR status = 'paid' LIMIT 1").get()) as any;
+        const postedPi = (await testDb.prepare("SELECT id, status FROM purchase_invoices WHERE status = 'posted' LIMIT 1").get()) as any;
 
         let immutableRulesEnforced = true;
         if (!postedJe || postedJe.status !== 'posted') immutableRulesEnforced = false;
@@ -1347,26 +1348,26 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const userIdA = 'usr_test_acct_a';
         const userIdB = 'usr_test_acct_b';
         
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO users (id, username, password_hash, display_name, role, is_active)
           VALUES (?, 'acct_a', 'hash', 'محاسب أ', 'accountant', 1),
                  (? ,'acct_b', 'hash', 'محاسب ب', 'accountant', 1)
-        `).run(userIdA, userIdB);
+        `).run(userIdA, userIdB));
 
         // User A: granted sales.edit_draft, but NOT sales.delete_draft
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO individual_permissions (user_id, permission_keys, updated_at)
           VALUES (?, ?, CURRENT_TIMESTAMP)
-        `).run(userIdA, JSON.stringify(['sales.view', 'sales.edit_draft']));
+        `).run(userIdA, JSON.stringify(['sales.view', 'sales.edit_draft'])));
 
         // User B: granted treasury.receipt, but NOT treasury.payment
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO individual_permissions (user_id, permission_keys, updated_at)
           VALUES (?, ?, CURRENT_TIMESTAMP)
-        `).run(userIdB, JSON.stringify(['treasury.view', 'treasury.receipt']));
+        `).run(userIdB, JSON.stringify(['treasury.view', 'treasury.receipt'])));
 
-        const permsA = effectivePermissions(userIdA, 'accountant', testDb);
-        const permsB = effectivePermissions(userIdB, 'accountant', testDb);
+        const permsA = (await effectivePermissions(userIdA, 'accountant', testDb));
+        const permsB = (await effectivePermissions(userIdB, 'accountant', testDb));
 
         const userACanEditSales = permsA.includes('sales.edit_draft');
         const userACanDeleteSales = permsA.includes('sales.delete_draft');
@@ -1410,24 +1411,24 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const userEmptyId = 'usr_test_empty';
         const ownerId = 'usr_owner_001';
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO users (id, username, password_hash, display_name, role, is_active)
           VALUES (?, 'user_inherit', 'hash', 'مستخدم يورث الدور', 'accountant', 1),
                  (?, 'user_empty', 'hash', 'مستخدم مفرغ الصلاحيات', 'accountant', 1)
-        `).run(userInheritId, userEmptyId);
+        `).run(userInheritId, userEmptyId));
 
         // User Inherit: NO record in individual_permissions
-        testDb.prepare('DELETE FROM individual_permissions WHERE user_id = ?').run(userInheritId);
+        (await testDb.prepare('DELETE FROM individual_permissions WHERE user_id = ?').run(userInheritId));
 
         // User Empty: Explicit record with '[]'
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO individual_permissions (user_id, permission_keys, updated_at)
           VALUES (?, '[]', CURRENT_TIMESTAMP)
-        `).run(userEmptyId);
+        `).run(userEmptyId));
 
-        const permsInherit = effectivePermissions(userInheritId, 'accountant', testDb);
-        const permsEmpty = effectivePermissions(userEmptyId, 'accountant', testDb);
-        const permsOwner = effectivePermissions(ownerId, 'owner', testDb);
+        const permsInherit = (await effectivePermissions(userInheritId, 'accountant', testDb));
+        const permsEmpty = (await effectivePermissions(userEmptyId, 'accountant', testDb));
+        const permsOwner = (await effectivePermissions(ownerId, 'owner', testDb));
 
         if (permsInherit.length === 0) {
           throw new Error('المستخدم الذي يورث صلاحيات الدور لم يحصل على الصلاحيات الافتراضية.');
@@ -1468,24 +1469,24 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const cashBoxId = 'cash_cairo';
         const partyCustId = 'party_cust_001';
         const partySuppId = 'party_supp_001';
-        const period = getFiscalPeriodForDate('2026-03-15', testDb);
+        const period = (await getFiscalPeriodForDate('2026-03-15', testDb));
 
-        const getPartyBalance = (pId: string, pType: string) => {
-          const row = testDb.prepare(`
+        const getPartyBalance = async (pId: string, pType: string) => {
+          const row = (await testDb.prepare(`
             SELECT ROUND(SUM(
               CASE WHEN ? = 'supplier' THEN (credit - debit) ELSE (debit - credit) END
             ), 2) as bal
             FROM journal_entry_lines jel
             JOIN journal_entries je ON jel.entry_id = je.id
             WHERE jel.party_id = ? AND je.status = 'posted'
-          `).get(pType, pId) as any;
+          `).get(pType, pId)) as any;
           return row && row.bal !== null ? row.bal : 0;
         };
 
         // Baseline balances
-        const initialCash = testDb.prepare('SELECT current_balance FROM cash_boxes WHERE id = ?').get(cashBoxId) as any;
-        const initialCustBal = getPartyBalance(partyCustId, 'customer');
-        const initialSuppBal = getPartyBalance(partySuppId, 'supplier');
+        const initialCash = (await testDb.prepare('SELECT current_balance FROM cash_boxes WHERE id = ?').get(cashBoxId)) as any;
+        const initialCustBal = (await getPartyBalance(partyCustId, 'customer'));
+        const initialSuppBal = (await getPartyBalance(partySuppId, 'supplier'));
 
         const receiptAmount = 10000;
         const paymentAmount = 4000;
@@ -1493,7 +1494,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         // 1. Issue Receipt Voucher (10,000 EGP from customer)
         const rvNumber = 'RV-TEST-001';
         const rvId = 'vouch_rv_test_1';
-        const rvGl = postJournalEntry({
+        const rvGl = (await postJournalEntry({
           docType: 'RCPT',
           docId: rvId,
           docNumber: rvNumber,
@@ -1507,14 +1508,14 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_1111', debit: receiptAmount, credit: 0, description: 'قبض خزينة' },
             { accountId: 'acc_1121', partyId: partyCustId, debit: 0, credit: receiptAmount, description: 'سداد عميل' }
           ]
-        }, testDb);
+        }, testDb));
 
-        testDb.prepare('UPDATE cash_boxes SET current_balance = current_balance + ? WHERE id = ?').run(receiptAmount, cashBoxId);
+        (await testDb.prepare('UPDATE cash_boxes SET current_balance = current_balance + ? WHERE id = ?').run(receiptAmount, cashBoxId));
 
         // 2. Issue Payment Voucher (4,000 EGP to supplier)
         const pvNumber = 'PV-TEST-001';
         const pvId = 'vouch_pv_test_1';
-        const pvGl = postJournalEntry({
+        const pvGl = (await postJournalEntry({
           docType: 'PYMT',
           docId: pvId,
           docNumber: pvNumber,
@@ -1528,14 +1529,14 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_2111', partyId: partySuppId, debit: paymentAmount, credit: 0, description: 'صرف لمورد' },
             { accountId: 'acc_1111', debit: 0, credit: paymentAmount, description: 'صرف من الخزينة' }
           ]
-        }, testDb);
+        }, testDb));
 
-        testDb.prepare('UPDATE cash_boxes SET current_balance = current_balance - ? WHERE id = ?').run(paymentAmount, cashBoxId);
+        (await testDb.prepare('UPDATE cash_boxes SET current_balance = current_balance - ? WHERE id = ?').run(paymentAmount, cashBoxId));
 
         // Check updated balances
-        const finalCash = testDb.prepare('SELECT current_balance FROM cash_boxes WHERE id = ?').get(cashBoxId) as any;
-        const finalCustBal = getPartyBalance(partyCustId, 'customer');
-        const finalSuppBal = getPartyBalance(partySuppId, 'supplier');
+        const finalCash = (await testDb.prepare('SELECT current_balance FROM cash_boxes WHERE id = ?').get(cashBoxId)) as any;
+        const finalCustBal = (await getPartyBalance(partyCustId, 'customer'));
+        const finalSuppBal = (await getPartyBalance(partySuppId, 'supplier'));
 
         const expectedNetCashDelta = receiptAmount - paymentAmount; // +6,000
         const actualNetCashDelta = finalCash.current_balance - initialCash.current_balance;
@@ -1581,37 +1582,37 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const uEmptyId = 'usr_test_empty_rep';
 
         // Insert test users with same role
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO users (id, username, password_hash, display_name, role, is_active)
           VALUES (?, 'test_sales_rep', 'dummy_hash', 'مسؤول مبيعات مخصص', 'sales_officer', 1),
                  (?, 'test_purch_rep', 'dummy_hash', 'مسؤول مشتريات مخصص', 'sales_officer', 1),
                  (?, 'test_empty_rep', 'dummy_hash', 'مستخدم مقيد الصلاحيات', 'sales_officer', 1)
-        `).run(uSalesId, uPurchId, uEmptyId);
+        `).run(uSalesId, uPurchId, uEmptyId));
 
         // User 1: Sales Only + Edit Draft (NO delete draft, NO purchases)
         const salesPerms = ['dashboard.view', 'sales.view', 'sales.create', 'sales.edit_draft'];
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO individual_permissions (user_id, permission_keys)
           VALUES (?, ?)
-        `).run(uSalesId, JSON.stringify(salesPerms));
+        `).run(uSalesId, JSON.stringify(salesPerms)));
 
         // User 2: Purchases Only + Delete Draft (NO sales)
         const purchPerms = ['dashboard.view', 'purchases.view', 'purchases.create', 'purchases.edit_draft', 'purchases.delete_draft'];
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO individual_permissions (user_id, permission_keys)
           VALUES (?, ?)
-        `).run(uPurchId, JSON.stringify(purchPerms));
+        `).run(uPurchId, JSON.stringify(purchPerms)));
 
         // User 3: Empty custom list []
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO individual_permissions (user_id, permission_keys)
           VALUES (?, '[]')
-        `).run(uEmptyId);
+        `).run(uEmptyId));
 
         // Evaluate permissions dynamically
-        const effSales = effectivePermissions(uSalesId, 'sales_officer', testDb);
-        const effPurch = effectivePermissions(uPurchId, 'sales_officer', testDb);
-        const effEmpty = effectivePermissions(uEmptyId, 'sales_officer', testDb);
+        const effSales = (await effectivePermissions(uSalesId, 'sales_officer', testDb));
+        const effPurch = (await effectivePermissions(uPurchId, 'sales_officer', testDb));
+        const effEmpty = (await effectivePermissions(uEmptyId, 'sales_officer', testDb));
 
         // Verification 1: User 1
         if (!effSales.includes('sales.view') || !effSales.includes('sales.create') || !effSales.includes('sales.edit_draft')) {
@@ -1638,8 +1639,8 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         }
 
         // Verification 4: Switching back to role inheritance
-        testDb.prepare('DELETE FROM individual_permissions WHERE user_id = ?').run(uEmptyId);
-        const inheritedPerms = effectivePermissions(uEmptyId, 'sales_officer', testDb);
+        (await testDb.prepare('DELETE FROM individual_permissions WHERE user_id = ?').run(uEmptyId));
+        const inheritedPerms = (await effectivePermissions(uEmptyId, 'sales_officer', testDb));
         if (inheritedPerms.length === 0) {
           throw new Error('فشل استعادة صلاحيات الدور الموروثة بعد إلغاء التخصيص');
         }
@@ -1668,7 +1669,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     {
       const start = Date.now();
       try {
-        const period = getFiscalPeriodForDate('2026-03-20', testDb);
+        const period = (await getFiscalPeriodForDate('2026-03-20', testDb));
         const invDraftId1 = 'inv_test_draft_1';
         const invDraftId2 = 'inv_test_draft_2';
         const partyId = 'party_cust_001';
@@ -1676,68 +1677,68 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const itemId = 'item_001';
 
         // 1. Create Draft 1
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO sales_invoices (
             id, invoice_number, branch_id, warehouse_id, customer_id, invoice_date, due_date,
             payment_type, subtotal, discount_amount, taxable_amount, tax_amount, withholding_tax_amount,
             total_amount, paid_amount, remaining_amount, cogs_amount, status, journal_entry_id, eta_status, created_by
           ) VALUES (?, 'INV-DFT-9901', 'br_cairo', ?, ?, '2026-03-20', '2026-03-20', 'credit', 1000, 0, 1000, 140, 10, 1130, 0, 1130, 600, 'draft', NULL, 'NotSubmitted', 'usr_admin')
-        `).run(invDraftId1, whId, partyId);
+        `).run(invDraftId1, whId, partyId));
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO sales_invoice_items (
             id, invoice_id, item_id, unit_name, unit_factor, quantity, unit_price, cost_price, discount_amount, tax_rate, tax_amount, total_amount
           ) VALUES ('sii_dft_1', ?, ?, 'قطعة', 1.0, 1, 1000, 600, 0, 14, 140, 1140)
-        `).run(invDraftId1, itemId);
+        `).run(invDraftId1, itemId));
 
         // 2. Edit Draft 1: change quantity from 1 to 2
-        testDb.prepare(`
+        (await testDb.prepare(`
           UPDATE sales_invoices
           SET subtotal = 2000, taxable_amount = 2000, tax_amount = 280, withholding_tax_amount = 20, total_amount = 2260, remaining_amount = 2260, cogs_amount = 1200
           WHERE id = ?
-        `).run(invDraftId1);
+        `).run(invDraftId1));
 
-        testDb.prepare('DELETE FROM sales_invoice_items WHERE invoice_id = ?').run(invDraftId1);
-        testDb.prepare(`
+        (await testDb.prepare('DELETE FROM sales_invoice_items WHERE invoice_id = ?').run(invDraftId1));
+        (await testDb.prepare(`
           INSERT INTO sales_invoice_items (
             id, invoice_id, item_id, unit_name, unit_factor, quantity, unit_price, cost_price, discount_amount, tax_rate, tax_amount, total_amount
           ) VALUES ('sii_dft_1_edited', ?, ?, 'قطعة', 1.0, 2, 1000, 600, 0, 14, 280, 2280)
-        `).run(invDraftId1, itemId);
+        `).run(invDraftId1, itemId));
 
-        const editedDraft = testDb.prepare('SELECT total_amount, cogs_amount, status FROM sales_invoices WHERE id = ?').get(invDraftId1) as any;
+        const editedDraft = (await testDb.prepare('SELECT total_amount, cogs_amount, status FROM sales_invoices WHERE id = ?').get(invDraftId1)) as any;
         if (editedDraft.total_amount !== 2260 || editedDraft.status !== 'draft') {
           throw new Error('فشل تحديث مسودة فاتورة المبيعات بالقيم المحسوبة الجديدة');
         }
 
         // 3. Create Draft 2 and delete it
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO sales_invoices (
             id, invoice_number, branch_id, warehouse_id, customer_id, invoice_date, due_date,
             payment_type, subtotal, discount_amount, taxable_amount, tax_amount, withholding_tax_amount,
             total_amount, paid_amount, remaining_amount, cogs_amount, status, journal_entry_id, eta_status, created_by
           ) VALUES (?, 'INV-DFT-9902', 'br_cairo', ?, ?, '2026-03-20', '2026-03-20', 'credit', 500, 0, 500, 70, 5, 565, 0, 565, 300, 'draft', NULL, 'NotSubmitted', 'usr_admin')
-        `).run(invDraftId2, whId, partyId);
+        `).run(invDraftId2, whId, partyId));
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO sales_invoice_items (
             id, invoice_id, item_id, unit_name, unit_factor, quantity, unit_price, cost_price, discount_amount, tax_rate, tax_amount, total_amount
           ) VALUES ('sii_dft_2', ?, ?, 'قطعة', 1.0, 1, 500, 300, 0, 14, 70, 570)
-        `).run(invDraftId2, itemId);
+        `).run(invDraftId2, itemId));
 
         // Delete Draft 2
-        testDb.prepare('DELETE FROM sales_invoice_items WHERE invoice_id = ?').run(invDraftId2);
-        testDb.prepare('DELETE FROM sales_invoices WHERE id = ?').run(invDraftId2);
+        (await testDb.prepare('DELETE FROM sales_invoice_items WHERE invoice_id = ?').run(invDraftId2));
+        (await testDb.prepare('DELETE FROM sales_invoices WHERE id = ?').run(invDraftId2));
 
-        const deletedCheck = testDb.prepare('SELECT COUNT(*) as cnt FROM sales_invoices WHERE id = ?').get(invDraftId2) as { cnt: number };
+        const deletedCheck = (await testDb.prepare('SELECT COUNT(*) as cnt FROM sales_invoices WHERE id = ?').get(invDraftId2)) as { cnt: number };
         if (deletedCheck.cnt !== 0) {
           throw new Error('فشل حذف مسودة الفاتورة');
         }
 
         // 4. Post Draft 1
-        const initialStockRow = testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(whId, itemId) as any;
+        const initialStockRow = (await testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(whId, itemId)) as any;
         const initialQty = initialStockRow?.quantity || 0;
 
-        validateAndDeductStock(whId, [{ itemId, quantity: 2 }], testDb);
+        (await validateAndDeductStock(whId, [{ itemId, quantity: 2 }], testDb));
 
         const postedNumber = 'INV-2026-TEST-9901';
         const glLines = [
@@ -1749,7 +1750,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
           { accountId: 'acc_1141', debit: 0, credit: 1200, description: `صرف مخزون فاتورة ${postedNumber}` }
         ];
 
-        const glResult = postJournalEntry({
+        const glResult = (await postJournalEntry({
           docType: 'SALES_INV',
           docId: invDraftId1,
           docNumber: postedNumber,
@@ -1760,38 +1761,38 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
           description: `اعتماد فاتورة مبيعات ${postedNumber}`,
           createdBy: 'usr_admin',
           lines: glLines
-        }, testDb);
+        }, testDb));
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           UPDATE sales_invoices
           SET invoice_number = ?, status = 'posted', journal_entry_id = ?
           WHERE id = ?
-        `).run(postedNumber, glResult.entryId, invDraftId1);
+        `).run(postedNumber, glResult.entryId, invDraftId1));
 
-        const stockAfterPost = testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(whId, itemId) as any;
+        const stockAfterPost = (await testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(whId, itemId)) as any;
         if (stockAfterPost.quantity !== initialQty - 2) {
           throw new Error(`لم يتم خصم كمية الفاتورة من المخزن بدقة: السابق (${initialQty})، بعد الصرف (${stockAfterPost.quantity})`);
         }
 
         // 5. Reverse the Posted Invoice with Reason
         const reversalReason = 'تصحيح محاسبي: إلغاء أمر التوريد بناءً على طلب العميل';
-        const revResult = reverseJournalEntry(glResult.entryId, `عكس فاتورة المبيعات ${postedNumber}: ${reversalReason}`, 'usr_admin', testDb, true);
+        const revResult = (await reverseJournalEntry(glResult.entryId, `عكس فاتورة المبيعات ${postedNumber}: ${reversalReason}`, 'usr_admin', testDb, true));
 
         // Restore Stock
-        testDb.prepare(`
+        (await testDb.prepare(`
           UPDATE warehouse_stock
           SET quantity = quantity + 2
           WHERE warehouse_id = ? AND item_id = ?
-        `).run(whId, itemId);
+        `).run(whId, itemId));
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           UPDATE sales_invoices
-          SET status = 'reversed', remaining_amount = 0, notes = notes || ?
+          SET status = 'reversed', remaining_amount = 0, notes = CONCAT(COALESCE(notes, ''), ?)
           WHERE id = ?
-        `).run(` | تم الإلغاء والعكس بالقيد (${revResult.reverseNumber}) بسبب: ${reversalReason}`, invDraftId1);
+        `).run(` | تم الإلغاء والعكس بالقيد (${revResult.reverseNumber}) بسبب: ${reversalReason}`, invDraftId1));
 
-        const finalInvoice = testDb.prepare('SELECT status, remaining_amount, notes FROM sales_invoices WHERE id = ?').get(invDraftId1) as any;
-        const finalStock = testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(whId, itemId) as any;
+        const finalInvoice = (await testDb.prepare('SELECT status, remaining_amount, notes FROM sales_invoices WHERE id = ?').get(invDraftId1)) as any;
+        const finalStock = (await testDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(whId, itemId)) as any;
 
         if (finalInvoice.status !== 'reversed' || finalInvoice.remaining_amount !== 0) {
           throw new Error(`حالة الفاتورة بعد العكس غير صحيحة: ${finalInvoice.status}`);
@@ -1828,29 +1829,29 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const fromDate = '2026-01-01';
         const toDate = '2026-12-31';
 
-        const allSalesRow = testDb.prepare(`
+        const allSalesRow = (await testDb.prepare(`
           SELECT COUNT(*) as cnt, COALESCE(SUM(total_amount), 0) as total
           FROM sales_invoices
           WHERE invoice_date >= ? AND invoice_date <= ? AND status IN ('posted', 'paid', 'partially_paid')
-        `).get(fromDate, toDate) as any;
+        `).get(fromDate, toDate)) as any;
 
-        const cairoSalesRow = testDb.prepare(`
+        const cairoSalesRow = (await testDb.prepare(`
           SELECT COUNT(*) as cnt, COALESCE(SUM(total_amount), 0) as total
           FROM sales_invoices
           WHERE invoice_date >= ? AND invoice_date <= ? AND branch_id = 'br_cairo' AND status IN ('posted', 'paid', 'partially_paid')
-        `).get(fromDate, toDate) as any;
+        `).get(fromDate, toDate)) as any;
 
         if (cairoSalesRow.total > allSalesRow.total) {
           throw new Error('مبيعات فرع القاهرة لا يمكن أن تتجاوز مبيعات كافة الفروع');
         }
 
         // 2. Test Warehouse Stock Valuation
-        const whMainItems = testDb.prepare(`
+        const whMainItems = (await testDb.prepare(`
           SELECT ws.quantity, i.moving_avg_cost
           FROM warehouse_stock ws
           JOIN items i ON ws.item_id = i.id
           WHERE ws.warehouse_id = 'wh_main'
-        `).all() as any[];
+        `).all()) as any[];
 
         const calculatedValuation = whMainItems.reduce((acc, row) => acc + (row.quantity * (row.moving_avg_cost || 0)), 0);
         if (calculatedValuation <= 0) {
@@ -1917,13 +1918,13 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const custId = 'party_cust_test_cyc';
         const brId = 'br_cairo';
         const whId = 'wh_main';
-        const period = getFiscalPeriodForDate('2026-03-01', testDb);
+        const period = (await getFiscalPeriodForDate('2026-03-01', testDb));
 
         // Insert fresh isolated customer for this test
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO parties (id, code, type, name_ar, name_en)
           VALUES (?, 'CUST-CYC-99', 'customer', 'عميل دورة الاختبار', 'Cycle Test Customer')
-        `).run(custId);
+        `).run(custId));
 
         // 1. Credit Sale: 10 units @ 1000 = 10,000 + 1,400 VAT (14%) - 100 WHT (1%) = 11,300 EGP
         const invId = 'test_sinv_cycle_01';
@@ -1934,7 +1935,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const total = 11300;
         const cogs = 7000; // 10 units @ 700 cost
 
-        const sJe = postJournalEntry({
+        const sJe = (await postJournalEntry({
           docType: 'INV',
           docId: invId,
           docNumber: invNum,
@@ -1952,19 +1953,19 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_5111', debit: cogs, credit: 0, description: 'تكلفة المبيعات COGS' },
             { accountId: 'acc_1141', debit: 0, credit: cogs, description: 'صرف من المخزون' }
           ]
-        }, testDb);
+        }, testDb));
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO sales_invoices (
             id, invoice_number, branch_id, warehouse_id, customer_id, invoice_date, due_date,
             payment_type, subtotal, discount_amount, taxable_amount, tax_amount, withholding_tax_amount,
             total_amount, paid_amount, remaining_amount, status, journal_entry_id, created_by
           ) VALUES (?, ?, ?, ?, ?, '2026-03-02', '2026-03-25', 'credit', ?, 0, ?, ?, ?, ?, 0, ?, 'posted', ?, 'usr_admin')
-        `).run(invId, invNum, brId, whId, custId, subtotal, subtotal, vat, wht, total, total, sJe.entryId);
+        `).run(invId, invNum, brId, whId, custId, subtotal, subtotal, vat, wht, total, total, sJe.entryId));
 
         // 2. Partial Receipt Voucher for 10,000 EGP (remaining dues = 1,300 EGP)
         const recAmount = 10000;
-        const rJe = postJournalEntry({
+        const rJe = (await postJournalEntry({
           docType: 'REC',
           docId: 'test_rec_cyc_01',
           docNumber: 'REC-CYC-001',
@@ -1978,13 +1979,13 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_1111', debit: recAmount, credit: 0, description: 'قبض بالخزينة' },
             { accountId: 'acc_1121', partyId: custId, debit: 0, credit: recAmount, description: 'سداد من العميل' }
           ]
-        }, testDb);
+        }, testDb));
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           UPDATE sales_invoices
           SET paid_amount = paid_amount + ?, remaining_amount = remaining_amount - ?
           WHERE id = ?
-        `).run(recAmount, recAmount, invId);
+        `).run(recAmount, recAmount, invId));
 
         // 3. Sales Return: Return 3 units (value = 3,000 + 420 VAT - 30 WHT = 3,390 EGP, COGS = 2,100)
         // Since remaining invoice is 1,300 EGP, returning 3,390 EGP creates a negative dues (credit balance) of 2,090 EGP on the customer!
@@ -1994,7 +1995,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const retTotal = 3390;
         const retCogs = 2100;
 
-        const retJe = postJournalEntry({
+        const retJe = (await postJournalEntry({
           docType: 'SALES_RET',
           docId: 'test_sret_cyc_01',
           docNumber: 'RET-CYC-001',
@@ -2012,16 +2013,16 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_1141', debit: retCogs, credit: 0, description: 'إعادة للمخزون' },
             { accountId: 'acc_5111', debit: 0, credit: retCogs, description: 'تخفيض تكلفة المبيعات' }
           ]
-        }, testDb);
+        }, testDb));
 
         // Check customer balance in ledger:
         // Debits = 11,300, Credits = 10,000 (receipt) + 3,390 (return) = 13,390.
         // Balance = 11,300 - 13,390 = -2,090 (Credit balance: company owes customer 2,090 EGP)
-        const custLedger = testDb.prepare(`
+        const custLedger = (await testDb.prepare(`
           SELECT SUM(debit) as debits, SUM(credit) as credits
           FROM journal_entry_lines
           WHERE party_id = ?
-        `).get(custId) as any;
+        `).get(custId)) as any;
 
         const netBalance = new Decimal(custLedger.debits).minus(custLedger.credits).toNumber();
         if (netBalance !== -2090) {
@@ -2030,7 +2031,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
 
         // 4. Refund customer the 2,090 EGP via linked payment voucher from cash box
         const refundAmount = 2090;
-        const refJe = postJournalEntry({
+        const refJe = (await postJournalEntry({
           docType: 'PAY',
           docId: 'test_ref_cyc_01',
           docNumber: 'REF-CYC-001',
@@ -2044,14 +2045,14 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_1121', partyId: custId, debit: refundAmount, credit: 0, description: 'تسوية رصيد العميل الدائن' },
             { accountId: 'acc_1111', debit: 0, credit: refundAmount, description: 'صرف نقدي من الخزينة' }
           ]
-        }, testDb);
+        }, testDb));
 
         // Check final customer balance
-        const finalLedger = testDb.prepare(`
+        const finalLedger = (await testDb.prepare(`
           SELECT SUM(debit) as debits, SUM(credit) as credits
           FROM journal_entry_lines
           WHERE party_id = ?
-        `).get(custId) as any;
+        `).get(custId)) as any;
         const finalNet = new Decimal(finalLedger.debits).minus(finalLedger.credits).toNumber();
         if (Math.abs(finalNet) > 0.001) {
           throw new Error(`رصيد العميل النهائي بعد رد النقدية يجب أن يعود إلى 0.00 ج.م، المحسوب: ${finalNet}`);
@@ -2084,13 +2085,13 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const suppId = 'party_supp_test_cyc';
         const brId = 'br_cairo';
         const whId = 'wh_main';
-        const period = getFiscalPeriodForDate('2026-03-01', testDb);
+        const period = (await getFiscalPeriodForDate('2026-03-01', testDb));
 
         // Insert fresh isolated supplier for this test
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO parties (id, code, type, name_ar, name_en)
           VALUES (?, 'SUPP-CYC-99', 'supplier', 'مورد دورة الاختبار', 'Cycle Test Supplier')
-        `).run(suppId);
+        `).run(suppId));
 
         // Credit purchase: 10 units @ 800 = 8,000 + 1,120 VAT (14%) - 80 WHT (1%) = 9,040 EGP
         const pInvId = 'test_pinv_cyc_02';
@@ -2099,7 +2100,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const pWht = 80;
         const pTotal = 9040;
 
-        const pJe = postJournalEntry({
+        const pJe = (await postJournalEntry({
           docType: 'PUR_INV',
           docId: pInvId,
           docNumber: 'PINV-CYC-002',
@@ -2115,10 +2116,10 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_2111', partyId: suppId, debit: 0, credit: pTotal, description: 'استحقاق المورد' },
             { accountId: 'acc_2132', debit: 0, credit: pWht, description: 'أمانات ضرائب خصم وتحصيل' }
           ]
-        }, testDb);
+        }, testDb));
 
         // Partial payment voucher of 5,000 EGP
-        const payJe = postJournalEntry({
+        const payJe = (await postJournalEntry({
           docType: 'PAY',
           docId: 'test_pay_cyc_02',
           docNumber: 'PAY-CYC-002',
@@ -2132,10 +2133,10 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_2111', partyId: suppId, debit: 5000, credit: 0, description: 'سداد للمورد' },
             { accountId: 'acc_1111', debit: 0, credit: 5000, description: 'صرف من الخزينة' }
           ]
-        }, testDb);
+        }, testDb));
 
         // Partial purchase return: 2 units @ 800 = 1,600 + 224 VAT - 16 WHT = 1,808 EGP
-        const pretJe = postJournalEntry({
+        const pretJe = (await postJournalEntry({
           docType: 'PUR_RET',
           docId: 'test_pret_cyc_02',
           docNumber: 'PRET-CYC-002',
@@ -2151,14 +2152,14 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_1141', debit: 0, credit: 1600, description: 'إخراج من المخزون' },
             { accountId: 'acc_1151', debit: 0, credit: 224, description: 'رد ضريبة مدخلات' }
           ]
-        }, testDb);
+        }, testDb));
 
         // Check remaining payable to supplier: 9,040 - 5,000 - 1,808 = 2,232 EGP
-        const suppRow = testDb.prepare(`
+        const suppRow = (await testDb.prepare(`
           SELECT SUM(credit) - SUM(debit) as net_payable
           FROM journal_entry_lines
           WHERE party_id = ?
-        `).get(suppId) as any;
+        `).get(suppId)) as any;
 
         if (Number(suppRow.net_payable) !== 2232) {
           throw new Error(`مستحق المورد المتوقع 2232 ج.م، المحسوب: ${suppRow.net_payable}`);
@@ -2189,7 +2190,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
       const start = Date.now();
       try {
         // Record baseline stock for item_001
-        const baseStock = testDb.prepare(`SELECT quantity FROM warehouse_stock WHERE warehouse_id = 'wh_main' AND item_id = 'item_001'`).get() as any;
+        const baseStock = (await testDb.prepare(`SELECT quantity FROM warehouse_stock WHERE warehouse_id = 'wh_main' AND item_id = 'item_001'`).get()) as any;
         const initialQty = baseStock?.quantity;
         if (initialQty === undefined || initialQty === null) {
           throw new Error('لم يتم العثور على رصيد المخزون الأولي للصنف');
@@ -2197,36 +2198,36 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
 
         // 1. Create draft sales invoice
         const draftInvId = 'draft_sinv_test_01';
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO sales_invoices (
             id, invoice_number, branch_id, warehouse_id, customer_id, invoice_date, due_date,
             payment_type, subtotal, discount_amount, taxable_amount, tax_amount, withholding_tax_amount,
             total_amount, paid_amount, remaining_amount, status, created_by
           ) VALUES (?, 'DRAFT-INV-999', 'br_cairo', 'wh_main', 'party_cust_001', '2026-03-01', '2026-03-30', 'credit', 50000, 0, 50000, 7000, 500, 56500, 0, 56500, 'draft', 'usr_admin')
-        `).run(draftInvId);
+        `).run(draftInvId));
 
         // 2. Verify stock quantity has NOT changed
-        const stockAfterDraft = testDb.prepare(`SELECT quantity FROM warehouse_stock WHERE warehouse_id = 'wh_main' AND item_id = 'item_001'`).get() as any;
+        const stockAfterDraft = (await testDb.prepare(`SELECT quantity FROM warehouse_stock WHERE warehouse_id = 'wh_main' AND item_id = 'item_001'`).get()) as any;
         if (stockAfterDraft?.quantity !== initialQty) {
           throw new Error('المسودة أثرت على كميات المخزون قبل الترحيل!');
         }
 
         // 3. Verify no journal entry was created for draft
-        const jeForDraft = testDb.prepare(`SELECT id FROM journal_entries WHERE doc_id = ?`).get(draftInvId);
+        const jeForDraft = (await testDb.prepare(`SELECT id FROM journal_entries WHERE doc_id = ?`).get(draftInvId));
         if (jeForDraft) {
           throw new Error('تم إنشاء قيد يومية لمسودة غير مرحلة!');
         }
 
         // 4. Update draft details
-        testDb.prepare(`UPDATE sales_invoices SET subtotal = 60000, total_amount = 67800 WHERE id = ?`).run(draftInvId);
-        const updatedDraft = testDb.prepare(`SELECT total_amount FROM sales_invoices WHERE id = ?`).get(draftInvId) as any;
+        (await testDb.prepare(`UPDATE sales_invoices SET subtotal = 60000, total_amount = 67800 WHERE id = ?`).run(draftInvId));
+        const updatedDraft = (await testDb.prepare(`SELECT total_amount FROM sales_invoices WHERE id = ?`).get(draftInvId)) as any;
         if (updatedDraft.total_amount !== 67800) {
           throw new Error('فشل تعديل بيانات المسودة قبل الترحيل');
         }
 
         // 5. Delete draft with confirmation
-        testDb.prepare(`DELETE FROM sales_invoices WHERE id = ? AND status = 'draft'`).run(draftInvId);
-        const checkDeleted = testDb.prepare(`SELECT id FROM sales_invoices WHERE id = ?`).get(draftInvId);
+        (await testDb.prepare(`DELETE FROM sales_invoices WHERE id = ? AND status = 'draft'`).run(draftInvId));
+        const checkDeleted = (await testDb.prepare(`SELECT id FROM sales_invoices WHERE id = ?`).get(draftInvId));
         if (checkDeleted) {
           throw new Error('فشل حذف المسودة');
         }
@@ -2297,26 +2298,26 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         const periodId = 'fp_2026_01';
 
         // 1. Verify period is open initially
-        const pBefore = testDb.prepare(`SELECT is_closed FROM fiscal_periods WHERE id = ?`).get(periodId) as any;
+        const pBefore = (await testDb.prepare(`SELECT is_closed FROM fiscal_periods WHERE id = ?`).get(periodId)) as any;
         if (pBefore.is_closed === 1) {
           throw new Error('الفترة يجب أن تكون مفتوحة في بداية الاختبار');
         }
 
         // 2. Perform Month Closing with exact schema columns (period_id, closed_by, notes, summary_json)
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO period_closings (
             id, period_id, closed_by, notes, summary_json
           ) VALUES ('close_test_01', ?, 'usr_admin', 'إقفال تجريبي معتمد', '{}')
-        `).run(periodId);
+        `).run(periodId));
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           UPDATE fiscal_periods SET is_closed = 1 WHERE id = ?
-        `).run(periodId);
+        `).run(periodId));
 
         // 3. Attempt to post a transaction inside closed period -> MUST throw PERIOD_CLOSED error
         let blocked = false;
         try {
-          postJournalEntry({
+          (await postJournalEntry({
             docType: 'MANUAL',
             docId: 'test_blocked_je',
             docNumber: 'BLK-001',
@@ -2330,7 +2331,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
               { accountId: 'acc_1111', debit: 100, credit: 0, description: 'تجربة' },
               { accountId: 'acc_1112', debit: 0, credit: 100, description: 'تجربة' }
             ]
-          }, testDb);
+          }, testDb));
         } catch (err: any) {
           if (err.message.includes('مغلقة') || err.message.includes('closed') || err.message.includes('PERIOD_CLOSED')) {
             blocked = true;
@@ -2345,17 +2346,17 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
 
         // 4. Test Reopen Period with Audit Log
         const reopenReason = 'تسوية تدقيق ضريبي استثنائية معتمدة من الإدارة المالية';
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO period_reopen_logs (
             id, period_id, reopened_by, reason, previous_status
           ) VALUES ('reopen_01', ?, 'usr_admin', ?, 'closed')
-        `).run(periodId, reopenReason);
+        `).run(periodId, reopenReason));
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           UPDATE fiscal_periods SET is_closed = 0 WHERE id = ?
-        `).run(periodId);
+        `).run(periodId));
 
-        const checkAudit = testDb.prepare(`SELECT * FROM period_reopen_logs WHERE id = 'reopen_01'`).get() as any;
+        const checkAudit = (await testDb.prepare(`SELECT * FROM period_reopen_logs WHERE id = 'reopen_01'`).get()) as any;
         if (!checkAudit || checkAudit.reason !== reopenReason) {
           throw new Error('فشل تسجيل سبب إعادة فتح الفترة في سجل الرقابة المالي');
         }
@@ -2399,8 +2400,8 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         }
 
         // Post opening entry
-        const period = getFiscalPeriodForDate('2026-01-01', testDb);
-        const openJe = postJournalEntry({
+        const period = (await getFiscalPeriodForDate('2026-01-01', testDb));
+        const openJe = (await postJournalEntry({
           docType: 'OPENING',
           docId: 'test_open_batch_01',
           docNumber: 'OPN-IMP-001',
@@ -2415,16 +2416,16 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_1141', debit: 50000, credit: 0, description: 'مخزون افتتاحي' },
             { accountId: 'acc_3111', debit: 0, credit: 100000, description: 'رأس المال الافتتاحي' }
           ]
-        }, testDb);
+        }, testDb));
 
         // Check import log with schema columns (id, import_type, filename, total_rows, valid_rows, error_rows, status, imported_by)
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO excel_imports_log (
             id, import_type, filename, total_rows, valid_rows, error_rows, status, imported_by
           ) VALUES ('imp_test_01', 'opening_balances', 'Opening_2026.xlsx', 3, 3, 0, 'committed', 'usr_admin')
-        `).run();
+        `).run());
 
-        const logCheck = testDb.prepare(`SELECT * FROM excel_imports_log WHERE id = 'imp_test_01'`).get() as any;
+        const logCheck = (await testDb.prepare(`SELECT * FROM excel_imports_log WHERE id = 'imp_test_01'`).get()) as any;
         if (!logCheck || logCheck.valid_rows !== 3) {
           throw new Error('فشل تسجيل عملية الاستيراد في سجل العمليات');
         }
@@ -2448,55 +2449,24 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
     }
 
     // ----------------------------------------------------
-    // Suite 37: النسخ الاحتياطي التوافقي SQLite WAL عبر VACUUM INTO واستعادة آمنة
-    // ----------------------------------------------------
+    // Suite 37: Consistent MySQL backup and isolated restore
     {
-      const start = Date.now();
-      const backupTestFile = path.resolve(__dirname, `../../almizan_backup_test_${Date.now()}.db`);
+      const start = Date.now(); let backupFile = '';
+      const isolated = createDatabaseConnection('almizan_test_restore_' + Date.now());
       try {
-        // 1. Perform online consistent backup using VACUUM INTO
-        testDb.prepare(`VACUUM INTO ?`).run(backupTestFile);
-
-        if (!fs.existsSync(backupTestFile)) {
-          throw new Error('فشل توليد ملف النسخة الاحتياطية عبر VACUUM INTO');
-        }
-
-        // 2. Open backup database and check PRAGMA integrity_check
-        const backupConn = createDatabaseConnection(backupTestFile);
-        const integrity = backupConn.prepare(`PRAGMA integrity_check`).get() as any;
-        if (integrity.integrity_check !== 'ok') {
-          backupConn.close();
-          throw new Error(`فشل فحص تكامل ملف النسخة الاحتياطية: ${integrity.integrity_check}`);
-        }
-
-        // 3. Compare record counts
-        const origAccounts = testDb.prepare(`SELECT COUNT(*) as cnt FROM accounts`).get() as any;
-        const backupAccounts = backupConn.prepare(`SELECT COUNT(*) as cnt FROM accounts`).get() as any;
-        backupConn.close();
-
-        if (origAccounts.cnt !== backupAccounts.cnt) {
-          throw new Error('عدم تطابق عدد الحسابات بين الأصل والنسخة الاحتياطية');
-        }
-
-        results.push({
-          suiteNumber: 37,
-          name: 'النسخ الاحتياطي التوافقي SQLite WAL: فحص سلامة VACUUM INTO وتكامل ملف الاستعادة',
-          passed: true,
-          message: `تم التحقق بنجاح من توليد نسخة احتياطية متسقة ومضغوطة عبر VACUUM INTO، واجتياز فحص PRAGMA integrity_check (ok)، وتطابق كامل السجلات دون قفل أو تعليق.`,
-          durationMs: Date.now() - start
-        });
-      } catch (err: any) {
-        results.push({
-          suiteNumber: 37,
-          name: 'النسخ الاحتياطي التوافقي SQLite WAL: فحص سلامة VACUUM INTO وتكامل ملف الاستعادة',
-          passed: false,
-          message: err.message,
-          durationMs: Date.now() - start
-        });
+        const backup = await createSnapshot(testDb); backupFile = backup.filePath;
+        const snapshot = await readSnapshot(backupFile);
+        await initDb(isolated);
+        await restoreSnapshot(isolated, snapshot);
+        const original = await testDb.prepare('SELECT COUNT(*) AS cnt FROM accounts').get();
+        const restored = await isolated.prepare('SELECT COUNT(*) AS cnt FROM accounts').get();
+        if (original.cnt !== restored.cnt) throw new Error('Backup record count mismatch');
+        results.push({ suiteNumber: 37, name: 'نسخ MySQL واستعادة مستقلة مع فحص العلاقات', passed: true, message: 'تطابقت الحسابات بعد الاستعادة واجتاز فحص SHA-256 والعلاقات', durationMs: Date.now() - start });
+      } catch (error: any) {
+        results.push({ suiteNumber: 37, name: 'نسخ MySQL واستعادة مستقلة مع فحص العلاقات', passed: false, message: error.message, durationMs: Date.now() - start });
       } finally {
-        if (fs.existsSync(backupTestFile)) {
-          try { fs.unlinkSync(backupTestFile); } catch (e) {}
-        }
+        await isolated.dropTestSchema();
+        if (backupFile && fs.existsSync(backupFile)) fs.unlinkSync(backupFile);
       }
     }
 
@@ -2511,36 +2481,36 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
 
         // Invoice issued on 2026-01-10, Due 2026-01-25 for 5,000 EGP
         const invId = 'test_hist_inv_01';
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO sales_invoices (
             id, invoice_number, branch_id, warehouse_id, customer_id, invoice_date, due_date,
             payment_type, subtotal, discount_amount, taxable_amount, tax_amount, withholding_tax_amount,
             total_amount, paid_amount, remaining_amount, status, created_by
           ) VALUES (?, 'HIST-INV-001', ?, 'wh_main', ?, '2026-01-10', '2026-01-25', 'credit', 5000, 0, 5000, 0, 0, 5000, 0, 5000, 'posted', 'usr_admin')
-        `).run(invId, brId, custId);
+        `).run(invId, brId, custId));
 
         // Later payment voucher on 2026-03-15 for 5,000 EGP using exact schema
         const payVoucherId = 'test_hist_pay_01';
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO payment_vouchers (
             id, voucher_number, voucher_type, branch_id, payment_method, party_id, voucher_date, amount, status, description, created_by
           ) VALUES (?, 'HIST-PV-001', 'receipt', ?, 'cash', ?, '2026-03-15', 5000, 'posted', 'سداد لاحق في مارس', 'usr_admin')
-        `).run(payVoucherId, brId, custId);
+        `).run(payVoucherId, brId, custId));
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO voucher_allocations (
             id, voucher_id, invoice_type, invoice_id, allocated_amount
           ) VALUES ('alloc_hist_01', ?, 'sales_invoice', ?, 5000)
-        `).run(payVoucherId, invId);
+        `).run(payVoucherId, invId));
 
         // Point-in-time calculation as of 2026-01-31:
         // Payments up to 2026-01-31 = 0 EGP!
-        const paymentsAsOfJan = testDb.prepare(`
+        const paymentsAsOfJan = (await testDb.prepare(`
           SELECT COALESCE(SUM(va.allocated_amount), 0) as paid
           FROM voucher_allocations va
           JOIN payment_vouchers pv ON va.voucher_id = pv.id
           WHERE va.invoice_id = ? AND pv.voucher_date <= '2026-01-31' AND pv.status = 'posted'
-        `).get(invId) as any;
+        `).get(invId)) as any;
 
         const outstandingAsOfJan = 5000 - Number(paymentsAsOfJan.paid);
         if (outstandingAsOfJan !== 5000) {
@@ -2548,12 +2518,12 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         }
 
         // Calculation as of 2026-03-31:
-        const paymentsAsOfMar = testDb.prepare(`
+        const paymentsAsOfMar = (await testDb.prepare(`
           SELECT COALESCE(SUM(va.allocated_amount), 0) as paid
           FROM voucher_allocations va
           JOIN payment_vouchers pv ON va.voucher_id = pv.id
           WHERE va.invoice_id = ? AND pv.voucher_date <= '2026-03-31' AND pv.status = 'posted'
-        `).get(invId) as any;
+        `).get(invId)) as any;
 
         const outstandingAsOfMar = 5000 - Number(paymentsAsOfMar.paid);
         if (outstandingAsOfMar !== 0) {
@@ -2586,10 +2556,10 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
       try {
         const bankAccId = 'acc_1113'; // National Bank of Egypt (account 1113)
         const bankFeeAccId = 'acc_6511'; // Bank charges & commissions (account 6511)
-        const period = getFiscalPeriodForDate('2026-03-01', testDb);
+        const period = (await getFiscalPeriodForDate('2026-03-01', testDb));
 
         // 1. Direct bank fee entry: 75 EGP (debit acc_6511 bank charges, credit acc_1113 bank)
-        const feeJe = postJournalEntry({
+        const feeJe = (await postJournalEntry({
           docType: 'BANK_FEE',
           docId: 'test_bank_fee_01',
           docNumber: 'BFEE-001',
@@ -2603,10 +2573,10 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: bankFeeAccId, debit: 75, credit: 0, description: 'مصاريف وعمولات بنكية' },
             { accountId: bankAccId, debit: 0, credit: 75, description: 'خصم من الحساب البنكي' }
           ]
-        }, testDb);
+        }, testDb));
 
         // Verify journal entry lines
-        const lines = testDb.prepare(`SELECT * FROM journal_entry_lines WHERE entry_id = ?`).all(feeJe.entryId) as any[];
+        const lines = (await testDb.prepare(`SELECT * FROM journal_entry_lines WHERE entry_id = ?`).all(feeJe.entryId)) as any[];
         if (lines.length !== 2 || lines[0].debit !== 75 || lines[1].credit !== 75) {
           throw new Error('قيد المصروفات البنكية غير متزن');
         }
@@ -2637,26 +2607,26 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
       try {
         const whId = 'wh_main';
         const itemId = 'item_001';
-        const period = getFiscalPeriodForDate('2026-03-01', testDb);
+        const period = (await getFiscalPeriodForDate('2026-03-01', testDb));
 
         // 1. Create inventory count session using schema columns (id, count_number, branch_id, warehouse_id, count_date, status, created_by)
         const countId = 'test_count_session_01';
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO inventory_counts (
             id, count_number, branch_id, warehouse_id, count_date, status, created_by
           ) VALUES (?, 'COUNT-2026-001', 'br_cairo', ?, '2026-03-20', 'draft', 'usr_admin')
-        `).run(countId, whId);
+        `).run(countId, whId));
 
         // 2. Add count item using schema columns (id, count_id, item_id, system_quantity, counted_quantity, diff_quantity, unit_cost, total_diff_cost)
-        testDb.prepare(`
+        (await testDb.prepare(`
           INSERT INTO inventory_count_items (
             id, count_id, item_id, system_quantity, counted_quantity, diff_quantity, unit_cost, total_diff_cost
           ) VALUES ('ci_test_01', ?, ?, 10, 8, -2, 7000, -14000)
-        `).run(countId, itemId);
+        `).run(countId, itemId));
 
         // 3. Post inventory count session: Generates balanced JE (debit acc_5211 Inventory Shortage Expense 14,000, credit acc_1141 Inventory 14,000)
         const shortageAmount = 14000;
-        const countJe = postJournalEntry({
+        const countJe = (await postJournalEntry({
           docType: 'INV_COUNT',
           docId: countId,
           docNumber: 'COUNT-2026-001',
@@ -2670,22 +2640,22 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             { accountId: 'acc_5211', debit: shortageAmount, credit: 0, description: 'عجز وفروق الجرد المخزني' },
             { accountId: 'acc_1141', debit: 0, credit: shortageAmount, description: 'تخفيض قيمة المخزون' }
           ]
-        }, testDb);
+        }, testDb));
 
-        testDb.prepare(`
+        (await testDb.prepare(`
           UPDATE inventory_counts
           SET status = 'posted', journal_entry_id = ?
           WHERE id = ?
-        `).run(countJe.entryId, countId);
+        `).run(countJe.entryId, countId));
 
         // 4. Verify warehouse stock deduction
-        testDb.prepare(`
+        (await testDb.prepare(`
           UPDATE warehouse_stock
           SET quantity = 8
           WHERE warehouse_id = ? AND item_id = ?
-        `).run(whId, itemId);
+        `).run(whId, itemId));
 
-        const checkWh = testDb.prepare(`SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?`).get(whId, itemId) as any;
+        const checkWh = (await testDb.prepare(`SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?`).get(whId, itemId)) as any;
         if (checkWh.quantity !== 8) {
           throw new Error(`كمية المخزون بعد اعتماد الجرد يجب أن تكون 8 وحدات، الحالي: ${checkWh.quantity}`);
         }
@@ -2868,10 +2838,10 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         }
 
         // Execute plan2 on server
-        const execRes = executeAnalysisPlan(plan2, {
+        const execRes = (await executeAnalysisPlan(plan2, {
           sheetAnalysis: parsed.sheetAnalysis,
           rows: parsed.rows
-        });
+        }));
 
         if (!execRes.primaryValue?.includes('100500.00')) {
           throw new Error(`نتيجة سؤال المتابعة لشهر أكتوبر يجب أن تتضمن 100500.00 ج.م، الفعلي: ${execRes.primaryValue}`);
@@ -2884,10 +2854,10 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
           operation: 'sum',
           targetColumn: 'عمود_خيالي_غير_موجود'
         };
-        const invalidExec = executeAnalysisPlan(invalidPlan, {
+        const invalidExec = (await executeAnalysisPlan(invalidPlan, {
           sheetAnalysis: parsed.sheetAnalysis,
           rows: parsed.rows
-        });
+        }));
         if (!invalidExec.primaryValue?.includes('0.00')) {
           throw new Error(`الاستعلام عن عمود غير موجود يجب أن يُعالج بأمان مع قيمة 0.00، الفعلي: ${invalidExec.primaryValue}`);
         }
@@ -3086,7 +3056,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
           currencyColumn: 'العملة'
         };
 
-        const minMaxRes = executeAnalysisPlan(minMaxPlan, {
+        const minMaxRes = (await executeAnalysisPlan(minMaxPlan, {
           sheetAnalysis: {
             name: 'ورقة_الحدود',
             totalRows: 5,
@@ -3100,7 +3070,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
             hasSalesAndReturns: false
           },
           rows: testRowsWithTies
-        });
+        }));
 
         if (!minMaxRes.success) {
           throw new Error(`فشل تنفيذ خطة min_max: ${minMaxRes.error}`);
@@ -3284,7 +3254,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
           { 'القيمة': 10, 'المجموعة': 'أ' }, { 'القيمة': 12, 'المجموعة': 'أ' }, { 'القيمة': 14, 'المجموعة': 'أ' },
           { 'القيمة': 30, 'المجموعة': 'ب' }, { 'القيمة': 32, 'المجموعة': 'ب' }, { 'القيمة': 34, 'المجموعة': 'ب' }
         ];
-        const twoGrpRes = runTwoIndependentGroupsTest(twoGrpRows, 'القيمة', 'المجموعة', 'أ', 'ب', undefined, 0.05, 'ويلش');
+        const twoGrpRes = (await runTwoIndependentGroupsTest(twoGrpRows, 'القيمة', 'المجموعة', 'أ', 'ب', undefined, 0.05, 'ويلش'));
         if (twoGrpRes.twoGroupMetrics.mean1 !== 12.0 || twoGrpRes.twoGroupMetrics.mean2 !== 32.0) {
           throw new Error(`متوسطات المجموعتين غير صحيحة: ${twoGrpRes.twoGroupMetrics.mean1} و ${twoGrpRes.twoGroupMetrics.mean2}`);
         }
@@ -3299,7 +3269,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
           { 'قبل': 60, 'بعد': 70, 'معرف': 'E3' },
           { 'قبل': 65, 'بعد': 75, 'معرف': 'E4' }
         ];
-        const pairedRes = runPairedSamplesTest(pairedRows, 'قبل', 'بعد', 'معرف', undefined, 0.05, 'أزواج');
+        const pairedRes = (await runPairedSamplesTest(pairedRows, 'قبل', 'بعد', 'معرف', undefined, 0.05, 'أزواج'));
         if (pairedRes.pairedMetrics.meanDifference !== 10.0) {
           throw new Error(`متوسط الفرق المزدوج المتوقع 10.0، الفعلي: ${pairedRes.pairedMetrics.meanDifference}`);
         }
@@ -3310,7 +3280,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
           { 'المبيعات': 50, 'الفرع': 'فرع 2' }, { 'المبيعات': 52, 'الفرع': 'فرع 2' },
           { 'المبيعات': 90, 'الفرع': 'فرع 3' }, { 'المبيعات': 92, 'الفرع': 'فرع 3' }
         ];
-        const anovaRes = runAnovaAndKruskalTest(anovaRows, 'المبيعات', 'الفرع', undefined, 0.05, 'أنوفا');
+        const anovaRes = (await runAnovaAndKruskalTest(anovaRows, 'المبيعات', 'الفرع', undefined, 0.05, 'أنوفا'));
         if (anovaRes.statistics.primaryStatValue <= 10 || (anovaRes.statistics.pValue ?? 1) > 0.01) {
           throw new Error(`تحليل التباين F يجب أن يكون دالاً جداً بفروق شاسعة بين الفروع، الفعلي: F=${anovaRes.statistics.primaryStatValue}, p=${anovaRes.statistics.pValue}`);
         }
@@ -3369,10 +3339,10 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
           ]
         };
 
-        const execPlan = executeAnalysisPlan(filterPlan, {
+        const execPlan = (await executeAnalysisPlan(filterPlan, {
           sheetAnalysis: parsed.sheetAnalysis,
           rows: parsed.rows
-        });
+        }));
 
         // Verify matching row indices
         const matchingIndices = execPlan.matchingRowIndices;
@@ -3440,10 +3410,10 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
         }
 
         // 2. Server-side execution of statistical plan
-        const execRes = executeAnalysisPlan(plan, {
+        const execRes = (await executeAnalysisPlan(plan, {
           sheetAnalysis: parsed.sheetAnalysis,
           rows: parsed.rows
-        });
+        }));
 
         if (!execRes.success || !execRes.statisticalResult) {
           throw new Error(`فشل تنفيذ الخطة الإحصائية بواسطة محرك السيرفر: ${execRes.error}`);
@@ -3487,7 +3457,7 @@ export function runAllFinancialTests(): { summary: { total: number; passed: numb
   } finally {
     // Strictly isolate: close and delete the test database files
     try {
-      testDb.close();
+      await testDb.dropTestSchema();
       if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
       if (fs.existsSync(`${testDbPath}-wal`)) fs.unlinkSync(`${testDbPath}-wal`);
       if (fs.existsSync(`${testDbPath}-shm`)) fs.unlinkSync(`${testDbPath}-shm`);

@@ -21,9 +21,9 @@ export function verifyPassword(plain: string, storedHash: string): { valid: bool
   return { valid: false, needsRehash: false };
 }
 
-export function seedInitialData(targetDb = db) {
+export async function seedInitialData(targetDb = db) {
   const conn = targetDb;
-  const companyCheck = conn.prepare('SELECT COUNT(*) as cnt FROM companies').get() as { cnt: number };
+  const companyCheck = (await conn.prepare('SELECT COUNT(*) as cnt FROM companies').get()) as { cnt: number };
   if (companyCheck && companyCheck.cnt > 0) {
     console.log('Database already has company data.');
     return;
@@ -32,10 +32,10 @@ export function seedInitialData(targetDb = db) {
   console.log('Starting full Egyptian Commercial ERP Seed...');
 
   const db = targetDb;
-  const transaction = db.transaction(() => {
+  const transaction = db.transaction(async () => {
     // 1. Company Information
     const companyId = 'comp_al_mizan';
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO companies (
         id, name_ar, name_en, legal_name, commercial_registry, tax_id, vat_number,
         activity_code, address_ar, address_en, city, country, postal_code, phone, email, website
@@ -46,24 +46,24 @@ export function seedInitialData(targetDb = db) {
         '15 Makram Ebeid St, 6th District, Nasr City, Cairo', 'القاهرة', 'مصر', '11765',
         '+20 2 22718900', 'info@almizan-erp.eg', 'https://almizan-erp.eg'
       )
-    `).run(companyId);
+    `).run(companyId));
 
     // 2. Branches
     const branchCairoId = 'br_cairo';
     const branchAlexId = 'br_alex';
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO branches (id, company_id, code, name_ar, name_en, address, phone)
       VALUES 
       (?, ?, 'CAI', 'الفرع الرئيسي - القاهرة (مدينة نصر)', 'Cairo Main Branch', '15 شارع مكرم عبيد، مدينة نصر', '+20 2 22718901'),
       (?, ?, 'ALX', 'فرع الإسكندرية (سموحة)', 'Alexandria Branch', 'شارع فوزي معاذ، سموحة، الإسكندرية', '+20 3 4298100')
-    `).run(branchCairoId, companyId, branchAlexId, companyId);
+    `).run(branchCairoId, companyId, branchAlexId, companyId));
 
     // 3. Fiscal Year 2026 and 12 Monthly Periods
     const yearId = 'fy_2026';
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO fiscal_years (id, code, name_ar, name_en, start_date, end_date, is_closed)
       VALUES (?, '2026', 'السنة المالية 2026', 'Fiscal Year 2026', '2026-01-01', '2026-12-31', 0)
-    `).run(yearId);
+    `).run(yearId));
 
     const monthNamesAr = ['يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو', 'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر'];
     const monthNamesEn = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
@@ -73,44 +73,44 @@ export function seedInitialData(targetDb = db) {
       const mm = m.toString().padStart(2, '0');
       const lastDay = new Date(2026, m, 0).getDate();
       const periodId = `fp_2026_${mm}`;
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO fiscal_periods (id, fiscal_year_id, period_number, name_ar, name_en, start_date, end_date, is_closed)
         VALUES (?, ?, ?, ?, ?, ?, ?, 0)
       `).run(
         periodId, yearId, pNum,
         `فترة ${monthNamesAr[m - 1]} 2026`, `Period ${monthNamesEn[m - 1]} 2026`,
         `2026-${mm}-01`, `2026-${mm}-${lastDay}`
-      );
+      ));
     }
 
     // 4. Currencies
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO currencies (code, name_ar, name_en, symbol, decimal_places, is_base)
       VALUES
       ('EGP', 'الجنيه المصري', 'Egyptian Pound', 'ج.م', 2, 1),
       ('USD', 'الدولار الأمريكي', 'US Dollar', '$', 2, 0),
       ('EUR', 'اليورو الأوروبي', 'Euro', '€', 2, 0),
       ('SAR', 'الريال السعودي', 'Saudi Riyal', 'ر.س', 2, 0)
-    `).run();
+    `).run());
 
     // Exchange Rates
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO exchange_rates (id, currency_code, rate, rate_date)
       VALUES
       ('rate_usd_2026', 'USD', 48.50, '2026-01-01'),
       ('rate_eur_2026', 'EUR', 52.20, '2026-01-01'),
       ('rate_sar_2026', 'SAR', 12.92, '2026-01-01')
-    `).run();
+    `).run());
 
     // 5. Cost Centers
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO cost_centers (id, code, name_ar, name_en)
       VALUES
       ('cc_admin', 'CC-101', 'الإدارة العامة والمكتب التنفيذي', 'General Administration'),
       ('cc_sales', 'CC-201', 'قطاع المبيعات والتسويق', 'Sales & Marketing'),
       ('cc_warehouses', 'CC-301', 'إدارة المخازن واللوجستيات', 'Warehousing & Logistics'),
       ('cc_tech', 'CC-401', 'إدارة تقنية المعلومات والدعم الفني', 'IT & Support')
-    `).run();
+    `).run());
 
     // 6. Complete Standard Egyptian Chart of Accounts (دليل الحسابات المصري الموحد)
     const accountsData = [
@@ -207,39 +207,39 @@ export function seedInitialData(targetDb = db) {
     `);
 
     for (const a of accountsData) {
-      insertAcc.run(a.id, a.code, a.name_ar, a.name_en, a.parent, a.type, a.nature, a.is_group, a.level, a.is_reconciliation || 0);
+      (await insertAcc.run(a.id, a.code, a.name_ar, a.name_en, a.parent, a.type, a.nature, a.is_group, a.level, a.is_reconciliation || 0));
     }
 
     // 7. Warehouses
     const whMainId = 'wh_main';
     const whAlexId = 'wh_alex';
     const whDamagedId = 'wh_damaged';
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO warehouses (id, branch_id, code, name_ar, name_en, address, is_damaged_stock)
       VALUES
       (?, ?, 'WH-CAI-01', 'المخزن الرئيسي - القاهرة (مصر الجديدة)', 'Cairo Central Warehouse', 'منطقة شيراتون، مصر الجديدة', 0),
       (?, ?, 'WH-ALX-01', 'مخزن فرع الإسكندرية (سموحة)', 'Alexandria Regional Warehouse', 'المنطقة الصناعية، سموحة', 0),
       (?, ?, 'WH-DMG-01', 'مخزن البضاعة المرتجعة والتالفة', 'Damaged & Inspection Warehouse', 'ملحق المخزن الرئيسي، القاهرة', 1)
-    `).run(whMainId, branchCairoId, whAlexId, branchAlexId, whDamagedId, branchCairoId);
+    `).run(whMainId, branchCairoId, whAlexId, branchAlexId, whDamagedId, branchCairoId));
 
     // 8. Cash Boxes & Bank Accounts
     const cashCairoId = 'cash_cairo';
     const cashAlexId = 'cash_alex';
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO cash_boxes (id, branch_id, code, name_ar, name_en, account_id, currency_code, current_balance)
       VALUES
       (?, ?, 'CASH-01', 'خزينة المركز الرئيسي - القاهرة', 'Cairo Main Cash Box', 'acc_1111', 'EGP', 150000.00),
       (?, ?, 'CASH-02', 'خزينة فرع الإسكندرية', 'Alexandria Cash Box', 'acc_1112', 'EGP', 75000.00)
-    `).run(cashCairoId, branchCairoId, cashAlexId, branchAlexId);
+    `).run(cashCairoId, branchCairoId, cashAlexId, branchAlexId));
 
     const bankNbeId = 'bank_nbe';
     const bankMisrId = 'bank_misr';
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO bank_accounts (id, bank_name, account_number, iban, swift_code, branch_name, account_id, currency_code, current_balance)
       VALUES
       (?, 'البنك الأهلي المصري', '100458921001', 'EG380003010045892100100000100', 'NBEGEGCX', 'فرع مكرم عبيد', 'acc_1113', 'EGP', 850000.00),
       (?, 'بنك مصر', '200987114002', 'EG920002020098711400200000200', 'BMISEGCX', 'فرع سموحة', 'acc_1114', 'USD', 25000.00)
-    `).run(bankNbeId, bankMisrId);
+    `).run(bankNbeId, bankMisrId));
 
     // 9. Users and Roles
     const usersList = [
@@ -260,7 +260,7 @@ export function seedInitialData(targetDb = db) {
       VALUES (?, ?, ?, ?, ?, 1, '*', '*', '*')
     `);
     for (const u of usersList) {
-      insertUser.run(u.id, u.u, passHash, u.name, u.role);
+      (await insertUser.run(u.id, u.u, passHash, u.name, u.role));
     }
 
     // User permissions matrix with granular unit-specific and action permissions
@@ -368,10 +368,10 @@ export function seedInitialData(targetDb = db) {
       ]
     };
 
-    const insertPerm = db.prepare('INSERT OR IGNORE INTO user_permissions (id, role, permission_key) VALUES (?, ?, ?)');
+    const insertPerm = db.prepare('INSERT IGNORE INTO user_permissions (id, role, permission_key) VALUES (?, ?, ?)');
     for (const [role, perms] of Object.entries(rolesPermissions)) {
       for (const p of perms) {
-        insertPerm.run(`perm_${role}_${p}`, role, p);
+        (await insertPerm.run(`perm_${role}_${p}`, role, p));
       }
     }
 
@@ -409,11 +409,11 @@ export function seedInitialData(targetDb = db) {
     for (const c of customersData) {
       const pId = `party_cust_${custIndex.toString().padStart(3, '0')}`;
       const code = `CUST-${custIndex.toString().padStart(4, '0')}`;
-      insertParty.run(
+      (await insertParty.run(
         pId, code, 'customer', c.name, `Customer ${custIndex}`,
         c.tax, c.reg, `+20 2 27${custIndex}0000`, `شارع التجارة الرئيسي، ${c.city}`, c.city,
         c.limit, c.days
-      );
+      ));
       custIndex++;
     }
 
@@ -439,11 +439,11 @@ export function seedInitialData(targetDb = db) {
     for (const s of suppliersData) {
       const pId = `party_supp_${suppIndex.toString().padStart(3, '0')}`;
       const code = `SUPP-${suppIndex.toString().padStart(4, '0')}`;
-      insertParty.run(
+      (await insertParty.run(
         pId, code, 'supplier', s.name, `Supplier ${suppIndex}`,
         s.tax, s.reg, `+20 2 33${suppIndex}0000`, `المنطقة الصناعية، ${s.city}`, s.city,
         0, 30
-      );
+      ));
       suppIndex++;
     }
 
@@ -527,32 +527,32 @@ export function seedInitialData(targetDb = db) {
       const isServ = (it as any).is_service ? 'service' : 'stock';
       const baseUnit = (it as any).is_service ? 'خدمة' : 'قطعة';
 
-      insertItem.run(
+      (await insertItem.run(
         itId, code, barcode, it.name_ar, it.name_en, isServ, it.cat, baseUnit,
         it.cost, it.sale, isServ === 'stock' ? 5 : 0, it.cost, it.eta
-      );
+      ));
 
       // Base unit
-      insertUnit.run(`unit_base_${itemIdx}`, itId, baseUnit, 1.0, it.sale, 1);
+      (await insertUnit.run(`unit_base_${itemIdx}`, itId, baseUnit, 1.0, it.sale, 1));
 
       // Extra multi-unit for high-volume items (Carton of 10)
       if (it.cat === 'ملحقات وإكسسوارات' && isServ === 'stock') {
-        insertUnit.run(`unit_carton_${itemIdx}`, itId, 'كرتونة (10 قطع)', 10.0, it.sale * 9.5, 0);
+        (await insertUnit.run(`unit_carton_${itemIdx}`, itId, 'كرتونة (10 قطع)', 10.0, it.sale * 9.5, 0));
       }
 
       // Initial Stock in Warehouses
       if (isServ === 'stock') {
         const qtyCairo = 15 + (itemIdx % 20) * 3;
         const qtyAlex = 5 + (itemIdx % 10) * 2;
-        insertStock.run(whMainId, itId, qtyCairo);
-        insertStock.run(whAlexId, itId, qtyAlex);
+        (await insertStock.run(whMainId, itId, qtyCairo));
+        (await insertStock.run(whAlexId, itId, qtyAlex));
       }
 
       itemIdx++;
     }
 
     // 12. Fixed Assets Records (3 Commercial Fixed Assets)
-    db.prepare(`
+    (await db.prepare(`
       INSERT INTO fixed_assets (
         id, code, name_ar, name_en, branch_id, cost_center_id, purchase_date, operation_date,
         purchase_cost, scrap_value, useful_life_years, annual_depreciation_rate, accumulated_depreciation, book_value,
@@ -561,14 +561,14 @@ export function seedInitialData(targetDb = db) {
       ('fa_01', 'AST-001', 'أجهزة كمبيوتر وخوادم الإدارة الرئيسية', 'HQ Core Servers & PCs', 'br_cairo', 'cc_tech', '2025-01-01', '2025-01-01', 120000.00, 10000.00, 3, 33.33, 40000.00, 80000.00, 'acc_1211', 'acc_6311', 'acc_1221'),
       ('fa_02', 'AST-002', 'أثاث ومكاتب المقر الرئيسي وفرع الإسكندرية', 'Office Furniture & Desks', 'br_cairo', 'cc_admin', '2025-01-01', '2025-01-01', 80000.00, 5000.00, 5, 20.00, 16000.00, 64000.00, 'acc_1212', 'acc_6311', 'acc_1222'),
       ('fa_03', 'AST-003', 'سيارة نقل وتوزيع شيفروليه جامبو', 'Chevrolet Jumbo Distribution Truck', 'br_cairo', 'cc_warehouses', '2025-01-01', '2025-01-01', 350000.00, 50000.00, 5, 20.00, 70000.00, 280000.00, 'acc_1213', 'acc_6311', 'acc_1223')
-    `).run();
+    `).run());
 
     console.log('Master data created. Now posting Opening Journal Entry...');
 
     // 13. Opening Balance Journal Entry (قيد الافتتاح المتوازن بدقة)
     // Total Debit = Total Credit = 3,000,000 EGP
-    const openingPeriod = getFiscalPeriodForDate('2026-01-01', db);
-    postJournalEntry({
+    const openingPeriod = (await getFiscalPeriodForDate('2026-01-01', db));
+    (await postJournalEntry({
       docType: 'MANUAL',
       docId: 'OPENING_2026',
       docNumber: 'OPN-2026-001',
@@ -602,7 +602,7 @@ export function seedInitialData(targetDb = db) {
         { accountId: 'acc_3211', debit: 0, credit: 300000, description: 'الاحتياطي القانوني' },
         { accountId: 'acc_3311', debit: 0, credit: 1200000, description: 'الأرباح المحتجزة من السنوات السابقة' },
       ]
-    }, db);
+    }, db));
 
     console.log('Opening entry posted. Total Debit == Total Credit.');
 
@@ -660,13 +660,13 @@ export function seedInitialData(targetDb = db) {
       const whtAmount = subtotal * 0.01; // Withholding tax 1%
       const totalAmount = subtotal + vatAmount - whtAmount;
 
-      const p = getFiscalPeriodForDate(inv.date, db);
+      const p = (await getFiscalPeriodForDate(inv.date, db));
       const isAlex = inv.num.includes('ALX');
       const bId = isAlex ? branchAlexId : branchCairoId;
       const wId = isAlex ? whAlexId : whMainId;
 
       // 1. Post Journal Entry for the Sales Invoice
-      const { entryId } = postJournalEntry({
+      const { entryId } = (await postJournalEntry({
         docType: 'SALES_INV',
         docId: invId,
         docNumber: inv.num,
@@ -690,10 +690,10 @@ export function seedInitialData(targetDb = db) {
           { accountId: 'acc_5111', debit: totalCost, credit: 0, description: `تكلفة البضاعة المباعة للفاتورة ${inv.num}` },
           { accountId: isAlex ? 'acc_1142' : 'acc_1141', debit: 0, credit: totalCost, description: `صرف مخزون للفاتورة ${inv.num}` }
         ]
-      }, db);
+      }, db));
 
       // 2. Insert Sales Invoice Record
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO sales_invoices (
           id, invoice_number, branch_id, warehouse_id, customer_id, invoice_date, due_date,
           payment_type, subtotal, discount_amount, taxable_amount, tax_amount, withholding_tax_amount,
@@ -707,29 +707,29 @@ export function seedInitialData(targetDb = db) {
         inv.payment, subtotal, subtotal, vatAmount, whtAmount,
         totalAmount, inv.payment === 'cash' ? totalAmount : 0, inv.payment === 'cash' ? 0 : totalAmount,
         totalCost, entryId
-      );
+      ));
 
       // 3. Insert Invoice Items & Update Stock
       for (const it of inv.items) {
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO sales_invoice_items (
             id, invoice_id, item_id, unit_name, unit_factor, quantity, unit_price, cost_price, tax_rate, tax_amount, total_amount
           ) VALUES (?, ?, ?, 'قطعة', 1.0, ?, ?, ?, 14.0, ?, ?)
         `).run(
           `sii_${inv.num}_${it.id}`, invId, it.id, it.qty, it.price, it.cost, (it.qty * it.price * 0.14), (it.qty * it.price * 1.14)
-        );
+        ));
 
-        db.prepare(`
+        (await db.prepare(`
           UPDATE warehouse_stock 
           SET quantity = quantity - ? 
           WHERE warehouse_id = ? AND item_id = ?
-        `).run(it.qty, wId, it.id);
+        `).run(it.qty, wId, it.id));
       }
 
       // If cash sale, also record the receipt entry and payment voucher
       if (inv.payment === 'cash') {
-        const rcptPeriod = getFiscalPeriodForDate(inv.date, db);
-        const rcptJe = postJournalEntry({
+        const rcptPeriod = (await getFiscalPeriodForDate(inv.date, db));
+        const rcptJe = (await postJournalEntry({
           docType: 'RCPT',
           docId: `rcpt_${inv.num}`,
           docNumber: `RC-${inv.num}`,
@@ -743,9 +743,9 @@ export function seedInitialData(targetDb = db) {
             { accountId: 'acc_1111', debit: totalAmount, credit: 0, description: `تحصيل نقدي بالخزينة - فاتورة ${inv.num}` },
             { accountId: 'acc_1121', partyId: inv.cust, debit: 0, credit: totalAmount, description: `سداد قيمة الفاتورة ${inv.num}` }
           ]
-        }, db);
+        }, db));
 
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO payment_vouchers (
             id, voucher_number, voucher_type, branch_id, payment_method, cash_box_id,
             party_id, voucher_date, amount, allocated_amount, unallocated_amount,
@@ -754,7 +754,7 @@ export function seedInitialData(targetDb = db) {
         `).run(
           `pv_${inv.num}`, `RV-2026-${inv.num.slice(-6)}`, bId, cashCairoId,
           inv.cust, inv.date, totalAmount, totalAmount, `تحصيل نقدي للفاتورة ${inv.num}`, rcptJe.entryId
-        );
+        ));
       }
     }
 
@@ -787,9 +787,9 @@ export function seedInitialData(targetDb = db) {
       const vat = subtotal * 0.14;
       const wht = subtotal * 0.01;
       const totalAmount = subtotal + vat - wht;
-      const period = getFiscalPeriodForDate(pur.date, db);
+      const period = (await getFiscalPeriodForDate(pur.date, db));
 
-      const purJe = postJournalEntry({
+      const purJe = (await postJournalEntry({
         docType: 'PUR_INV',
         docId: pId,
         docNumber: pur.num,
@@ -805,9 +805,9 @@ export function seedInitialData(targetDb = db) {
           { accountId: pur.payment === 'cash' ? 'acc_1111' : 'acc_2111', partyId: pur.payment === 'cash' ? null : pur.supp, debit: 0, credit: totalAmount, description: `استحقاق المورد عن فاتورة مشتريات ${pur.num}` },
           { accountId: 'acc_2132', debit: 0, credit: wht, description: `أمانات خصم وتحصيل 1% فاتورة مشتريات ${pur.num}` }
         ]
-      }, db);
+      }, db));
 
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO purchase_invoices (
           id, invoice_number, supplier_invoice_number, branch_id, warehouse_id, supplier_id,
           invoice_date, due_date, payment_type, subtotal, discount_amount, taxable_amount,
@@ -818,38 +818,38 @@ export function seedInitialData(targetDb = db) {
         pId, pur.num, pur.suppInv, branchCairoId, whMainId, pur.supp, pur.date, pur.date,
         pur.payment, subtotal, subtotal, vat, wht, totalAmount, pur.payment === 'cash' ? totalAmount : 0,
         pur.payment === 'cash' ? 0 : totalAmount, purJe.entryId
-      );
+      ));
 
       for (const it of pur.items) {
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO purchase_invoice_items (
             id, invoice_id, item_id, unit_name, unit_factor, quantity, unit_price, tax_rate, tax_amount, total_amount
           ) VALUES (?, ?, ?, 'قطعة', 1.0, ?, ?, 14.0, ?, ?)
         `).run(
           `pii_${pur.num}_${it.id}`, pId, it.id, it.qty, it.price, (it.qty * it.price * 0.14), (it.qty * it.price * 1.14)
-        );
+        ));
 
-        db.prepare(`
+        (await db.prepare(`
           UPDATE warehouse_stock 
           SET quantity = quantity + ? 
           WHERE warehouse_id = ? AND item_id = ?
-        `).run(it.qty, whMainId, it.id);
+        `).run(it.qty, whMainId, it.id));
       }
     }
 
     // 16. Seed Sample Sales Return (for INV-2026-CAI-000001: 1 unit of item_001 returned)
     const retNum = 'RET-2026-CAI-000001';
     const retId = `ret_${retNum}`;
-    const origInv = db.prepare('SELECT * FROM sales_invoices WHERE invoice_number = ?').get('INV-2026-CAI-000001') as any;
+    const origInv = (await db.prepare('SELECT * FROM sales_invoices WHERE invoice_number = ?').get('INV-2026-CAI-000001')) as any;
     if (origInv) {
       const retSubtotal = 22000;
       const retVat = retSubtotal * 0.14;
       const retWht = retSubtotal * 0.01;
       const retTotal = retSubtotal + retVat - retWht;
       const retCost = 18500;
-      const retPeriod = getFiscalPeriodForDate('2026-01-20', db);
+      const retPeriod = (await getFiscalPeriodForDate('2026-01-20', db));
 
-      const retJe = postJournalEntry({
+      const retJe = (await postJournalEntry({
         docType: 'SALES_RET',
         docId: retId,
         docNumber: retNum,
@@ -867,9 +867,9 @@ export function seedInitialData(targetDb = db) {
           { accountId: 'acc_1141', debit: retCost, credit: 0, description: `إعادة مخزون بضاعة مرتجعة ${retNum}` },
           { accountId: 'acc_5111', debit: 0, credit: retCost, description: `عكس تكلفة مبيعات ${retNum}` }
         ]
-      }, db);
+      }, db));
 
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO sales_returns (
           id, return_number, original_invoice_id, branch_id, warehouse_id, customer_id,
           return_date, refund_type, subtotal, tax_amount, withholding_tax_amount,
@@ -878,27 +878,27 @@ export function seedInitialData(targetDb = db) {
       `).run(
         retId, retNum, origInv.id, branchCairoId, whMainId, origInv.customer_id,
         retSubtotal, retVat, retWht, retTotal, retCost, retJe.entryId
-      );
+      ));
 
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO sales_return_items (
           id, return_id, item_id, unit_name, unit_factor, quantity, unit_price, unit_cost, tax_rate, tax_amount, total_amount
         ) VALUES (?, ?, 'item_001', 'قطعة', 1.0, 1, 22000, 18500, 14.0, 3080, 25080)
-      `).run(`sri_${retNum}_item001`, retId);
+      `).run(`sri_${retNum}_item001`, retId));
 
       // Update returned_quantity on sales_invoice_items
-      db.prepare(`
+      (await db.prepare(`
         UPDATE sales_invoice_items 
         SET returned_quantity = returned_quantity + 1 
         WHERE invoice_id = ? AND item_id = 'item_001'
-      `).run(origInv.id);
+      `).run(origInv.id));
 
       // Restore stock
-      db.prepare(`
+      (await db.prepare(`
         UPDATE warehouse_stock 
         SET quantity = quantity + 1 
         WHERE warehouse_id = ? AND item_id = 'item_001'
-      `).run(whMainId);
+      `).run(whMainId));
     }
 
     // 17. Seed Initialized Document Sequences above existing seeded numbers
@@ -920,30 +920,30 @@ export function seedInitialData(targetDb = db) {
     ];
 
     const insSeq = db.prepare(`
-      INSERT OR REPLACE INTO document_sequences (id, doc_type, branch_id, fiscal_year_id, prefix, next_number)
+      REPLACE INTO document_sequences (id, doc_type, branch_id, fiscal_year_id, prefix, next_number)
       VALUES (?, ?, ?, 'fy_2026', ?, ?)
     `);
 
     // 18. Sync party_sequences and account_sequences with seeded records
     for (const pType of ['customer', 'supplier']) {
       const pfx = pType === 'supplier' ? 'SUPP' : 'CUST';
-      const rows = db.prepare("SELECT code FROM parties WHERE code LIKE ?").all(`${pfx}-%`) as { code: string }[];
+      const rows = (await db.prepare("SELECT code FROM parties WHERE code LIKE ?").all(`${pfx}-%`)) as { code: string }[];
       let maxNum = 0;
       for (const r of rows) {
         const parts = r.code.split('-');
         const n = parseInt(parts[parts.length - 1], 10);
         if (!isNaN(n) && n > maxNum) maxNum = n;
       }
-      db.prepare(`
+      (await db.prepare(`
         INSERT INTO party_sequences (type, last_number)
         VALUES (?, ?)
-        ON CONFLICT(type) DO UPDATE SET last_number = MAX(last_number, excluded.last_number)
-      `).run(pType, maxNum);
+        ON DUPLICATE KEY UPDATE last_number = GREATEST(last_number, VALUES(last_number))
+      `).run(pType, maxNum));
     }
 
-    const parents = db.prepare('SELECT id, code FROM accounts WHERE is_group = 1').all() as { id: string; code: string }[];
+    const parents = (await db.prepare('SELECT id, code FROM accounts WHERE is_group = 1').all()) as { id: string; code: string }[];
     for (const p of parents) {
-      const children = db.prepare('SELECT code FROM accounts WHERE parent_id = ?').all(p.id) as { code: string }[];
+      const children = (await db.prepare('SELECT code FROM accounts WHERE parent_id = ?').all(p.id)) as { code: string }[];
       let maxSub = 0;
       for (const c of children) {
         if (c.code.startsWith(p.code)) {
@@ -953,16 +953,16 @@ export function seedInitialData(targetDb = db) {
         }
       }
       if (maxSub > 0) {
-        db.prepare(`
+        (await db.prepare(`
           INSERT INTO account_sequences (sequence_key, last_number)
           VALUES (?, ?)
-          ON CONFLICT(sequence_key) DO UPDATE SET last_number = MAX(last_number, excluded.last_number)
-        `).run(`parent_${p.id}`, maxSub);
+          ON DUPLICATE KEY UPDATE last_number = GREATEST(last_number, VALUES(last_number))
+        `).run(`parent_${p.id}`, maxSub));
       }
     }
 
     console.log('Seed completed successfully with sales, purchases, returns, and synced sequences!');
   });
 
-  transaction();
+  (await transaction());
 }

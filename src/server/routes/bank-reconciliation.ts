@@ -1,4 +1,5 @@
-import { Router, Response } from 'express';
+import { Router } from '../mysql-router.js';
+import { Response } from 'express';
 import Decimal from 'decimal.js';
 import { db } from '../db.js';
 import { AuthenticatedRequest, requireAuth, requirePermission } from '../api.js';
@@ -10,33 +11,33 @@ export const bankReconciliationRouter = Router();
 /**
  * GET /data: Fetch bank reconciliation workspace data
  */
-bankReconciliationRouter.get('/data', requireAuth, requirePermission('bank_reconciliation.view', 'bank.reconciliation.view', 'bank.view', 'bank.reconcile', 'treasury.view'), (req: AuthenticatedRequest, res: Response) => {
+bankReconciliationRouter.get('/data', requireAuth, requirePermission('bank_reconciliation.view', 'bank.reconciliation.view', 'bank.view', 'bank.reconcile', 'treasury.view'), async (req: AuthenticatedRequest, res: Response) => {
   const bankAccountId = (req.query.bankAccountId as string) || 'bank_nbe';
   const fromDate = (req.query.fromDate as string) || '2026-01-01';
   const toDate = (req.query.toDate as string) || new Date().toISOString().split('T')[0];
 
   try {
-    const bank = db.prepare(`
+    const bank = (await db.prepare(`
       SELECT ba.*, a.code as account_code, a.name_ar as account_name_ar
       FROM bank_accounts ba
       JOIN accounts a ON ba.account_id = a.id
       WHERE ba.id = ?
-    `).get(bankAccountId) as any;
+    `).get(bankAccountId)) as any;
 
     if (!bank) {
       return res.status(404).json({ error: 'الحساب البنكي المحدد غير موجود.' });
     }
 
     // 1. Bank Statement Lines
-    const statementLines = db.prepare(`
+    const statementLines = (await db.prepare(`
       SELECT bsl.*
       FROM bank_statement_lines bsl
       WHERE bsl.bank_account_id = ? AND bsl.line_date BETWEEN ? AND ?
       ORDER BY bsl.line_date ASC, bsl.id ASC
-    `).all(bankAccountId, fromDate, toDate) as BankStatementLine[];
+    `).all(bankAccountId, fromDate, toDate)) as BankStatementLine[];
 
     // 2. Book Transactions from Payment Vouchers & General Ledger
-    const bookVouchers = db.prepare(`
+    const bookVouchers = (await db.prepare(`
       SELECT pv.id, pv.voucher_number as doc_number, pv.voucher_date as doc_date,
              pv.description, pv.amount, pv.voucher_type,
              CASE WHEN pv.voucher_type = 'receipt' THEN pv.amount ELSE 0 END as debit,
@@ -47,10 +48,10 @@ bankReconciliationRouter.get('/data', requireAuth, requirePermission('bank_recon
       LEFT JOIN parties p ON pv.party_id = p.id
       WHERE pv.bank_account_id = ? AND pv.status = 'posted' AND pv.voucher_date BETWEEN ? AND ?
       ORDER BY pv.voucher_date ASC
-    `).all(bankAccountId, fromDate, toDate) as any[];
+    `).all(bankAccountId, fromDate, toDate)) as any[];
 
     // Also include direct journal entry lines affecting this bank account (e.g. bank fee entries)
-    const bookJournalLines = db.prepare(`
+    const bookJournalLines = (await db.prepare(`
       SELECT jel.id, je.entry_number as doc_number, je.posting_date as doc_date,
              jel.description, jel.debit, jel.credit,
              (SELECT COUNT(*) FROM bank_statement_lines WHERE matched_journal_line_id = jel.id) as is_reconciled
@@ -59,7 +60,7 @@ bankReconciliationRouter.get('/data', requireAuth, requirePermission('bank_recon
       WHERE jel.account_id = ? AND je.status = 'posted' AND je.posting_date BETWEEN ? AND ?
         AND je.doc_type NOT IN ('RCPT', 'PYMT') -- avoid duplicating vouchers
       ORDER BY je.posting_date ASC
-    `).all(bank.account_id, fromDate, toDate) as any[];
+    `).all(bank.account_id, fromDate, toDate)) as any[];
 
     const allBookTransactions = [
       ...bookVouchers.map(v => ({
@@ -120,20 +121,20 @@ bankReconciliationRouter.get('/data', requireAuth, requirePermission('bank_recon
 
     // 4. Calculate Balances
     // Current Book Balance
-    const bookBalanceRow = db.prepare(`
+    const bookBalanceRow = (await db.prepare(`
       SELECT COALESCE(ROUND(SUM(jel.debit - jel.credit), 2), 0) as book_balance
       FROM journal_entry_lines jel
       JOIN journal_entries je ON jel.entry_id = je.id
       WHERE jel.account_id = ? AND je.status = 'posted' AND je.posting_date <= ?
-    `).get(bank.account_id, toDate) as { book_balance: number };
+    `).get(bank.account_id, toDate)) as { book_balance: number };
 
-    const latestStatement = db.prepare(`
+    const latestStatement = (await db.prepare(`
       SELECT closing_balance, statement_date
       FROM bank_statements
       WHERE bank_account_id = ?
       ORDER BY statement_date DESC
       LIMIT 1
-    `).get(bankAccountId) as { closing_balance: number; statement_date: string } | undefined;
+    `).get(bankAccountId)) as { closing_balance: number; statement_date: string } | undefined;
 
     const statementBalance = latestStatement?.closing_balance || bank.current_balance;
 
@@ -199,7 +200,7 @@ bankReconciliationRouter.get('/data', requireAuth, requirePermission('bank_recon
 /**
  * POST /import-statement: Import Bank Statement Lines with Duplicate Prevention
  */
-bankReconciliationRouter.post('/import-statement', requireAuth, requirePermission('bank.reconciliation.import', 'bank.reconcile'), (req: AuthenticatedRequest, res: Response) => {
+bankReconciliationRouter.post('/import-statement', requireAuth, requirePermission('bank.reconciliation.import', 'bank.reconcile'), async (req: AuthenticatedRequest, res: Response) => {
   const { bankAccountId, statementDate, openingBalance, closingBalance, lines, filename } = req.body;
 
   if (!bankAccountId || !lines || !Array.isArray(lines) || lines.length === 0) {
@@ -212,8 +213,8 @@ bankReconciliationRouter.post('/import-statement', requireAuth, requirePermissio
     let insertedLines = 0;
     let skippedDuplicates = 0;
 
-    db.transaction(() => {
-      db.prepare(`
+    (await db.transaction(async () => {
+      (await db.prepare(`
         INSERT INTO bank_statements (id, bank_account_id, statement_date, opening_balance, closing_balance, filename, imported_by)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(
@@ -224,7 +225,7 @@ bankReconciliationRouter.post('/import-statement', requireAuth, requirePermissio
         Number(closingBalance || 0),
         filename || 'bank_statement.xlsx',
         req.user!.id
-      );
+      ));
 
       const insLine = db.prepare(`
         INSERT INTO bank_statement_lines (id, statement_id, bank_account_id, line_date, reference, description, debit, credit)
@@ -240,10 +241,10 @@ bankReconciliationRouter.post('/import-statement', requireAuth, requirePermissio
 
         // Duplicate Check: Same bank account, date, ref, debit, and credit
         if (ref) {
-          const dupCheck = db.prepare(`
+          const dupCheck = (await db.prepare(`
             SELECT id FROM bank_statement_lines
             WHERE bank_account_id = ? AND line_date = ? AND reference = ? AND debit = ? AND credit = ?
-          `).get(bankAccountId, lineDate, ref, d, c);
+          `).get(bankAccountId, lineDate, ref, d, c));
 
           if (dupCheck) {
             skippedDuplicates++;
@@ -252,18 +253,18 @@ bankReconciliationRouter.post('/import-statement', requireAuth, requirePermissio
         }
 
         const lineId = `bsl_${Date.now()}_${insertedLines}_${Math.random().toString(36).slice(2, 5)}`;
-        insLine.run(lineId, stmtId, bankAccountId, lineDate, ref || null, desc, d, c);
+        (await insLine.run(lineId, stmtId, bankAccountId, lineDate, ref || null, desc, d, c));
         insertedLines++;
       }
-    })();
+    })());
 
-    logAudit(
+    (await logAudit(
       req.user!.id,
       'IMPORT_BANK_STATEMENT',
       'bank_statements',
       stmtId,
       `استيراد كشف حساب بنكي: تم إدراج (${insertedLines}) حركة، وتجاهل (${skippedDuplicates}) حركة مكررة لمنع الازدواج.`
-    );
+    ));
 
     res.json({
       success: true,
@@ -279,7 +280,7 @@ bankReconciliationRouter.post('/import-statement', requireAuth, requirePermissio
 /**
  * POST /match: Match a statement line with a book voucher or journal line
  */
-bankReconciliationRouter.post('/match', requireAuth, requirePermission('bank.reconciliation.match', 'bank.reconcile'), (req: AuthenticatedRequest, res: Response) => {
+bankReconciliationRouter.post('/match', requireAuth, requirePermission('bank.reconciliation.match', 'bank.reconcile'), async (req: AuthenticatedRequest, res: Response) => {
   const { statementLineId, bookTxId, bookTxType } = req.body;
 
   if (!statementLineId || !bookTxId) {
@@ -287,29 +288,29 @@ bankReconciliationRouter.post('/match', requireAuth, requirePermission('bank.rec
   }
 
   try {
-    const sLine = db.prepare('SELECT * FROM bank_statement_lines WHERE id = ?').get(statementLineId) as any;
+    const sLine = (await db.prepare('SELECT * FROM bank_statement_lines WHERE id = ?').get(statementLineId)) as any;
     if (!sLine) return res.status(404).json({ error: 'حركة كشف الحساب غير موجودة.' });
     if (sLine.is_matched === 1) return res.status(400).json({ error: 'تمت مطابقة حركة كشف الحساب هذه مسبقاً.' });
 
     // Prevent double matching
     if (bookTxType === 'voucher') {
-      const alreadyMatched = db.prepare('SELECT id FROM bank_statement_lines WHERE matched_voucher_id = ?').get(bookTxId);
+      const alreadyMatched = (await db.prepare('SELECT id FROM bank_statement_lines WHERE matched_voucher_id = ?').get(bookTxId));
       if (alreadyMatched) return res.status(400).json({ error: 'سند الدفاتر المحدد مرتبط ومطابق بالفعل مع حركة بنكية أخرى.' });
 
-      db.prepare(`
+      (await db.prepare(`
         UPDATE bank_statement_lines
         SET is_matched = 1, matched_voucher_id = ?, matched_by = ?, matched_at = CURRENT_TIMESTAMP
         WHERE id = ?
-      `).run(bookTxId, req.user!.id, statementLineId);
+      `).run(bookTxId, req.user!.id, statementLineId));
     } else {
-      const alreadyMatched = db.prepare('SELECT id FROM bank_statement_lines WHERE matched_journal_line_id = ?').get(bookTxId);
+      const alreadyMatched = (await db.prepare('SELECT id FROM bank_statement_lines WHERE matched_journal_line_id = ?').get(bookTxId));
       if (alreadyMatched) return res.status(400).json({ error: 'حركة القيد المحددة مطابقة بالفعل مع حركة بنكية أخرى.' });
 
-      db.prepare(`
+      (await db.prepare(`
         UPDATE bank_statement_lines
         SET is_matched = 1, matched_journal_line_id = ?, matched_by = ?, matched_at = CURRENT_TIMESTAMP
         WHERE id = ?
-      `).run(bookTxId, req.user!.id, statementLineId);
+      `).run(bookTxId, req.user!.id, statementLineId));
     }
 
     res.json({ success: true, message: 'تمت المطابقة بنجاح.' });
@@ -321,7 +322,7 @@ bankReconciliationRouter.post('/match', requireAuth, requirePermission('bank.rec
 /**
  * POST /unmatch: Unmatch a previously matched statement line
  */
-bankReconciliationRouter.post('/unmatch', requireAuth, requirePermission('bank.reconciliation.match', 'bank.reconcile'), (req: AuthenticatedRequest, res: Response) => {
+bankReconciliationRouter.post('/unmatch', requireAuth, requirePermission('bank.reconciliation.match', 'bank.reconcile'), async (req: AuthenticatedRequest, res: Response) => {
   const { statementLineId } = req.body;
 
   if (!statementLineId) {
@@ -329,11 +330,11 @@ bankReconciliationRouter.post('/unmatch', requireAuth, requirePermission('bank.r
   }
 
   try {
-    db.prepare(`
+    (await db.prepare(`
       UPDATE bank_statement_lines
       SET is_matched = 0, matched_voucher_id = NULL, matched_journal_line_id = NULL, matched_by = NULL, matched_at = NULL
       WHERE id = ?
-    `).run(statementLineId);
+    `).run(statementLineId));
 
     res.json({ success: true, message: 'تم إلغاء المطابقة بنجاح.' });
   } catch (err: any) {
@@ -344,7 +345,7 @@ bankReconciliationRouter.post('/unmatch', requireAuth, requirePermission('bank.r
 /**
  * POST /record-fee: Record missing bank charge/interest directly with a balanced Journal Entry & match it
  */
-bankReconciliationRouter.post('/record-fee', requireAuth, requirePermission('bank.reconciliation.fees', 'bank.reconcile'), (req: AuthenticatedRequest, res: Response) => {
+bankReconciliationRouter.post('/record-fee', requireAuth, requirePermission('bank.reconciliation.fees', 'bank.reconcile'), async (req: AuthenticatedRequest, res: Response) => {
   const { statementLineId, feeType, description } = req.body;
 
   if (!statementLineId) {
@@ -352,25 +353,25 @@ bankReconciliationRouter.post('/record-fee', requireAuth, requirePermission('ban
   }
 
   try {
-    const sLine = db.prepare(`
+    const sLine = (await db.prepare(`
       SELECT bsl.*, ba.account_id as bank_account_id_gl
       FROM bank_statement_lines bsl
       JOIN bank_accounts ba ON bsl.bank_account_id = ba.id
       WHERE bsl.id = ?
-    `).get(statementLineId) as any;
+    `).get(statementLineId)) as any;
 
     if (!sLine) return res.status(404).json({ error: 'حركة كشف الحساب غير موجودة.' });
     if (sLine.is_matched === 1) return res.status(400).json({ error: 'الحركة مطابقة بالفعل.' });
 
-    const period = getFiscalPeriodForDate(sLine.line_date);
+    const period = (await getFiscalPeriodForDate(sLine.line_date));
     const amount = sLine.debit > 0 ? sLine.debit : sLine.credit;
     const isFeeExpense = sLine.debit > 0; // Bank took money (fee)
 
     let jeResult: any = null;
 
-    db.transaction(() => {
+    (await db.transaction(async () => {
       // Create and post balanced journal entry
-      jeResult = postJournalEntry({
+      jeResult = (await postJournalEntry({
         docType: 'MANUAL',
         entryDate: sLine.line_date,
         postingDate: sLine.line_date,
@@ -385,30 +386,30 @@ bankReconciliationRouter.post('/record-fee', requireAuth, requirePermission('ban
           { accountId: sLine.bank_account_id_gl, debit: amount, credit: 0, description: 'إيداع بالحساب البنكي' },
           { accountId: 'acc_4511', debit: 0, credit: amount, description: sLine.description } // إيرادات وعوائد
         ]
-      });
+      }));
 
       // Find the created line for the bank account
-      const createdLine = db.prepare(`
+      const createdLine = (await db.prepare(`
         SELECT id FROM journal_entry_lines
         WHERE entry_id = ? AND account_id = ?
         LIMIT 1
-      `).get(jeResult.entryId, sLine.bank_account_id_gl) as any;
+      `).get(jeResult.entryId, sLine.bank_account_id_gl)) as any;
 
       // Auto-match this new line with the statement line
-      db.prepare(`
+      (await db.prepare(`
         UPDATE bank_statement_lines
         SET is_matched = 1, matched_journal_line_id = ?, matched_by = ?, matched_at = CURRENT_TIMESTAMP
         WHERE id = ?
-      `).run(createdLine.id, req.user!.id, statementLineId);
-    })();
+      `).run(createdLine.id, req.user!.id, statementLineId));
+    })());
 
-    logAudit(
+    (await logAudit(
       req.user!.id,
       'POST_BANK_FEE_ENTRY',
       'bank_statement_lines',
       statementLineId,
       `تسجيل قيد تسوية بنكية برقم (${jeResult.entryNumber}) بمبلغ (${amount} ج.م) ومطابقته فورياً.`
-    );
+    ));
 
     res.json({
       success: true,

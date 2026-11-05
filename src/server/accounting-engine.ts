@@ -1,6 +1,6 @@
 import Decimal from 'decimal.js';
 import { db } from './db.js';
-import type Database from 'better-sqlite3';
+import type { MysqlDatabase } from './mysql-database.js';
 
 // Configure Decimal precision
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_HALF_UP });
@@ -35,14 +35,14 @@ export interface JournalEntryInput {
 /**
  * Get or determine the open fiscal period for a given date
  */
-export function getFiscalPeriodForDate(dateStr: string, targetDb = db): { id: string; fiscal_year_id: string; is_closed: number } {
-  const period = targetDb.prepare(`
+export async function getFiscalPeriodForDate(dateStr: string, targetDb = db): Promise<{ id: string; fiscal_year_id: string; is_closed: number }> {
+  const period = (await targetDb.prepare(`
     SELECT fp.id, fp.fiscal_year_id, fp.is_closed, fy.is_closed as year_closed
     FROM fiscal_periods fp
     JOIN fiscal_years fy ON fp.fiscal_year_id = fy.id
     WHERE ? BETWEEN fp.start_date AND fp.end_date
     LIMIT 1
-  `).get(dateStr) as { id: string; fiscal_year_id: string; is_closed: number; year_closed: number } | undefined;
+  `).get(dateStr)) as { id: string; fiscal_year_id: string; is_closed: number; year_closed: number } | undefined;
 
   if (!period) {
     throw new Error(`لا توجد فترة مالية معرفة للتاريخ ${dateStr}. يرجى إعداد السنوات والفترات المالية أولاً.`);
@@ -58,10 +58,10 @@ export function getFiscalPeriodForDate(dateStr: string, targetDb = db): { id: st
 /**
  * Generate atomic sequential document number without gaps or collisions
  */
-export function getNextDocumentNumber(docType: string, branchId: string, fiscalYearId: string, targetDb = db): string {
-  const branch = targetDb.prepare('SELECT code FROM branches WHERE id = ?').get(branchId) as { code: string } | undefined;
+async function getNextDocumentNumberImpl(docType: string, branchId: string, fiscalYearId: string, targetDb = db): Promise<string> {
+  const branch = (await targetDb.prepare('SELECT code FROM branches WHERE id = ?').get(branchId)) as { code: string } | undefined;
   const branchCode = branch ? branch.code : 'B01';
-  const year = targetDb.prepare('SELECT code FROM fiscal_years WHERE id = ?').get(fiscalYearId) as { code: string } | undefined;
+  const year = (await targetDb.prepare('SELECT code FROM fiscal_years WHERE id = ?').get(fiscalYearId)) as { code: string } | undefined;
   const yearCode = year ? year.code : new Date().getFullYear().toString();
 
   const prefix = `${docType}-${yearCode}-${branchCode}`;
@@ -72,7 +72,7 @@ export function getNextDocumentNumber(docType: string, branchId: string, fiscalY
     WHERE doc_type = ? AND branch_id = ? AND fiscal_year_id = ?
   `);
   
-  let seq = getSeq.get(docType, branchId, fiscalYearId) as { id: string; prefix: string; next_number: number } | undefined;
+  let seq = (await getSeq.get(docType, branchId, fiscalYearId)) as { id: string; prefix: string; next_number: number } | undefined;
 
   // Scan existing tables to guarantee next_number is strictly greater than any existing document
   let maxExisting = 0;
@@ -87,7 +87,7 @@ export function getNextDocumentNumber(docType: string, branchId: string, fiscalY
 
   for (const q of checkQueries) {
     try {
-      const row = targetDb.prepare(q.sql).get(`${prefix}-%`) as { num: string } | undefined;
+      const row = (await targetDb.prepare(q.sql).get(`${prefix}-%`)) as { num: string } | undefined;
       if (row && row.num) {
         const parts = row.num.split('-');
         const lastPart = parts[parts.length - 1];
@@ -107,19 +107,19 @@ export function getNextDocumentNumber(docType: string, branchId: string, fiscalY
   } else {
     nextVal = maxExisting + 1;
     const id = `seq_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    targetDb.prepare(`
+    (await targetDb.prepare(`
       INSERT INTO document_sequences (id, doc_type, branch_id, fiscal_year_id, prefix, next_number)
       VALUES (?, ?, ?, ?, ?, ?)
-    `).run(id, docType, branchId, fiscalYearId, prefix, nextVal);
+    `).run(id, docType, branchId, fiscalYearId, prefix, nextVal));
     seq = { id, prefix, next_number: nextVal };
   }
 
   const currentNumber = nextVal;
-  targetDb.prepare(`
+  (await targetDb.prepare(`
     UPDATE document_sequences 
     SET next_number = ? 
     WHERE id = ?
-  `).run(currentNumber + 1, seq.id);
+  `).run(currentNumber + 1, seq.id));
 
   return `${prefix}-${currentNumber.toString().padStart(6, '0')}`;
 }
@@ -127,7 +127,7 @@ export function getNextDocumentNumber(docType: string, branchId: string, fiscalY
 /**
  * Log action to immutable audit log table
  */
-export function logAudit(
+export async function logAudit(
   userId: string,
   action: string,
   entityType: string,
@@ -152,7 +152,7 @@ export function logAudit(
 
   try {
     const id = `audit_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    targetDb.prepare(`
+    (await targetDb.prepare(`
       INSERT INTO audit_logs (id, user_id, action, entity_type, entity_id, details, old_values, new_values, ip_address)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
@@ -165,7 +165,7 @@ export function logAudit(
       oldVal ? JSON.stringify(sanitize(oldVal)) : null,
       newVal ? JSON.stringify(sanitize(newVal)) : null,
       ipAddress || null
-    );
+    ));
   } catch (err) {
     console.error('Audit log fatal write error:', err);
     throw new Error(`فشل تسجيل التدقيق الرقابي للعملية (${action}): ${err instanceof Error ? err.message : String(err)}`);
@@ -175,7 +175,7 @@ export function logAudit(
 /**
  * Central Journal Entry Posting
  */
-export function postJournalEntry(input: JournalEntryInput, targetDb = db): { entryId: string; entryNumber: string } {
+async function postJournalEntryImpl(input: JournalEntryInput, targetDb = db): Promise<{ entryId: string; entryNumber: string }> {
   if (!input.lines || input.lines.length < 2) {
     throw new Error('يجب أن يحتوي القيد المحاسبي على طرفين على الأقل (مدين ودائن).');
   }
@@ -202,7 +202,7 @@ export function postJournalEntry(input: JournalEntryInput, targetDb = db): { ent
     totalCredit = totalCredit.plus(credit);
 
     // Verify Account
-    const acc = targetDb.prepare('SELECT id, name_ar, is_group, is_active FROM accounts WHERE id = ?').get(line.accountId) as { id: string; name_ar: string; is_group: number; is_active: number } | undefined;
+    const acc = (await targetDb.prepare('SELECT id, name_ar, is_group, is_active FROM accounts WHERE id = ?').get(line.accountId)) as { id: string; name_ar: string; is_group: number; is_active: number } | undefined;
     if (!acc) {
       throw new Error(`الحساب ذو المعرف ${line.accountId} غير موجود في دليل الحسابات.`);
     }
@@ -220,11 +220,11 @@ export function postJournalEntry(input: JournalEntryInput, targetDb = db): { ent
     throw new Error(`القيد غير متوازن! إجمالي المدين (${totalDebit.toFixed(2)}) لا يساوي إجمالي الدائن (${totalCredit.toFixed(2)}). الفرق: ${diff.toFixed(2)}`);
   }
 
-  const period = getFiscalPeriodForDate(input.postingDate, targetDb);
+  const period = (await getFiscalPeriodForDate(input.postingDate, targetDb));
   const entryId = `je_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-  const entryNumber = getNextDocumentNumber('JV', input.branchId, period.fiscal_year_id, targetDb);
+  const entryNumber = (await getNextDocumentNumber('JV', input.branchId, period.fiscal_year_id, targetDb));
 
-  targetDb.prepare(`
+  (await targetDb.prepare(`
     INSERT INTO journal_entries (
       id, entry_number, doc_type, doc_id, doc_number, entry_date, posting_date,
       fiscal_period_id, branch_id, status, description, total_debit, total_credit,
@@ -247,7 +247,7 @@ export function postJournalEntry(input: JournalEntryInput, targetDb = db): { ent
     input.exchangeRate || 1.0,
     input.createdBy,
     input.createdBy
-  );
+  ));
 
   const insertLine = targetDb.prepare(`
     INSERT INTO journal_entry_lines (
@@ -264,7 +264,7 @@ export function postJournalEntry(input: JournalEntryInput, targetDb = db): { ent
     const rate = line.exchangeRate || 1.0;
     const currAmt = d > 0 ? (d / rate) : (c / rate);
 
-    insertLine.run(
+    (await insertLine.run(
       lineId,
       entryId,
       lineNo++,
@@ -277,22 +277,22 @@ export function postJournalEntry(input: JournalEntryInput, targetDb = db): { ent
       line.currencyCode || 'EGP',
       rate,
       currAmt
-    );
+    ));
   }
 
-  logAudit(input.createdBy, 'POST_JOURNAL', 'journal_entries', entryId, `ترحيل قيد يومية برقم ${entryNumber}`, null, null, targetDb);
+  (await logAudit(input.createdBy, 'POST_JOURNAL', 'journal_entries', entryId, `ترحيل قيد يومية برقم ${entryNumber}`, null, null, targetDb));
 
   return { entryId, entryNumber };
 }
 
-export function reverseJournalEntry(
+async function reverseJournalEntryImpl(
   originalEntryId: string,
   reason: string,
   userId: string,
   targetDb = db,
   allowDocumentReversal = false
-): { reverseEntryId: string; reverseNumber: string } {
-  const orig = targetDb.prepare('SELECT * FROM journal_entries WHERE id = ?').get(originalEntryId) as any;
+): Promise<{ reverseEntryId: string; reverseNumber: string }> {
+  const orig = (await targetDb.prepare('SELECT * FROM journal_entries WHERE id = ?').get(originalEntryId)) as any;
   if (!orig) {
     throw new Error('القيد المحاسبي المراد عكسه غير موجود.');
   }
@@ -308,14 +308,14 @@ export function reverseJournalEntry(
     throw new Error(`لا يمكن عكس قيد الفاتورة أو المردود (${orig.doc_type}) بشكل منفرد لأن ذلك يخل بتسوية المخزون والمديونية؛ يرجى استخدام إجراء إلغاء الفاتورة أو المردود.`);
   }
 
-  const lines = targetDb.prepare('SELECT * FROM journal_entry_lines WHERE entry_id = ? ORDER BY line_number').all(originalEntryId) as any[];
+  const lines = (await targetDb.prepare('SELECT * FROM journal_entry_lines WHERE entry_id = ? ORDER BY line_number').all(originalEntryId)) as any[];
   if (!lines || lines.length === 0) {
     throw new Error('لا توجد بنود مسجلة لهذا القيد.');
   }
 
   const today = new Date().toISOString().split('T')[0];
-  const period = getFiscalPeriodForDate(today, targetDb);
-  const reverseNumber = getNextDocumentNumber('REV', orig.branch_id, period.fiscal_year_id, targetDb);
+  const period = (await getFiscalPeriodForDate(today, targetDb));
+  const reverseNumber = (await getNextDocumentNumber('REV', orig.branch_id, period.fiscal_year_id, targetDb));
   const reverseId = `je_rev_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
   // Swap debit and credit lines
@@ -331,9 +331,9 @@ export function reverseJournalEntry(
     amountCurrency: line.amount_currency
   }));
 
-  targetDb.transaction(() => {
+  (await targetDb.transaction(async () => {
     // 1. Insert reverse entry first (referencing originalEntryId)
-    targetDb.prepare(`
+    (await targetDb.prepare(`
       INSERT INTO journal_entries (
         id, entry_number, doc_type, doc_id, doc_number, entry_date, posting_date,
         fiscal_period_id, branch_id, status, description, total_debit, total_credit,
@@ -356,14 +356,14 @@ export function reverseJournalEntry(
       userId,
       userId,
       originalEntryId
-    );
+    ));
 
     // 2. Mark original entry as reversed
-    targetDb.prepare(`
+    (await targetDb.prepare(`
       UPDATE journal_entries 
       SET status = 'reversed', reversed_entry_id = ? 
       WHERE id = ?
-    `).run(reverseId, originalEntryId);
+    `).run(reverseId, originalEntryId));
 
     const insertLine = targetDb.prepare(`
       INSERT INTO journal_entry_lines (
@@ -375,7 +375,7 @@ export function reverseJournalEntry(
     let lineNo = 1;
     for (const line of reverseLines) {
       const lineId = `jel_rev_${Date.now()}_${lineNo}_${Math.random().toString(36).substring(2, 5)}`;
-      insertLine.run(
+      (await insertLine.run(
         lineId,
         reverseId,
         lineNo++,
@@ -388,11 +388,11 @@ export function reverseJournalEntry(
         line.currencyCode,
         line.exchangeRate,
         line.amountCurrency
-      );
+      ));
     }
 
-    logAudit(userId, 'REVERSE_ENTRY', 'journal_entries', originalEntryId, `عكس القيد ${orig.entry_number} بالقيد العكسي ${reverseNumber}. السبب: ${reason}`, null, null, targetDb);
-  })();
+    (await logAudit(userId, 'REVERSE_ENTRY', 'journal_entries', originalEntryId, `عكس القيد ${orig.entry_number} بالقيد العكسي ${reverseNumber}. السبب: ${reason}`, null, null, targetDb));
+  })());
 
   return { reverseEntryId: reverseId, reverseNumber };
 }
@@ -400,20 +400,20 @@ export function reverseJournalEntry(
 /**
  * Check whether system allows negative stock
  */
-export function isNegativeStockAllowed(targetDb = db): boolean {
-  const setting = targetDb.prepare('SELECT setting_value FROM system_settings WHERE setting_key = ?').get('allow_negative_stock') as { setting_value: string } | undefined;
+export async function isNegativeStockAllowed(targetDb = db): Promise<boolean> {
+  const setting = (await targetDb.prepare('SELECT setting_value FROM system_settings WHERE setting_key = ?').get('allow_negative_stock')) as { setting_value: string } | undefined;
   return setting?.setting_value === 'true';
 }
 
 /**
  * Multi-Line Aggregated Stock Check
  */
-export function validateAndDeductStock(
+async function validateAndDeductStockImpl(
   warehouseId: string,
   items: { itemId: string; quantity: number }[],
   targetDb = db
-): { itemId: string; totalQty: number; costPrice: number }[] {
-  const allowNegative = isNegativeStockAllowed(targetDb);
+): Promise<{ itemId: string; totalQty: number; costPrice: number }[]> {
+  const allowNegative = (await isNegativeStockAllowed(targetDb));
   const qtyMap = new Map<string, Decimal>();
 
   for (const it of items) {
@@ -428,13 +428,13 @@ export function validateAndDeductStock(
 
   for (const [itemId, totalQtyDec] of qtyMap.entries()) {
     const totalQty = totalQtyDec.toNumber();
-    const itemRow = targetDb.prepare('SELECT id, name_ar, item_type, moving_avg_cost FROM items WHERE id = ?').get(itemId) as any;
+    const itemRow = (await targetDb.prepare('SELECT id, name_ar, item_type, moving_avg_cost FROM items WHERE id = ?').get(itemId)) as any;
     if (!itemRow) {
       throw new Error(`الصنف ${itemId} غير موجود.`);
     }
 
     if (itemRow.item_type === 'stock') {
-      const currentStock = targetDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(warehouseId, itemId) as { quantity: number } | undefined;
+      const currentStock = (await targetDb.prepare('SELECT quantity FROM warehouse_stock WHERE warehouse_id = ? AND item_id = ?').get(warehouseId, itemId)) as { quantity: number } | undefined;
       const available = currentStock ? currentStock.quantity : 0;
 
       if (!allowNegative && available < totalQty) {
@@ -442,11 +442,11 @@ export function validateAndDeductStock(
       }
 
       // Deduct stock in warehouse_stock
-      targetDb.prepare(`
+      (await targetDb.prepare(`
         UPDATE warehouse_stock 
         SET quantity = quantity - ? 
         WHERE warehouse_id = ? AND item_id = ?
-      `).run(totalQty, warehouseId, itemId);
+      `).run(totalQty, warehouseId, itemId));
     }
 
     results.push({
@@ -457,4 +457,28 @@ export function validateAndDeductStock(
   }
 
   return results;
+}
+
+/** Atomic even when called outside an HTTP request. */
+export async function getNextDocumentNumber(...args: Parameters<typeof getNextDocumentNumberImpl>): Promise<Awaited<ReturnType<typeof getNextDocumentNumberImpl>>> {
+  const targetDb = args[3] || db;
+  return targetDb.transaction(() => getNextDocumentNumberImpl(...args))();
+}
+
+/** Atomic even when called outside an HTTP request. */
+export async function postJournalEntry(...args: Parameters<typeof postJournalEntryImpl>): Promise<Awaited<ReturnType<typeof postJournalEntryImpl>>> {
+  const targetDb = args[1] || db;
+  return targetDb.transaction(() => postJournalEntryImpl(...args))();
+}
+
+/** Atomic even when called outside an HTTP request. */
+export async function reverseJournalEntry(...args: Parameters<typeof reverseJournalEntryImpl>): Promise<Awaited<ReturnType<typeof reverseJournalEntryImpl>>> {
+  const targetDb = args[3] || db;
+  return targetDb.transaction(() => reverseJournalEntryImpl(...args))();
+}
+
+/** Atomic even when called outside an HTTP request. */
+export async function validateAndDeductStock(...args: Parameters<typeof validateAndDeductStockImpl>): Promise<Awaited<ReturnType<typeof validateAndDeductStockImpl>>> {
+  const targetDb = args[2] || db;
+  return targetDb.transaction(() => validateAndDeductStockImpl(...args))();
 }
