@@ -44,6 +44,7 @@ try{
  }finally{Stop-Process -Id $mockProcess.Id -Force -ErrorAction SilentlyContinue}
 }catch{
  Write-Host $_
+ if(Test-Path (Join-Path $dataDir 'setup.log')){Get-Content (Join-Path $dataDir 'setup.log') -Tail 100}
  Get-ChildItem $dataDir -Filter '*.err' -Recurse -ErrorAction SilentlyContinue|ForEach-Object{Get-Content $_.FullName -Tail 60}
  if(Test-Path (Join-Path $dataDir 'logs')){Get-ChildItem (Join-Path $dataDir 'logs') -File|ForEach-Object{Get-Content $_.FullName -Tail 60}}
  throw

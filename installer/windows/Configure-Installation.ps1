@@ -139,7 +139,7 @@ init-file="$myInit"
  <id>AlMizanERP</id><name>Al-Mizan ERP</name><description>Al-Mizan ERP application server</description>
  <executable>powershell.exe</executable><arguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$nodeLauncher" -InstallDir "$safeInstall" -DataDir "$safeData"</arguments>
  <workingdirectory>$safeInstall</workingdirectory><startmode>Automatic</startmode><delayedAutoStart>true</delayedAutoStart>
- <serviceaccount><username>NT AUTHORITY\LocalService</username></serviceaccount>
+ <serviceaccount><domain>NT AUTHORITY</domain><user>LocalService</user></serviceaccount>
  $dependency<onfailure action="restart" delay="10 sec"/><stoptimeout>20 sec</stoptimeout>
  <logpath>$logs</logpath><log mode="roll-by-size"><sizeThreshold>10240</sizeThreshold><keepFiles>5</keepFiles></log>
 </service>

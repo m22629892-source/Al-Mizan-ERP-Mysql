@@ -144,7 +144,7 @@ begin
  end else begin
   if DbPage.SelectedValueIndex=0 then IsPrivate:='true' else IsPrivate:='false';
   Answers:='{"mode":'+J(ModeName)+',"dataDirectory":'+J(DataDir)+',"appPort":'+NetworkPage.Values[0]+',"privateDatabase":'+IsPrivate+',"mysqlHost":'+J(ConnectionPage.Values[0])+',"mysqlPort":'+J(ConnectionPage.Values[1])+',"mysqlDatabase":'+J(ConnectionPage.Values[2])+',"mysqlUser":'+J(ConnectionPage.Values[3])+',"mysqlPassword":'+J(ConnectionPage.Values[4])+',"companyName":'+J(CompanyPage.Values[0])+',"companyAddress":'+J(CompanyPage.Values[1])+',"taxId":'+J(CompanyPage.Values[2])+',"ownerName":'+J(CompanyPage.Values[3])+',"ownerUsername":'+J(CompanyPage.Values[4])+',"ownerPassword":'+J(PasswordPage.Values[0])+',"serverUrl":'+J(UrlPage.Values[0])+'}';
-  if not SaveStringToUTF8File(AnswerPath,Answers,False) then RaiseException('Cannot create setup configuration.');
+  if not SaveStringToFile(AnswerPath,UTF8Encode(Answers),False) then RaiseException('Cannot create setup configuration.');
  end;
  if IsServerInstall then begin
   if not Exec(ExpandConstant('{app}\installer\vc_redist.x64.exe'),'/install /quiet /norestart','',SW_HIDE,ewWaitUntilTerminated,ExitCode) or ((ExitCode<>0) and (ExitCode<>1638) and (ExitCode<>3010)) then RaiseException('Microsoft Visual C++ Runtime installation failed.');
