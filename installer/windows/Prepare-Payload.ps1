@@ -24,7 +24,7 @@ Download 'https://raw.githubusercontent.com/winsw/winsw/v2.12.0/LICENSE.txt' (Jo
 Download 'https://aka.ms/vs/17/release/vc_redist.x64.exe' (Join-Path $stage 'installer\vc_redist.x64.exe')
 $signature=Get-AuthenticodeSignature (Join-Path $stage 'installer\vc_redist.x64.exe')
 if($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft'){throw 'Microsoft VC runtime signature verification failed'}
-Copy-Item (Join-Path $PSScriptRoot '*.ps1') (Join-Path $stage 'installer') -Force
+foreach($script in @('Configure-Installation.ps1','Start-Server.ps1','Remove-Installation.ps1','Upgrade-Answers.ps1')){Copy-Item (Join-Path $PSScriptRoot $script) (Join-Path $stage 'installer') -Force}
 Copy-Item (Join-Path $PSScriptRoot 'THIRD_PARTY_NOTICES.txt') (Join-Path $stage 'notices') -Force
 & node (Join-Path $PSScriptRoot 'build-payload.mjs'); if($LASTEXITCODE -ne 0){throw 'Application bundle failed'}
 Get-ChildItem $stage -Recurse -File|ForEach-Object{@{path=$_.FullName.Substring($stage.Length+1);sha256=(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}}|ConvertTo-Json|Set-Content (Join-Path $stage 'build-manifest.json') -Encoding UTF8
