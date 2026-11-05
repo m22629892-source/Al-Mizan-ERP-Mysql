@@ -62,6 +62,7 @@ function ModeName: String;
 var Previous: String;
 begin
  Previous:=FileMode(ExpandConstant('{app}\installation.json'));
+ if Previous='' then Previous:=FileMode(ExpandConstant('{commonappdata}\AlMizanERP\config.json'));
  if Previous<>'' then begin Result:=Previous;exit;end;
  if ModePage.SelectedValueIndex=1 then Result:='server'
  else if ModePage.SelectedValueIndex=2 then Result:='client' else Result:='standalone';
@@ -96,7 +97,7 @@ begin
 end;
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
- ExistingInstall:=FileExists(ExpandConstant('{app}\installation.json'));
+ ExistingInstall:=FileExists(ExpandConstant('{app}\installation.json')) or FileExists(ExpandConstant('{commonappdata}\AlMizanERP\config.json'));
  Result:=(UseAnswerFile<>'') or ExistingInstall;
  if Result then exit;
  if PageID=UrlPage.ID then Result:=ModeName<>'client'
@@ -136,7 +137,7 @@ begin
  AnswerPath:=ExpandConstant('{tmp}\AlMizan-setup.json');
  if UseAnswerFile<>'' then begin
   if not FileCopy(UseAnswerFile,AnswerPath,False) then RaiseException('Cannot read setup configuration file.');
- end else if FileExists(ExpandConstant('{app}\installation.json')) then begin
+ end else if FileExists(ExpandConstant('{app}\installation.json')) or FileExists(ExpandConstant('{commonappdata}\AlMizanERP\config.json')) then begin
   { Preserve mode/data path from the previous installation, without collecting secrets again. }
   ConfigSource:=ExpandConstant('{app}\installer\Upgrade-Answers.ps1');
   if not RunPowerShell(ConfigSource,'-InstallDir "'+ExpandConstant('{app}')+'" -OutputFile "'+AnswerPath+'"',ExitCode) or (ExitCode<>0) then RaiseException('Cannot read existing installation configuration.');

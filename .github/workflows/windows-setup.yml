@@ -3,6 +3,9 @@ on:
   push:
     branches: ['codex/windows-setup']
   workflow_dispatch:
+concurrency:
+  group: windows-setup-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:

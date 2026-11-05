@@ -10,6 +10,7 @@ try {
     try{
       await admin.query('CREATE DATABASE IF NOT EXISTS `almizan` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin');
       await admin.query("CREATE USER IF NOT EXISTS 'almizan_app'@'localhost' IDENTIFIED BY ?",[input.mysqlPassword]);
+      await admin.query("ALTER USER 'almizan_app'@'localhost' IDENTIFIED BY ?",[input.mysqlPassword]);
       await admin.query("GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, REFERENCES ON almizan.* TO 'almizan_app'@'localhost'");
     }finally{await admin.end()}
   }

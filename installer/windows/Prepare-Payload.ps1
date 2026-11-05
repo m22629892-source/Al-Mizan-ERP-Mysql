@@ -1,4 +1,6 @@
 $ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
 [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
 $root=Resolve-Path (Join-Path $PSScriptRoot '..\..'); Set-Location $root
 $stage=Join-Path $root 'installer\stage';$cache=Join-Path $root 'installer\cache'

@@ -1,5 +1,7 @@
 param([Parameter(Mandatory)][string]$InstallDir,[Parameter(Mandatory)][string]$InputFile)
 $ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
 Set-StrictMode -Version Latest
 Add-Type -AssemblyName System.Security
 function Write-Json($Path,$Object){$Object | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $Path -Encoding UTF8}
@@ -10,6 +12,20 @@ function Test-Port([int]$Port){$listener=New-Object Net.Sockets.TcpListener([Net
 function Wait-Health([string]$Url,[int]$Seconds=90){
  for($i=0;$i -lt $Seconds;$i++){try{$response=Invoke-RestMethod -Uri ($Url.TrimEnd('/')+'/api/health') -TimeoutSec 2;if($response.status -eq 'ok' -and $response.database -eq 'mysql'){return}}catch{};Start-Sleep -Seconds 1}
  throw 'Server did not become ready. Check the server address or the service logs.'
+}
+function Ensure-MySQLFiles([string]$InstallDir,[string]$dataDir){
+ $mysqlDir=Join-Path $InstallDir 'mysql'
+   $package=Get-Content (Join-Path $InstallDir 'installer\mysql-package.json') -Raw -Encoding UTF8|ConvertFrom-Json
+   if(-not (Test-Path (Join-Path $mysqlDir 'bin\mysqld.exe'))){
+    $archive=Join-Path $dataDir 'mysql-download.zip'
+    if($env:ALMIZAN_MYSQL_ARCHIVE -and (Test-Path $env:ALMIZAN_MYSQL_ARCHIVE)){Copy-Item $env:ALMIZAN_MYSQL_ARCHIVE $archive -Force}
+    else{Write-Host 'Downloading MySQL Community Server from Oracle...';Invoke-WebRequest -UseBasicParsing -Uri $package.url -OutFile $archive}
+    if((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $package.sha256){Remove-Item $archive -Force;throw 'MySQL archive checksum mismatch'}
+    $expanded=Join-Path $dataDir 'mysql-unpack';Expand-Archive -LiteralPath $archive -DestinationPath $expanded -Force
+    Move-Item (Join-Path $expanded $package.folder) $mysqlDir
+    Remove-Item $expanded -Force;Remove-Item $archive -Force
+   }
+
 }
 $answers=$null; $bootstrapFile=$null
 try {
@@ -47,34 +63,48 @@ try {
   if($config.mysqlPort -lt 1 -or $config.mysqlPort -gt 65535){throw 'Invalid MySQL port'}
   if($private){
    $config.mysqlHost='127.0.0.1';$config.mysqlPort=3307;$config.mysqlDatabase='almizan';$config.mysqlUser='almizan_app'
-   if(-not (Test-Port 3307)){throw 'Private MySQL port 3307 is occupied. Choose the existing MySQL option instead.'}
-   if(Get-Service 'AlMizanMySQL' -ErrorAction SilentlyContinue){throw 'An existing AlMizanMySQL service was found without configuration. No database files were changed.'}
-   $mysqlDir=Join-Path $InstallDir 'mysql';$mysqlData=Join-Path $dataDir 'mysql-data';$ini=Join-Path $dataDir 'my.ini';$initSql=Join-Path $dataDir 'mysql-first-start.sql'
-   if(Test-Path (Join-Path $mysqlData 'mysql')){throw 'Existing private MySQL data found. Restore the original config.json before reinstalling; setup will not reinitialize it.'}
+   if(-not (Test-Port 3307) -and -not (Test-Path (Join-Path $dataDir 'private-setup.bin'))){throw 'Private MySQL port 3307 is occupied. Choose the existing MySQL option instead.'}
+   $mysqlDir=Join-Path $InstallDir 'mysql';$mysqlData=Join-Path $dataDir 'mysql-data';$ini=Join-Path $dataDir 'my.ini';$initSql=Join-Path $dataDir 'mysql-first-start.sql';$stateFile=Join-Path $dataDir 'private-setup.bin'
+   $hasData=Test-Path (Join-Path $mysqlData 'mysql')
+   if(Test-Path $stateFile){
+    $protected=[Convert]::FromBase64String((Get-Content $stateFile -Raw).Trim())
+    $state=[Text.Encoding]::UTF8.GetString([Security.Cryptography.ProtectedData]::Unprotect($protected,$null,[Security.Cryptography.DataProtectionScope]::LocalMachine))|ConvertFrom-Json
+    $rootPassword=$state.rootPassword;$appPassword=$state.appPassword
+   }elseif($hasData -or (Get-Service 'AlMizanMySQL' -ErrorAction SilentlyContinue)){
+    throw 'Existing private MySQL has no recoverable setup state. Restore the original config.json; no database files were modified.'
+   }else{
+    $rootPassword=New-Password;$appPassword=New-Password
+    Protect-String (@{rootPassword=$rootPassword;appPassword=$appPassword}|ConvertTo-Json) | Set-Content $stateFile -Encoding ASCII
+    Invoke-Checked 'icacls.exe' @($stateFile,'/inheritance:r','/grant:r','*S-1-5-18:F','*S-1-5-32-544:F')
+   }
    New-Item -ItemType Directory -Path $mysqlData -Force | Out-Null
-   $rootPassword=New-Password;$appPassword=New-Password
-   # Only a hex-generated secret is interpolated into this first-start SQL file.
+   Ensure-MySQLFiles $InstallDir $dataDir
    "ALTER USER 'root'@'localhost' IDENTIFIED BY '$rootPassword';" | Set-Content -LiteralPath $initSql -Encoding ASCII
    $myBase=$mysqlDir.Replace('\','/');$myData=$mysqlData.Replace('\','/');$myInit=$initSql.Replace('\','/')
-   "[mysqld]`r`nbasedir=$myBase`r`ndatadir=$myData`r`nbind-address=127.0.0.1`r`nport=3307`r`nmysqlx=OFF`r`ncharacter-set-server=utf8mb4`r`ninit-file=$myInit`r`n" | Set-Content -LiteralPath $ini -Encoding ASCII
-   $package=Get-Content (Join-Path $InstallDir 'installer\mysql-package.json') -Raw -Encoding UTF8|ConvertFrom-Json
-   $archive=Join-Path $dataDir 'mysql-download.zip'
-   if($env:ALMIZAN_MYSQL_ARCHIVE -and (Test-Path $env:ALMIZAN_MYSQL_ARCHIVE)){Copy-Item $env:ALMIZAN_MYSQL_ARCHIVE $archive -Force}
-   else{Write-Host 'Downloading MySQL Community Server from Oracle...';Invoke-WebRequest -UseBasicParsing -Uri $package.url -OutFile $archive}
-   if((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $package.sha256){Remove-Item $archive -Force;throw 'MySQL archive checksum mismatch'}
-   $expanded=Join-Path $dataDir 'mysql-unpack';Expand-Archive -LiteralPath $archive -DestinationPath $expanded -Force
-   Move-Item (Join-Path $expanded $package.folder) $mysqlDir
-   Remove-Item $expanded -Force;Remove-Item $archive -Force
-   $mysqld=Join-Path $mysqlDir 'bin\mysqld.exe' 
-   Invoke-Checked $mysqld @("--defaults-file=$ini",'--initialize-insecure','--console')
-   # --install must precede --defaults-file for MySQL's service registration command.
-   Invoke-Checked $mysqld @('--install','AlMizanMySQL',"--defaults-file=$ini")
-   Invoke-Checked 'sc.exe' @('config','AlMizanMySQL','obj=','NT AUTHORITY\LocalService')
+   @"
+[mysqld]
+basedir="$myBase"
+datadir="$myData"
+bind-address=127.0.0.1
+port=3307
+mysqlx=OFF
+character-set-server=utf8mb4
+init-file="$myInit"
+"@ | Set-Content -LiteralPath $ini -Encoding ASCII
+   $mysqld=Join-Path $mysqlDir 'bin\mysqld.exe'
+   if(-not $hasData){Invoke-Checked $mysqld @("--defaults-file=$ini",'--initialize-insecure','--console')}
+   $service=Get-CimInstance Win32_Service -Filter "Name='AlMizanMySQL'"
+   if($service){
+    if(-not $service.PathName.ToLowerInvariant().Contains($mysqld.ToLowerInvariant())){throw 'AlMizanMySQL service belongs to another installation'}
+   }else{
+    Invoke-Checked $mysqld @('--install','AlMizanMySQL',"--defaults-file=$ini")
+    Invoke-Checked 'sc.exe' @('config','AlMizanMySQL','obj=','NT AUTHORITY\LocalService')
+   }
+   (Protect-String $rootPassword) | Set-Content -LiteralPath (Join-Path $dataDir 'mysql-admin.bin') -Encoding ASCII
+   Invoke-Checked 'icacls.exe' @((Join-Path $dataDir 'mysql-admin.bin'),'/inheritance:r','/grant:r','*S-1-5-18:F','*S-1-5-32-544:F')
    Start-Service 'AlMizanMySQL'
    $answers | Add-Member -NotePropertyName rootPassword -NotePropertyValue $rootPassword -Force
    $answers.mysqlPassword=$appPassword;$answers.mysqlHost='127.0.0.1';$answers.mysqlPort=3307;$answers.mysqlDatabase='almizan';$answers.mysqlUser='almizan_app'
-   (Protect-String $rootPassword) | Set-Content -LiteralPath (Join-Path $dataDir 'mysql-admin.bin') -Encoding ASCII
-   Invoke-Checked 'icacls.exe' @((Join-Path $dataDir 'mysql-admin.bin'),'/inheritance:r','/grant:r','*S-1-5-18:F','*S-1-5-32-544:F')
   }
   $bootstrapFile=Join-Path $dataDir 'pending-setup.json';Write-Json $bootstrapFile $answers
   Invoke-Checked 'icacls.exe' @($bootstrapFile,'/inheritance:r','/grant:r','*S-1-5-18:F','*S-1-5-32-544:F')
@@ -91,8 +121,10 @@ try {
   }
   $config.protectedPassword=Protect-String ([string]$answers.mysqlPassword)
   Write-Json $configPath $config
+  if($private -and (Test-Path $stateFile)){Remove-Item $stateFile -Force}
  }
  # Reinstall after uninstall: reuse the same data and credentials, never initialize again.
+ if($config.privateDatabase){Ensure-MySQLFiles $InstallDir $dataDir}
  if($config.privateDatabase -and -not (Get-Service 'AlMizanMySQL' -ErrorAction SilentlyContinue)){
   Invoke-Checked (Join-Path $InstallDir 'mysql\bin\mysqld.exe') @('--install','AlMizanMySQL',"--defaults-file=$(Join-Path $dataDir 'my.ini')")
   Invoke-Checked 'sc.exe' @('config','AlMizanMySQL','obj=','NT AUTHORITY\LocalService')
