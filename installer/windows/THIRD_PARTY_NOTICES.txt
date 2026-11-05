@@ -1,0 +1,12 @@
+Al-Mizan ERP Windows Setup
+
+Node.js 26.13.0 is bundled. Its complete LICENSE is included in NODE-LICENSE.txt.
+WinSW 2.12.0 is bundled under the MIT license. See WINSW-LICENSE.txt.
+Microsoft Visual C++ Redistributable is included as the original Microsoft-signed installer and is subject to Microsoft's license terms.
+
+Selecting a new private database downloads the original MySQL Community Server 8.4.13 Windows archive directly from Oracle's CDN. These database binaries are not part of this Setup executable. The archive is verified using the SHA-256 recorded in mysql-package.json during the build. Oracle's included licenses remain in the downloaded MySQL installation directory. MySQL Community licensing and matching source downloads: https://dev.mysql.com/downloads/mysql/8.4.html and https://dev.mysql.com/downloads/mysql/ (Source Code).
+
+The ERP application uses third-party JavaScript packages; their original license notices are retained by the application bundler and listed in package-lock.json in the source repository.
+Source: https://github.com/m22629892-source/Al-Mizan-ERP-Mysql
+
+This installer is not code-signed by a commercial signing certificate. Do not disable Windows security protections. Verify the SHA-256 of the Setup file against the build artifact checksums.

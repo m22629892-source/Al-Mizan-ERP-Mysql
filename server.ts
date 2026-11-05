@@ -9,7 +9,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const isProduction = process.env.NODE_ENV === 'production';
-const PORT = parseInt(process.env.PORT || '3000', 10);
+const PORT = parseInt(process.env.PORT || '4000', 10);
+const BIND_HOST = process.env.BIND_HOST || (isProduction ? '127.0.0.1' : '0.0.0.0');
 
 async function startServer() {
   const app = express();
@@ -76,8 +77,8 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Al-Mizan ERP Server running on http://0.0.0.0:${PORT}`);
+  app.listen(PORT, BIND_HOST, () => {
+    console.log(`Al-Mizan ERP Server running on http://${BIND_HOST}:${PORT}`);
   });
 }
 

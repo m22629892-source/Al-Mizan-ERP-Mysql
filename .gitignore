@@ -14,3 +14,9 @@ almizan*.db*
 
 backups/
 *.zip
+
+installer/stage/
+installer/cache/
+installer/output/
+
+node_modules

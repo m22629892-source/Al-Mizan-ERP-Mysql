@@ -1,0 +1,60 @@
+name: Build Windows Setup
+on:
+  push:
+    branches: ['codex/windows-setup']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  setup:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.13.0'
+          cache: npm
+      - name: Parse Windows scripts
+        shell: powershell
+        run: |
+          Get-ChildItem installer\windows\*.ps1 | ForEach-Object {
+            $tokens=$null; $errors=$null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) { $errors | Format-List; throw "PowerShell syntax error in $($_.Name)" }
+          }
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - name: Download verified runtimes and bundle application
+        shell: powershell
+        run: .\installer\windows\Prepare-Payload.ps1
+      - name: Compile Setup.exe
+        shell: powershell
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc installer\windows\AlMizanSetup.iss
+          if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed' }
+      - name: Test real install, services, clean database, upgrade, uninstall and client mode
+        shell: powershell
+        run: |
+          $env:ALMIZAN_MYSQL_ARCHIVE = (Resolve-Path 'installer\cache\mysql-8.4.13-winx64.zip').Path
+          .\installer\windows\Test-Setup.ps1 -SetupPath (Resolve-Path 'installer\output\AlMizanERP-Setup-Windows-x64.exe').Path
+      - name: Generate checksums
+        shell: powershell
+        run: |
+          Get-FileHash installer\output\*.exe -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($_.Path))" } | Set-Content installer\output\SHA256SUMS.txt -Encoding ASCII
+          Copy-Item installer\windows\CUSTOMER_GUIDE_AR.md installer\output\CUSTOMER_GUIDE_AR.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AlMizanERP-Windows-Setup
+          path: installer/output/*
+          retention-days: 14
+      - name: Upload diagnostic install logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Setup-diagnostics
+          path: ${{ runner.temp }}/almizan-install.log
+          retention-days: 3
